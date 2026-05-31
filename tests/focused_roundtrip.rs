@@ -1,5 +1,6 @@
 use raptorq::{
     EncodingPacket, ObjectTransmissionInformation, SourceBlockDecoder, SourceBlockEncoder,
+    SourceBlockEncodingPlan,
 };
 
 const SYMBOL_SIZE: u16 = 8;
@@ -95,6 +96,21 @@ fn corrupt_exact_no_hdpc_repair_set_does_not_decode() {
 
     let mut decoder = SourceBlockDecoder::new(0, &config, data.len() as u64);
     assert_eq!(decoder.decode(corrupt_packets), None);
+}
+
+#[test]
+fn large_source_block_encoding_plan_generation_does_not_panic() {
+    let _plan = SourceBlockEncodingPlan::generate(5_000);
+}
+
+#[cfg(not(feature = "std"))]
+#[test]
+fn large_zero_no_std_source_block_encoder_does_not_panic() {
+    let data = vec![0; 5_000 * SYMBOL_SIZE as usize];
+    let config = ObjectTransmissionInformation::new(0, SYMBOL_SIZE, 0, 1, 1);
+    let encoder = SourceBlockEncoder::new(0, &config, &data);
+
+    assert_eq!(encoder.source_packets().len(), 5_000);
 }
 
 #[test]

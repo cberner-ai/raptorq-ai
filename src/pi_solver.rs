@@ -1,24 +1,33 @@
 #[cfg(feature = "std")]
+use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "std")]
+use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(feature = "std")]
 use std::vec::Vec;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
 use crate::base::intermediate_tuple;
+use crate::constraint_matrix::generate_constraint_matrix;
 use crate::constraint_matrix::{enc_indices, generate_hdpc_rows};
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
 use crate::octets::{fused_addassign_mul_scalar, mulassign_scalar};
 use crate::operation_vector::SymbolOps;
+use crate::sparse_matrix::SparseBinaryMatrix;
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::num_ldpc_symbols;
 use crate::systematic_constants::{
-    MAX_SUPPORTED_INTERMEDIATE_SYMBOLS, calculate_p1, extended_source_block_symbols,
-    num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
+    calculate_p1, extended_source_block_symbols, num_intermediate_symbols, num_lt_symbols,
+    num_pi_symbols, systematic_index,
 };
 
 type CoefficientRow = Vec<(usize, Octet)>;
+pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
+#[cfg(feature = "std")]
+const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 
 // Systematic planning matrices feed SourceBlockEncodingPlan, which replays concrete row
 // operations. Recording must therefore stay independent of matrix width and feature set.
@@ -52,6 +61,43 @@ pub fn fused_inverse_mul_symbols<M: BinaryMatrix>(
     source_block_symbols: u32,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     let recording = OperationRecording::for_matrix(&matrix, source_block_symbols);
+    if recording == OperationRecording::Record && matrix.width() > MAX_INLINE_RECORDED_SOLVER_WIDTH
+    {
+        #[cfg(feature = "std")]
+        {
+            let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+            cached_systematic_plan(source_block_symbols);
+            return (
+                None,
+                Some(vec![SymbolOps::ApplyCachedSystematicPlan {
+                    source_block_symbols,
+                }]),
+            );
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            // no_std cannot keep the global large-plan cache, so replay performs the solve.
+            let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+            let op = SymbolOps::DirectSystematicSolve {
+                source_block_symbols,
+            };
+            if symbol_is_zero(symbols.as_bytes()) {
+                let decoded = SymbolSlab::with_zeros(matrix.width(), symbols.symbol_size());
+                return (Some(decoded), Some(vec![op]));
+            }
+
+            let (decoded, _) = fused_inverse_mul_symbols_impl(
+                matrix,
+                hdpc_rows,
+                symbols,
+                source_block_symbols,
+                OperationRecording::Skip,
+            );
+            return (decoded, Some(vec![op]));
+        }
+    }
+
     fused_inverse_mul_symbols_impl(matrix, hdpc_rows, symbols, source_block_symbols, recording)
 }
 
@@ -71,6 +117,118 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
 
     let rows = coefficient_rows(&matrix, &hdpc_rows, source_block_symbols);
     solve(rows, width, symbols, recording)
+}
+
+#[cfg(feature = "std")]
+struct CachedSystematicPlan {
+    // Large systematic plans keep matrix state out of replay without storing huge row-op vectors.
+    rows: Vec<CoefficientRow>,
+    width: usize,
+}
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct SystematicPlanCache {
+    plans: HashMap<u32, Arc<CachedSystematicPlan>>,
+    insertion_order: VecDeque<u32>,
+}
+
+#[cfg(feature = "std")]
+type SystematicPlanCacheLock = Mutex<SystematicPlanCache>;
+
+#[cfg(feature = "std")]
+fn systematic_plan_cache() -> &'static SystematicPlanCacheLock {
+    static CACHE: OnceLock<SystematicPlanCacheLock> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(SystematicPlanCache::default()))
+}
+
+#[cfg(feature = "std")]
+fn cached_systematic_plan(source_block_symbols: u32) -> Arc<CachedSystematicPlan> {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    {
+        let cache = systematic_plan_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(plan) = guard.plans.get(&source_block_symbols) {
+            return Arc::clone(plan);
+        }
+    }
+
+    let generated = Arc::new(generate_systematic_plan(source_block_symbols));
+    let cache = systematic_plan_cache();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    insert_systematic_plan(&mut guard, source_block_symbols, generated)
+}
+
+#[cfg(feature = "std")]
+fn insert_systematic_plan(
+    cache: &mut SystematicPlanCache,
+    source_block_symbols: u32,
+    generated: Arc<CachedSystematicPlan>,
+) -> Arc<CachedSystematicPlan> {
+    if let Some(plan) = cache.plans.get(&source_block_symbols) {
+        return Arc::clone(plan);
+    }
+
+    if cache.plans.len() >= SYSTEMATIC_PLAN_CACHE_CAPACITY
+        && let Some(evicted_source_block_symbols) = cache.insertion_order.pop_front()
+    {
+        cache.plans.remove(&evicted_source_block_symbols);
+    }
+
+    cache.insertion_order.push_back(source_block_symbols);
+    cache
+        .plans
+        .insert(source_block_symbols, Arc::clone(&generated));
+    generated
+}
+
+#[cfg(feature = "std")]
+fn generate_systematic_plan(source_block_symbols: u32) -> CachedSystematicPlan {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    let indices: Vec<u32> = (0..source_block_symbols).collect();
+    let (matrix, hdpc_rows) =
+        generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
+    let width = matrix.width();
+    let rows = coefficient_rows(&matrix, &hdpc_rows, source_block_symbols);
+    CachedSystematicPlan { rows, width }
+}
+
+#[cfg(feature = "std")]
+pub(crate) fn apply_cached_systematic_plan(source_block_symbols: u32, symbols: &mut SymbolSlab) {
+    let plan = cached_systematic_plan(source_block_symbols);
+    let (decoded, _) = solve(
+        plan.rows.clone(),
+        plan.width,
+        symbols.clone(),
+        OperationRecording::Skip,
+    );
+    let decoded = decoded.expect("cached systematic solve failed");
+    for row in 0..decoded.len() {
+        symbols.get_mut(row).copy_from_slice(decoded.get(row));
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub(crate) fn apply_direct_systematic_solve(source_block_symbols: u32, symbols: &mut SymbolSlab) {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    let indices: Vec<u32> = (0..source_block_symbols).collect();
+    let (matrix, hdpc_rows) =
+        generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
+    let (decoded, _) = fused_inverse_mul_symbols_impl(
+        matrix,
+        hdpc_rows,
+        symbols.clone(),
+        source_block_symbols,
+        OperationRecording::Skip,
+    );
+    let decoded = decoded.expect("direct systematic solve failed");
+    for row in 0..decoded.len() {
+        symbols.get_mut(row).copy_from_slice(decoded.get(row));
+    }
 }
 
 fn coefficient_rows<M: BinaryMatrix>(
@@ -199,11 +357,6 @@ fn solve(
     mut symbols: SymbolSlab,
     recording: OperationRecording,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
-    assert!(
-        width <= MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize,
-        "generic RaptorQ solver supports at most {MAX_SUPPORTED_INTERMEDIATE_SYMBOLS} intermediate symbols; optimized large-matrix PI solver is not implemented"
-    );
-
     let height = rows.len();
     let mut ops = recording.new_ops();
     let mut pivot_row = 0usize;
@@ -429,22 +582,6 @@ mod recording_tests {
         assert!(decoded.is_some());
         assert!(ops.is_some());
     }
-
-    #[test]
-    #[should_panic(expected = "generic RaptorQ solver supports at most 1024 intermediate symbols")]
-    fn generic_solver_rejects_width_above_supported_limit() {
-        let width = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
-        let rows: Vec<CoefficientRow> = (0..width).map(|col| vec![(col, Octet::one())]).collect();
-        let symbols = SymbolSlab::with_zeros(width, 1);
-
-        let _ = solve(rows, width, symbols, OperationRecording::Record);
-    }
-
-    #[test]
-    #[should_panic(expected = "generic RaptorQ solver supports at most 1024 intermediate symbols")]
-    fn oversized_source_block_encoding_plan_rejects_at_solver_limit() {
-        crate::SourceBlockEncodingPlan::generate(1_000);
-    }
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -456,7 +593,7 @@ mod tests {
 
     #[test]
     fn large_non_planning_matrix_uses_non_recording_solver_without_ops() {
-        let width = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize;
+        let width = 1024;
         let mut matrix = DenseBinaryMatrix::new(width, width);
         for row in 0..width {
             matrix.set(row, row, true);
@@ -484,6 +621,47 @@ mod tests {
 
         assert!(decoded.is_some());
         assert!(ops.is_none());
+    }
+
+    #[test]
+    fn large_systematic_plan_uses_cached_systematic_plan() {
+        let source_symbols = 5_000;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let symbols = SymbolSlab::with_zeros(num_intermediate_symbols(source_symbols) as usize, 1);
+        let indices: Vec<u32> = (0..k_prime).collect();
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        let (decoded, ops) = fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_symbols);
+
+        assert!(decoded.is_none());
+        assert!(matches!(
+            ops.as_deref(),
+            Some([SymbolOps::ApplyCachedSystematicPlan {
+                source_block_symbols
+            }]) if *source_block_symbols == k_prime
+        ));
+    }
+
+    #[test]
+    fn systematic_plan_cache_insert_evicts_old_entries() {
+        let mut cache = SystematicPlanCache::default();
+
+        for source_block_symbols in 0..=SYSTEMATIC_PLAN_CACHE_CAPACITY as u32 {
+            let plan = std::sync::Arc::new(CachedSystematicPlan {
+                rows: Vec::new(),
+                width: 0,
+            });
+            insert_systematic_plan(&mut cache, source_block_symbols, plan);
+        }
+
+        assert_eq!(cache.plans.len(), SYSTEMATIC_PLAN_CACHE_CAPACITY);
+        assert!(!cache.plans.contains_key(&0));
+        assert!(
+            cache
+                .plans
+                .contains_key(&(SYSTEMATIC_PLAN_CACHE_CAPACITY as u32))
+        );
     }
 
     #[test]
