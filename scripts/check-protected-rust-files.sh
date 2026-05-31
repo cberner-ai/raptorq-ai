@@ -5,7 +5,7 @@ set -euo pipefail
 # target, when this check was introduced. The just lint stage fails if any of
 # these file contents change.
 protected_files=(
-  "340eec2510985ad0605af3fac047723b8f49d2cc3a007e58b22ae548bd178742  src/base.rs"
+  "9039f92017cbed696ad5308d58e4c8704d771ca9db21f68bf83eefd2afcc35c5  src/base.rs"
   "8feafd3a9f4f221261933f626b8f97565f33e25a077b09f72171a8aec2cc25c1  src/decoder.rs"
   "c44a4a5aceaf512ae269bea69f6237137809a06866e1b7637493351c6a90cf1d  src/encoder.rs"
   "c355f6daa05650a03ffbfc5b3cca1be0753d86436aae87b9bc4670f9da36f082  src/lib.rs"
