@@ -11,6 +11,7 @@ use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
 use crate::octets::{fused_addassign_mul_scalar, mulassign_scalar};
 use crate::operation_vector::SymbolOps;
+use crate::sparse_vec::SparseOctetVec;
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::num_ldpc_symbols;
 use crate::systematic_constants::{
@@ -18,7 +19,54 @@ use crate::systematic_constants::{
     num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
 };
 
-type CoefficientRow = Vec<(usize, Octet)>;
+type CoefficientRow = SparseOctetVec;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SolveStats {
+    symbol_mul_ops_by_phase: [usize; 5],
+    symbol_add_ops_by_phase: [usize; 5],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SolverPhase {
+    First,
+    Fifth,
+}
+
+impl SolverPhase {
+    fn index(self) -> usize {
+        match self {
+            SolverPhase::First => 0,
+            SolverPhase::Fifth => 4,
+        }
+    }
+}
+
+impl SolveStats {
+    fn record_symbol_op(&mut self, phase: SolverPhase, op: &SymbolOps) {
+        let phase = phase.index();
+        match op {
+            SymbolOps::Swap(..) => {}
+            SymbolOps::Scale(..) => {
+                self.symbol_mul_ops_by_phase[phase] += 1;
+            }
+            SymbolOps::FusedAdd { .. } => {
+                self.symbol_mul_ops_by_phase[phase] += 1;
+                self.symbol_add_ops_by_phase[phase] += 1;
+            }
+        }
+    }
+
+    #[cfg(feature = "benchmarking")]
+    fn total_symbol_mul_ops(self) -> usize {
+        self.symbol_mul_ops_by_phase.iter().sum()
+    }
+
+    #[cfg(feature = "benchmarking")]
+    fn total_symbol_add_ops(self) -> usize {
+        self.symbol_add_ops_by_phase.iter().sum()
+    }
+}
 
 // Systematic planning matrices feed SourceBlockEncodingPlan, which replays concrete row
 // operations. Recording must therefore stay independent of matrix width and feature set.
@@ -55,6 +103,23 @@ pub fn fused_inverse_mul_symbols<M: BinaryMatrix>(
     fused_inverse_mul_symbols_impl(matrix, hdpc_rows, symbols, source_block_symbols, recording)
 }
 
+#[cfg(feature = "benchmarking")]
+fn fused_inverse_mul_symbols_traced<M: BinaryMatrix>(
+    matrix: M,
+    hdpc_rows: DenseOctetMatrix,
+    symbols: SymbolSlab,
+    source_block_symbols: u32,
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>, SolveStats) {
+    let recording = OperationRecording::for_matrix(&matrix, source_block_symbols);
+    fused_inverse_mul_symbols_impl_traced(
+        matrix,
+        hdpc_rows,
+        symbols,
+        source_block_symbols,
+        recording,
+    )
+}
+
 fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     matrix: M,
     hdpc_rows: DenseOctetMatrix,
@@ -62,6 +127,23 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     source_block_symbols: u32,
     recording: OperationRecording,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    let (decoded, ops, _) = fused_inverse_mul_symbols_impl_traced(
+        matrix,
+        hdpc_rows,
+        symbols,
+        source_block_symbols,
+        recording,
+    );
+    (decoded, ops)
+}
+
+fn fused_inverse_mul_symbols_impl_traced<M: BinaryMatrix>(
+    matrix: M,
+    hdpc_rows: DenseOctetMatrix,
+    symbols: SymbolSlab,
+    source_block_symbols: u32,
+    recording: OperationRecording,
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>, SolveStats) {
     let s = num_ldpc_symbols(source_block_symbols) as usize;
     let width = matrix.width();
     let total_rows = matrix.height() + hdpc_rows.height();
@@ -70,7 +152,7 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     assert!(matrix.height() >= s);
 
     let rows = coefficient_rows(&matrix, &hdpc_rows, source_block_symbols);
-    solve(rows, width, symbols, recording)
+    solve_traced(rows, width, symbols, recording)
 }
 
 fn coefficient_rows<M: BinaryMatrix>(
@@ -80,7 +162,7 @@ fn coefficient_rows<M: BinaryMatrix>(
 ) -> Vec<CoefficientRow> {
     let s = num_ldpc_symbols(source_block_symbols) as usize;
     let total_rows = matrix.height() + hdpc_rows.height();
-    let mut rows = vec![Vec::new(); total_rows];
+    let mut rows = vec![SparseOctetVec::new(); total_rows];
     for row in 0..s {
         rows[row] = copy_binary_row(matrix, row);
     }
@@ -146,22 +228,11 @@ fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bo
 }
 
 fn copy_binary_row<M: BinaryMatrix>(matrix: &M, row: usize) -> CoefficientRow {
-    matrix
-        .row_entries(row)
-        .into_iter()
-        .map(|col| (col, Octet::one()))
-        .collect()
+    SparseOctetVec::from_binary_entries(matrix.row_entries(row))
 }
 
 fn copy_octet_row(matrix: &DenseOctetMatrix, row: usize) -> CoefficientRow {
-    let mut result = Vec::new();
-    for col in 0..matrix.width() {
-        let value = matrix.get(row, col);
-        if !value.is_zero() {
-            result.push((col, value));
-        }
-    }
-    result
+    SparseOctetVec::from_octet_entries((0..matrix.width()).map(|col| (col, matrix.get(row, col))))
 }
 
 fn is_full_systematic_planning_matrix<M: BinaryMatrix>(
@@ -194,11 +265,21 @@ fn is_full_systematic_planning_matrix<M: BinaryMatrix>(
 }
 
 fn solve(
+    rows: Vec<CoefficientRow>,
+    width: usize,
+    symbols: SymbolSlab,
+    recording: OperationRecording,
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    let (decoded, ops, _) = solve_traced(rows, width, symbols, recording);
+    (decoded, ops)
+}
+
+fn solve_traced(
     mut rows: Vec<CoefficientRow>,
     width: usize,
     mut symbols: SymbolSlab,
     recording: OperationRecording,
-) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>, SolveStats) {
     assert!(
         width <= MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize,
         "generic RaptorQ solver supports at most {MAX_SUPPORTED_INTERMEDIATE_SYMBOLS} intermediate symbols; optimized large-matrix PI solver is not implemented"
@@ -206,13 +287,14 @@ fn solve(
 
     let height = rows.len();
     let mut ops = recording.new_ops();
+    let mut stats = SolveStats::default();
     let mut pivot_row = 0usize;
 
     for col in 0..width {
         let Some(pivot) =
             (pivot_row..height).find(|&row| !coefficient_at(&rows[row], col).is_zero())
         else {
-            return (None, None);
+            return (None, None, stats);
         };
 
         if pivot != pivot_row {
@@ -231,27 +313,26 @@ fn solve(
             if let Some(ops) = ops.as_mut() {
                 ops.push(SymbolOps::Scale(pivot_row, scalar));
             }
+            stats.record_symbol_op(SolverPhase::First, &SymbolOps::Scale(pivot_row, scalar));
         }
 
         let pivot_coefficients = rows[pivot_row].clone();
         let pivot_symbol = symbols.get(pivot_row).to_vec();
-        for row in 0..height {
-            if row == pivot_row {
-                continue;
-            }
+        for row in (pivot_row + 1)..height {
             let factor = coefficient_at(&rows[row], col);
             if factor.is_zero() {
                 continue;
             }
             add_scaled_matrix_row(&mut rows[row], &pivot_coefficients, col, factor);
             fused_addassign_mul_scalar(symbols.get_mut(row), &pivot_symbol, &factor);
-            if let Some(ops) = ops.as_mut() {
-                ops.push(SymbolOps::FusedAdd {
-                    dest: row,
-                    src: pivot_row,
-                    scalar: factor,
-                });
-            }
+            record_fused_add(
+                ops.as_mut(),
+                &mut stats,
+                SolverPhase::First,
+                row,
+                pivot_row,
+                factor,
+            );
         }
 
         pivot_row += 1;
@@ -259,7 +340,28 @@ fn solve(
 
     for row in pivot_row..height {
         if !rows[row].is_empty() || !symbol_is_zero(symbols.get(row)) {
-            return (None, None);
+            return (None, None, stats);
+        }
+    }
+
+    for col in (0..width).rev() {
+        let pivot_coefficients = rows[col].clone();
+        let pivot_symbol = symbols.get(col).to_vec();
+        for row in 0..col {
+            let factor = coefficient_at(&rows[row], col);
+            if factor.is_zero() {
+                continue;
+            }
+            add_scaled_matrix_row(&mut rows[row], &pivot_coefficients, col, factor);
+            fused_addassign_mul_scalar(symbols.get_mut(row), &pivot_symbol, &factor);
+            record_fused_add(
+                ops.as_mut(),
+                &mut stats,
+                SolverPhase::Fifth,
+                row,
+                col,
+                factor,
+            );
         }
     }
 
@@ -268,25 +370,34 @@ fn solve(
         decoded.get_mut(row).copy_from_slice(symbols.get(row));
     }
 
-    (Some(decoded), ops)
+    (Some(decoded), ops, stats)
 }
 
 fn symbol_is_zero(symbol: &[u8]) -> bool {
     symbol.iter().all(|&byte| byte == 0)
 }
 
+fn record_fused_add(
+    ops: Option<&mut Vec<SymbolOps>>,
+    stats: &mut SolveStats,
+    phase: SolverPhase,
+    dest: usize,
+    src: usize,
+    scalar: Octet,
+) {
+    let op = SymbolOps::FusedAdd { dest, src, scalar };
+    stats.record_symbol_op(phase, &op);
+    if let Some(ops) = ops {
+        ops.push(op);
+    }
+}
+
 fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {
-    row.binary_search_by_key(&col, |&(entry_col, _)| entry_col)
-        .map(|index| row[index].1)
-        .unwrap_or_else(|_| Octet::zero())
+    row.get(col)
 }
 
 fn scale_matrix_row(row: &mut CoefficientRow, start_col: usize, scalar: Octet) {
-    for (col, value) in row.iter_mut() {
-        if *col >= start_col {
-            *value *= scalar;
-        }
-    }
+    row.scale_from(start_col, scalar);
 }
 
 fn add_scaled_matrix_row(
@@ -295,41 +406,7 @@ fn add_scaled_matrix_row(
     start_col: usize,
     scalar: Octet,
 ) {
-    let mut merged = Vec::with_capacity(dest.len() + src.len());
-    let mut dest_index = 0usize;
-    let mut src_index = src.partition_point(|&(col, _)| col < start_col);
-
-    while dest_index < dest.len() || src_index < src.len() {
-        match (dest.get(dest_index), src.get(src_index)) {
-            (Some(&(dest_col, dest_value)), Some(&(src_col, src_value))) => {
-                if dest_col < src_col {
-                    merged.push((dest_col, dest_value));
-                    dest_index += 1;
-                } else if src_col < dest_col {
-                    merged.push((src_col, src_value * scalar));
-                    src_index += 1;
-                } else {
-                    let value = dest_value + src_value * scalar;
-                    if !value.is_zero() {
-                        merged.push((dest_col, value));
-                    }
-                    dest_index += 1;
-                    src_index += 1;
-                }
-            }
-            (Some(&(dest_col, dest_value)), None) => {
-                merged.push((dest_col, dest_value));
-                dest_index += 1;
-            }
-            (None, Some(&(src_col, src_value))) => {
-                merged.push((src_col, src_value * scalar));
-                src_index += 1;
-            }
-            (None, None) => break,
-        }
-    }
-
-    *dest = merged;
+    dest.add_scaled_from(src, start_col, scalar);
 }
 
 fn swap_symbol_rows(symbols: &mut SymbolSlab, a: usize, b: usize) {
@@ -357,7 +434,7 @@ pub struct IntermediateSymbolDecoder<M: BinaryMatrix> {
     hdpc_rows: DenseOctetMatrix,
     symbols: SymbolSlab,
     source_block_symbols: u32,
-    ops: Vec<SymbolOps>,
+    stats: SolveStats,
 }
 
 #[cfg(feature = "benchmarking")]
@@ -373,18 +450,18 @@ impl<M: BinaryMatrix> IntermediateSymbolDecoder<M> {
             hdpc_rows,
             symbols,
             source_block_symbols,
-            ops: Vec::new(),
+            stats: SolveStats::default(),
         }
     }
 
     pub fn execute(&mut self) {
-        let (_, ops) = fused_inverse_mul_symbols(
+        let (_, _, stats) = fused_inverse_mul_symbols_traced(
             self.matrix.clone(),
             self.hdpc_rows.clone(),
             self.symbols.clone(),
             self.source_block_symbols,
         );
-        self.ops = ops.unwrap_or_default();
+        self.stats = stats;
     }
 
     pub fn get_non_symbol_bytes(&self) -> usize {
@@ -392,25 +469,19 @@ impl<M: BinaryMatrix> IntermediateSymbolDecoder<M> {
     }
 
     pub fn get_symbol_mul_ops(&self) -> usize {
-        self.ops
-            .iter()
-            .filter(|op| matches!(op, SymbolOps::Scale(..) | SymbolOps::FusedAdd { .. }))
-            .count()
+        self.stats.total_symbol_mul_ops()
     }
 
     pub fn get_symbol_add_ops(&self) -> usize {
-        self.ops
-            .iter()
-            .filter(|op| matches!(op, SymbolOps::FusedAdd { .. }))
-            .count()
+        self.stats.total_symbol_add_ops()
     }
 
     pub fn get_symbol_mul_ops_by_phase(&self) -> [usize; 5] {
-        [self.get_symbol_mul_ops(), 0, 0, 0, 0]
+        self.stats.symbol_mul_ops_by_phase
     }
 
     pub fn get_symbol_add_ops_by_phase(&self) -> [usize; 5] {
-        [self.get_symbol_add_ops(), 0, 0, 0, 0]
+        self.stats.symbol_add_ops_by_phase
     }
 }
 
@@ -421,7 +492,9 @@ mod recording_tests {
     #[test]
     fn operation_recording_solver_records_for_supported_width() {
         let width = 64;
-        let rows: Vec<CoefficientRow> = (0..width).map(|col| vec![(col, Octet::one())]).collect();
+        let rows: Vec<CoefficientRow> = (0..width)
+            .map(|col| SparseOctetVec::from_octet_entries([(col, Octet::one())]))
+            .collect();
         let symbols = SymbolSlab::with_zeros(width, 1);
 
         let (decoded, ops) = solve(rows, width, symbols, OperationRecording::Record);
@@ -431,19 +504,37 @@ mod recording_tests {
     }
 
     #[test]
-    #[should_panic(expected = "generic RaptorQ solver supports at most 1024 intermediate symbols")]
+    fn traced_solver_counts_forward_and_backward_symbol_ops_by_phase() {
+        let rows = vec![
+            SparseOctetVec::from_binary_entries([0, 1]),
+            SparseOctetVec::from_binary_entries([0]),
+        ];
+        let symbols = SymbolSlab::with_zeros(2, 1);
+
+        let (decoded, ops, stats) = solve_traced(rows, 2, symbols, OperationRecording::Skip);
+
+        assert!(decoded.is_some());
+        assert!(ops.is_none());
+        assert_eq!(stats.symbol_mul_ops_by_phase, [1, 0, 0, 0, 1]);
+        assert_eq!(stats.symbol_add_ops_by_phase, [1, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "generic RaptorQ solver supports at most 1120 intermediate symbols")]
     fn generic_solver_rejects_width_above_supported_limit() {
         let width = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
-        let rows: Vec<CoefficientRow> = (0..width).map(|col| vec![(col, Octet::one())]).collect();
+        let rows: Vec<CoefficientRow> = (0..width)
+            .map(|col| SparseOctetVec::from_octet_entries([(col, Octet::one())]))
+            .collect();
         let symbols = SymbolSlab::with_zeros(width, 1);
 
         let _ = solve(rows, width, symbols, OperationRecording::Record);
     }
 
     #[test]
-    #[should_panic(expected = "generic RaptorQ solver supports at most 1024 intermediate symbols")]
+    #[should_panic(expected = "generic RaptorQ solver supports at most 1120 intermediate symbols")]
     fn oversized_source_block_encoding_plan_rejects_at_solver_limit() {
-        crate::SourceBlockEncodingPlan::generate(1_000);
+        crate::SourceBlockEncodingPlan::generate(1_051);
     }
 }
 
