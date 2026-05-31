@@ -1,4 +1,6 @@
-use raptorq::{ObjectTransmissionInformation, SourceBlockDecoder, SourceBlockEncoder};
+use raptorq::{
+    EncodingPacket, ObjectTransmissionInformation, SourceBlockDecoder, SourceBlockEncoder,
+};
 
 const SYMBOL_SIZE: u16 = 8;
 const SYMBOL_COUNTS: [usize; 3] = [10, 12, 50];
@@ -43,6 +45,31 @@ fn repair_only_round_trip_for_small_systematic_sizes() {
             "repair-only failed for K={symbol_count}"
         );
     }
+}
+
+#[test]
+fn contradictory_redundant_repair_rows_do_not_decode() {
+    let symbol_count = 10;
+    let data = deterministic_data(symbol_count);
+    let config = ObjectTransmissionInformation::new(0, SYMBOL_SIZE, 0, 1, 1);
+    let encoder = SourceBlockEncoder::new(0, &config, &data);
+    let repair_count = symbol_count as u32 + 12;
+
+    let repair_packets = encoder.repair_packets(0, repair_count);
+    let mut good_decoder = SourceBlockDecoder::new(0, &config, data.len() as u64);
+    assert_eq!(
+        good_decoder.decode(repair_packets.clone()),
+        Some(data.clone())
+    );
+
+    let mut contradictory_packets = repair_packets;
+    let last = contradictory_packets.last_mut().unwrap();
+    let mut corrupt_payload = last.data().to_vec();
+    corrupt_payload[0] ^= 0xff;
+    *last = EncodingPacket::new(last.payload_id().clone(), corrupt_payload);
+
+    let mut decoder = SourceBlockDecoder::new(0, &config, data.len() as u64);
+    assert_eq!(decoder.decode(contradictory_packets), None);
 }
 
 #[test]
