@@ -73,6 +73,31 @@ fn contradictory_redundant_repair_rows_do_not_decode() {
 }
 
 #[test]
+fn corrupt_exact_no_hdpc_repair_set_does_not_decode() {
+    let symbol_count = 10;
+    let data = deterministic_data(symbol_count);
+    let config = ObjectTransmissionInformation::new(0, SYMBOL_SIZE, 0, 1, 1);
+    let encoder = SourceBlockEncoder::new(0, &config, &data);
+    let repair_count = 20;
+
+    let repair_packets = encoder.repair_packets(0, repair_count);
+    let mut good_decoder = SourceBlockDecoder::new(0, &config, data.len() as u64);
+    assert_eq!(
+        good_decoder.decode(repair_packets.clone()),
+        Some(data.clone())
+    );
+
+    let mut corrupt_packets = repair_packets;
+    let first = corrupt_packets.first_mut().unwrap();
+    let mut corrupt_payload = first.data().to_vec();
+    corrupt_payload[0] ^= 0xff;
+    *first = EncodingPacket::new(first.payload_id().clone(), corrupt_payload);
+
+    let mut decoder = SourceBlockDecoder::new(0, &config, data.len() as u64);
+    assert_eq!(decoder.decode(corrupt_packets), None);
+}
+
+#[test]
 #[should_panic(expected = "integer division result exceeds u32")]
 fn oti_rejects_symbol_counts_that_would_wrap_u32() {
     ObjectTransmissionInformation::new(942_574_504_275, 1, 1, 1, 1);

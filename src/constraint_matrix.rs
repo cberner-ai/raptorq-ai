@@ -107,7 +107,7 @@ pub fn enc_indices<F>(
     }
 }
 
-fn generate_hdpc_rows(source_block_symbols: u32) -> DenseOctetMatrix {
+pub(crate) fn generate_hdpc_rows(source_block_symbols: u32) -> DenseOctetMatrix {
     let k_prime = extended_source_block_symbols(source_block_symbols);
     let s = num_ldpc_symbols(k_prime);
     let h = num_hdpc_symbols(k_prime);
@@ -147,4 +147,105 @@ fn generate_hdpc_rows(source_block_symbols: u32) -> DenseOctetMatrix {
 fn xor_one<M: BinaryMatrix>(matrix: &mut M, row: usize, col: usize) {
     let next = matrix.get(row, col) == Octet::zero();
     matrix.set(row, col, next);
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
+    #[cfg(feature = "std")]
+    use std::vec::Vec;
+
+    use super::*;
+    use crate::base::intermediate_tuple;
+
+    fn octet_row_entries(matrix: &DenseOctetMatrix, row: usize) -> Vec<(usize, u8)> {
+        (0..matrix.width())
+            .filter_map(|col| {
+                let value = matrix.get(row, col).value();
+                if value == 0 { None } else { Some((col, value)) }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tuple_generator_matches_rfc_shape_vectors() {
+        let cases = [
+            (10, 0, (2, 4, 9, 2, 5, 1)),
+            (10, 9, (6, 3, 16, 2, 6, 4)),
+            (10, 10, (2, 15, 15, 2, 10, 7)),
+            (101, 0, (2, 30, 4, 2, 5, 12)),
+            (101, 100, (2, 90, 23, 2, 8, 12)),
+            (1002, 1001, (23, 23, 516, 2, 44, 0)),
+            (56403, 56403, (3, 11594, 17800, 3, 58, 66)),
+        ];
+
+        for (source_symbols, internal_symbol_id, expected) in cases {
+            let tuple = intermediate_tuple(
+                internal_symbol_id,
+                num_lt_symbols(source_symbols),
+                systematic_index(source_symbols),
+                calculate_p1(source_symbols),
+            );
+            assert_eq!(tuple, expected);
+        }
+    }
+
+    #[test]
+    fn hdpc_rows_match_rfc_shape_vector_for_k10() {
+        let rows = generate_hdpc_rows(10);
+        assert_eq!(rows.height(), 10);
+        assert_eq!(rows.width(), 27);
+
+        assert_eq!(
+            octet_row_entries(&rows, 0),
+            vec![
+                (0, 250),
+                (1, 243),
+                (2, 247),
+                (3, 245),
+                (4, 244),
+                (5, 244),
+                (6, 244),
+                (7, 122),
+                (8, 61),
+                (9, 144),
+                (10, 72),
+                (11, 36),
+                (12, 18),
+                (13, 9),
+                (14, 4),
+                (15, 2),
+                (16, 1),
+                (17, 1),
+            ]
+        );
+        assert_eq!(
+            octet_row_entries(&rows, 9),
+            vec![
+                (0, 235),
+                (1, 117),
+                (2, 58),
+                (3, 29),
+                (4, 128),
+                (5, 64),
+                (6, 32),
+                (7, 16),
+                (8, 8),
+                (9, 4),
+                (10, 2),
+                (11, 1),
+                (12, 142),
+                (13, 201),
+                (14, 234),
+                (15, 117),
+                (16, 58),
+                (26, 1),
+            ]
+        );
+
+        for row in 0..rows.height() {
+            assert_eq!(rows.get(row, 17 + row), Octet::one());
+        }
+    }
 }
