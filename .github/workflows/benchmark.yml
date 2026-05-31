@@ -1,0 +1,136 @@
+name: Performance Benchmarks
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-benchmarks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run benchmarks
+        env:
+          BENCH_BASE_LABEL: master
+          BENCH_BASE_REF: origin/master
+          BENCH_HEAD_LABEL: PR
+          BENCH_HEAD_REF: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci_benchmarks.py
+
+      - name: Upload benchmark comment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-comment
+          path: target/benchmark-ci/comment.md
+          if-no-files-found: ignore
+
+  comment:
+    name: Post benchmark comment
+    runs-on: ubuntu-latest
+    needs: benchmark
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Download benchmark comment
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: benchmark-comment
+          path: benchmark-comment
+
+      - name: Post benchmark comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_FILE: benchmark-comment/comment.md
+          COMMENT_MARKER: "<!-- raptorq-benchmark-ci -->"
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ ! -s "$COMMENT_FILE" ]; then
+            echo "Benchmark comment file was not created."
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          body = open(os.environ["COMMENT_FILE"], encoding="utf-8").read()
+          marker = os.environ["COMMENT_MARKER"]
+          repo = os.environ["REPOSITORY"]
+          pr_number = os.environ["PR_NUMBER"]
+
+          comments = json.loads(
+              subprocess.check_output(
+                  [
+                      "gh",
+                      "api",
+                      f"repos/{repo}/issues/{pr_number}/comments",
+                      "--paginate",
+                      "--slurp",
+                  ],
+                  text=True,
+              )
+          )
+          comments = [
+              comment
+              for page in comments
+              for comment in (page if isinstance(page, list) else [page])
+          ]
+
+          comment_id = None
+          for comment in comments:
+              if marker in comment.get("body", ""):
+                  comment_id = comment["id"]
+                  break
+
+          if comment_id is None:
+              subprocess.check_call(
+                  [
+                      "gh",
+                      "api",
+                      f"repos/{repo}/issues/{pr_number}/comments",
+                      "-X",
+                      "POST",
+                      "-f",
+                      f"body={body}",
+                  ]
+              )
+          else:
+              subprocess.check_call(
+                  [
+                      "gh",
+                      "api",
+                      f"repos/{repo}/issues/comments/{comment_id}",
+                      "-X",
+                      "PATCH",
+                      "-f",
+                      f"body={body}",
+                  ]
+              )
+          PY
