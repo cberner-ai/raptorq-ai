@@ -14,7 +14,7 @@ use crate::constraint_matrix::{enc_indices, generate_hdpc_rows};
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
-use crate::octets::{fused_addassign_mul_scalar, mulassign_scalar};
+use crate::octets::{add_assign, fused_addassign_mul_scalar, mulassign_scalar};
 use crate::operation_vector::SymbolOps;
 use crate::sparse_matrix::SparseBinaryMatrix;
 use crate::symbol_slab::SymbolSlab;
@@ -263,10 +263,10 @@ pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
     assert_eq!(symbols.len(), matrix.height());
     let mut rows = Vec::with_capacity(matrix.height());
     for row in 0..matrix.height() {
-        rows.push(copy_binary_row(&matrix, row));
+        rows.push(matrix.row_entries(row));
     }
 
-    let (decoded, ops) = solve(rows, width, symbols, OperationRecording::Skip);
+    let (decoded, ops) = solve_binary(rows, width, symbols);
     match decoded {
         Some(decoded) => (verify_no_hdpc_solution(decoded, source_block_symbols), ops),
         None => (None, ops),
@@ -370,7 +370,7 @@ fn solve(
 
         if pivot != pivot_row {
             rows.swap(pivot, pivot_row);
-            swap_symbol_rows(&mut symbols, pivot, pivot_row);
+            symbols.swap_symbols(pivot, pivot_row);
             if let Some(ops) = ops.as_mut() {
                 ops.push(SymbolOps::Swap(pivot, pivot_row));
             }
@@ -387,7 +387,6 @@ fn solve(
         }
 
         let pivot_coefficients = rows[pivot_row].clone();
-        let pivot_symbol = symbols.get(pivot_row).to_vec();
         for row in 0..height {
             if row == pivot_row {
                 continue;
@@ -397,7 +396,8 @@ fn solve(
                 continue;
             }
             add_scaled_matrix_row(&mut rows[row], &pivot_coefficients, col, factor);
-            fused_addassign_mul_scalar(symbols.get_mut(row), &pivot_symbol, &factor);
+            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
+            fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
             if let Some(ops) = ops.as_mut() {
                 ops.push(SymbolOps::FusedAdd {
                     dest: row,
@@ -424,8 +424,70 @@ fn solve(
     (Some(decoded), ops)
 }
 
+fn solve_binary(
+    mut rows: Vec<Vec<usize>>,
+    width: usize,
+    mut symbols: SymbolSlab,
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    assert!(
+        width <= MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize,
+        "generic RaptorQ solver supports at most {MAX_SUPPORTED_INTERMEDIATE_SYMBOLS} intermediate symbols; optimized large-matrix PI solver is not implemented"
+    );
+
+    let height = rows.len();
+    let mut pivot_row = 0usize;
+    let mut row_merge_scratch = Vec::new();
+
+    for col in 0..width {
+        let Some(pivot) = (pivot_row..height).find(|&row| binary_row_contains(&rows[row], col))
+        else {
+            return (None, None);
+        };
+
+        if pivot != pivot_row {
+            rows.swap(pivot, pivot_row);
+            symbols.swap_symbols(pivot, pivot_row);
+        }
+
+        let pivot_coefficients = rows[pivot_row].clone();
+        for row in 0..height {
+            if row == pivot_row || !binary_row_contains(&rows[row], col) {
+                continue;
+            }
+
+            add_binary_row(
+                &mut rows[row],
+                &pivot_coefficients,
+                col,
+                &mut row_merge_scratch,
+            );
+            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
+            add_assign(dest_symbol, pivot_symbol);
+        }
+
+        pivot_row += 1;
+    }
+
+    for row in pivot_row..height {
+        if !rows[row].is_empty() || !symbol_is_zero(symbols.get(row)) {
+            return (None, None);
+        }
+    }
+
+    let mut decoded = SymbolSlab::with_zeros(width, symbols.symbol_size());
+    for row in 0..width {
+        decoded.get_mut(row).copy_from_slice(symbols.get(row));
+    }
+
+    (Some(decoded), None)
+}
+
 fn symbol_is_zero(symbol: &[u8]) -> bool {
     symbol.iter().all(|&byte| byte == 0)
+}
+
+fn binary_row_contains(row: &[usize], col: usize) -> bool {
+    row.binary_search(&col).is_ok()
 }
 
 fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {
@@ -485,14 +547,46 @@ fn add_scaled_matrix_row(
     *dest = merged;
 }
 
-fn swap_symbol_rows(symbols: &mut SymbolSlab, a: usize, b: usize) {
-    if a == b {
-        return;
+fn add_binary_row(
+    dest: &mut Vec<usize>,
+    src: &[usize],
+    start_col: usize,
+    scratch: &mut Vec<usize>,
+) {
+    let dest_start = dest.partition_point(|&col| col < start_col);
+    let mut src_index = src.partition_point(|&col| col < start_col);
+    let mut dest_index = dest_start;
+    scratch.clear();
+    scratch.reserve(dest.len() + src.len() - src_index);
+    scratch.extend_from_slice(&dest[..dest_start]);
+
+    while dest_index < dest.len() || src_index < src.len() {
+        match (dest.get(dest_index), src.get(src_index)) {
+            (Some(&dest_col), Some(&src_col)) => {
+                if dest_col < src_col {
+                    scratch.push(dest_col);
+                    dest_index += 1;
+                } else if src_col < dest_col {
+                    scratch.push(src_col);
+                    src_index += 1;
+                } else {
+                    dest_index += 1;
+                    src_index += 1;
+                }
+            }
+            (Some(&dest_col), None) => {
+                scratch.push(dest_col);
+                dest_index += 1;
+            }
+            (None, Some(&src_col)) => {
+                scratch.push(src_col);
+                src_index += 1;
+            }
+            (None, None) => break,
+        }
     }
-    let tmp = symbols.get(a).to_vec();
-    let b_bytes = symbols.get(b).to_vec();
-    symbols.get_mut(a).copy_from_slice(&b_bytes);
-    symbols.get_mut(b).copy_from_slice(&tmp);
+
+    core::mem::swap(dest, scratch);
 }
 
 #[cfg(feature = "benchmarking")]
