@@ -225,6 +225,10 @@ impl ObjectTransmissionInformation {
         };
 
         let num_source_blocks = int_div_ceil(kt as u64, kl(n_max) as u64);
+        assert!(
+            num_source_blocks <= u8::MAX as u32,
+            "default encoding parameters require {num_source_blocks} source blocks, but at most 255 are supported"
+        );
 
         let mut n = 1;
         for i in 1..=n_max {
@@ -359,10 +363,7 @@ mod tests {
 
     #[test]
     fn oti_serialization() {
-        let oti = ObjectTransmissionInformation::with_defaults(
-            rand::rng().random_range(0..(256 * 256 * 256 * 256 * 256)),
-            rand::rng().random(),
-        );
+        let oti = ObjectTransmissionInformation::with_defaults(1024 * 1024, 1024);
         let deserialized = ObjectTransmissionInformation::deserialize(&oti.serialize());
         assert_eq!(deserialized, oti);
     }

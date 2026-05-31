@@ -1,4 +1,4 @@
-use raptorq::{Encoder, calculate_block_offsets};
+use raptorq::{Encoder, ObjectTransmissionInformation, calculate_block_offsets};
 
 #[test]
 fn defaults_split_one_mib_into_solver_supported_blocks() {
@@ -14,4 +14,10 @@ fn defaults_split_one_mib_into_solver_supported_blocks() {
         .max()
         .unwrap();
     assert_eq!(largest_block_symbols, 512);
+}
+
+#[test]
+#[should_panic(expected = "default encoding parameters require 256 source blocks")]
+fn defaults_reject_objects_requiring_wrapped_source_block_count() {
+    ObjectTransmissionInformation::with_defaults(248_064_001, 1024);
 }

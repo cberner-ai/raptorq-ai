@@ -3,12 +3,13 @@ use rand::RngExt;
 use raptorq::{
     ObjectTransmissionInformation, SourceBlockDecoder, SourceBlockEncoder, SourceBlockEncodingPlan,
 };
+use std::time::Duration;
 
 fn bench_encode(c: &mut Criterion) {
     let symbol_size: u16 = 1280;
     let mut group = c.benchmark_group("encode");
 
-    for &symbol_count in &[10u32, 50, 100, 250, 500, 1000] {
+    for &symbol_count in &[10u32, 50, 100, 250, 500] {
         let elements = symbol_count as usize * symbol_size as usize;
         let mut data: Vec<u8> = vec![0; elements];
         for b in data.iter_mut() {
@@ -49,7 +50,7 @@ fn bench_decode(c: &mut Criterion) {
     let symbol_size: u16 = 1280;
     let mut group = c.benchmark_group("decode");
 
-    for &symbol_count in &[10u32, 50, 100, 250, 500, 1000] {
+    for &symbol_count in &[10u32, 50, 100, 250, 500] {
         let elements = symbol_count as usize * symbol_size as usize;
         let mut data: Vec<u8> = vec![0; elements];
         for b in data.iter_mut() {
@@ -109,5 +110,16 @@ fn bench_roundtrip(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_encode, bench_decode, bench_roundtrip);
+fn configured_criterion() -> Criterion {
+    Criterion::default()
+        .sample_size(10)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(1))
+}
+
+criterion_group! {
+    name = benches;
+    config = configured_criterion();
+    targets = bench_encode, bench_decode, bench_roundtrip
+}
 criterion_main!(benches);
