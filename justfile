@@ -2,6 +2,7 @@ build: pre
     cargo build
 
 pre:
+    bash scripts/check-protected-rust-files.sh
     cargo deny --all-features check licenses
     cargo fmt --all -- --check
     cargo clippy --all --all-targets -- -Dwarnings

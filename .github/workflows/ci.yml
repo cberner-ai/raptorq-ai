@@ -15,8 +15,55 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Detect lint-helper-only changes
+        id: change-scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          case "${EVENT_NAME}" in
+            pull_request)
+              base_ref="${PR_BASE_SHA}"
+              head_ref="${PR_HEAD_SHA}"
+              ;;
+            push)
+              base_ref="${PUSH_BEFORE_SHA}"
+              head_ref="${PUSH_AFTER_SHA}"
+              ;;
+            *)
+              base_ref="HEAD"
+              head_ref="HEAD"
+              ;;
+          esac
+
+          lint_helper_only=true
+          if [[ "${base_ref}" == "0000000000000000000000000000000000000000" ]]; then
+            lint_helper_only=false
+          else
+            while IFS= read -r file; do
+              case "${file}" in
+                .github/workflows/ci.yml|AGENTS.md|justfile|scripts/check-protected-rust-files.sh)
+                  ;;
+                *)
+                  lint_helper_only=false
+                  ;;
+              esac
+            done < <(git diff --name-only "${base_ref}..${head_ref}")
+          fi
+
+          echo "lint_helper_only=${lint_helper_only}" >> "${GITHUB_OUTPUT}"
+
       - name: Cache
         id: rust-cache
+        if: steps.change-scope.outputs.lint_helper_only != 'true'
         uses: actions/cache@v3
         with:
           path: |
@@ -28,16 +75,18 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml', 'rust-toolchain') }}
 
       - name: Install Python
+        if: steps.change-scope.outputs.lint_helper_only != 'true'
         uses: actions/setup-python@v4
         with:
           python-version: "3.10"
 
       - uses: actions-rs/toolchain@v1
+        if: steps.change-scope.outputs.lint_helper_only != 'true'
         with:
           components: rustfmt, clippy
 
       - name: Non ASCII characters
-        if: startsWith(matrix.os, 'ubuntu')
+        if: startsWith(matrix.os, 'ubuntu') && steps.change-scope.outputs.lint_helper_only != 'true'
         run: |
           if grep -P -n "[^\x00-\x7F]" -r --include="*.rs" --include="*.toml" .; then
           echo "Non-ASCII characters detected"
@@ -45,29 +94,42 @@ jobs:
           fi
 
       - name: Install cargo-deny
-        if: steps.rust-cache.outputs.cache-hit != 'true'
+        if: steps.change-scope.outputs.lint_helper_only != 'true' && steps.rust-cache.outputs.cache-hit != 'true'
         run: rustup run --install 1.85 cargo install --force --version 0.16.2 cargo-deny --locked
 
       - name: Install just
-        if: steps.rust-cache.outputs.cache-hit != 'true'
+        if: steps.change-scope.outputs.lint_helper_only == 'true' || steps.rust-cache.outputs.cache-hit != 'true'
         run: rustup run --install 1.85 cargo install --force --version 1.36.0 just --locked
 
+      - name: Smoke test lint helper changes
+        if: steps.change-scope.outputs.lint_helper_only == 'true'
+        run: |
+          bash -n scripts/check-protected-rust-files.sh
+          bash scripts/check-protected-rust-files.sh
+          just --dry-run pre
+
       - name: Clippy
+        if: steps.change-scope.outputs.lint_helper_only != 'true'
         run: cargo clippy --all --all-targets -- -Dwarnings
 
       - name: Format
+        if: steps.change-scope.outputs.lint_helper_only != 'true'
         run: cargo fmt --all -- --check
 
       - name: Run tests
+        if: steps.change-scope.outputs.lint_helper_only != 'true'
         run: just test
 
       - name: Compile benchmarks
+        if: steps.change-scope.outputs.lint_helper_only != 'true'
         run: cargo bench --features benchmarking --no-run
 
       - name: Run tests (no-std)
+        if: steps.change-scope.outputs.lint_helper_only != 'true'
         run: cargo test --no-default-features
 
       - name: Run CPython wrapper tests
+        if: steps.change-scope.outputs.lint_helper_only != 'true'
         run: |
           python3 -m venv venv
           source venv/bin/activate
