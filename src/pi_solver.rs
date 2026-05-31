@@ -5,7 +5,7 @@ use std::vec::Vec;
 use alloc::vec::Vec;
 
 use crate::base::intermediate_tuple;
-use crate::constraint_matrix::enc_indices;
+use crate::constraint_matrix::{enc_indices, generate_hdpc_rows};
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
@@ -14,7 +14,8 @@ use crate::operation_vector::SymbolOps;
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::num_ldpc_symbols;
 use crate::systematic_constants::{
-    calculate_p1, extended_source_block_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
+    calculate_p1, extended_source_block_symbols, num_intermediate_symbols, num_lt_symbols,
+    num_pi_symbols, systematic_index,
 };
 
 type CoefficientRow = Vec<(usize, Octet)>;
@@ -111,7 +112,7 @@ fn coefficient_rows<M: BinaryMatrix>(
 pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
     matrix: M,
     symbols: SymbolSlab,
-    _source_block_symbols: u32,
+    source_block_symbols: u32,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     let width = matrix.width();
     assert_eq!(symbols.len(), matrix.height());
@@ -120,7 +121,41 @@ pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
         rows.push(copy_binary_row(&matrix, row));
     }
 
-    solve(rows, width, symbols, false)
+    let (decoded, ops) = solve(rows, width, symbols, false);
+    match decoded {
+        Some(decoded) => (verify_no_hdpc_solution(decoded, source_block_symbols), ops),
+        None => (None, ops),
+    }
+}
+
+fn verify_no_hdpc_solution(decoded: SymbolSlab, source_block_symbols: u32) -> Option<SymbolSlab> {
+    if decoded.len() != num_intermediate_symbols(source_block_symbols) as usize {
+        return Some(decoded);
+    }
+
+    let hdpc_rows = generate_hdpc_rows(source_block_symbols);
+    if hdpc_rows_satisfied(&decoded, &hdpc_rows) {
+        Some(decoded)
+    } else {
+        None
+    }
+}
+
+fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bool {
+    let mut check = vec![0u8; decoded.symbol_size()];
+    for row in 0..hdpc_rows.height() {
+        check.fill(0);
+        for col in 0..hdpc_rows.width() {
+            let coefficient = hdpc_rows.get(row, col);
+            if !coefficient.is_zero() {
+                fused_addassign_mul_scalar(&mut check, decoded.get(col), &coefficient);
+            }
+        }
+        if !symbol_is_zero(&check) {
+            return false;
+        }
+    }
+    true
 }
 
 fn copy_binary_row<M: BinaryMatrix>(matrix: &M, row: usize) -> CoefficientRow {
