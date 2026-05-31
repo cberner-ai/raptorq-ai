@@ -19,7 +19,32 @@ use crate::systematic_constants::{
 };
 
 type CoefficientRow = Vec<(usize, Octet)>;
-const MAX_RECORDED_SOLVER_WIDTH: usize = 4096;
+const MAX_GENERIC_SOLVER_WIDTH: usize = 1024;
+
+// Systematic planning matrices feed SourceBlockEncodingPlan, which replays concrete row
+// operations. Recording must therefore stay independent of matrix width and feature set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationRecording {
+    Record,
+    Skip,
+}
+
+impl OperationRecording {
+    fn for_matrix<M: BinaryMatrix>(matrix: &M, source_block_symbols: u32) -> OperationRecording {
+        if is_full_systematic_planning_matrix(matrix, source_block_symbols) {
+            OperationRecording::Record
+        } else {
+            OperationRecording::Skip
+        }
+    }
+
+    fn new_ops(self) -> Option<Vec<SymbolOps>> {
+        match self {
+            OperationRecording::Record => Some(Vec::new()),
+            OperationRecording::Skip => None,
+        }
+    }
+}
 
 pub fn fused_inverse_mul_symbols<M: BinaryMatrix>(
     matrix: M,
@@ -27,45 +52,8 @@ pub fn fused_inverse_mul_symbols<M: BinaryMatrix>(
     symbols: SymbolSlab,
     source_block_symbols: u32,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
-    let is_systematic_plan = is_full_systematic_planning_matrix(&matrix, source_block_symbols);
-    if matrix.width() > MAX_RECORDED_SOLVER_WIDTH {
-        if is_systematic_plan {
-            #[cfg(feature = "std")]
-            {
-                return (
-                    None,
-                    Some(vec![SymbolOps::Solve {
-                        source_block_symbols,
-                    }]),
-                );
-            }
-        }
-
-        return fused_inverse_mul_symbols_impl(
-            matrix,
-            hdpc_rows,
-            symbols,
-            source_block_symbols,
-            false,
-        );
-    }
-    fused_inverse_mul_symbols_impl(
-        matrix,
-        hdpc_rows,
-        symbols,
-        source_block_symbols,
-        is_systematic_plan,
-    )
-}
-
-#[cfg(feature = "std")]
-pub(crate) fn fused_inverse_mul_symbols_without_ops<M: BinaryMatrix>(
-    matrix: M,
-    hdpc_rows: DenseOctetMatrix,
-    symbols: SymbolSlab,
-    source_block_symbols: u32,
-) -> Option<SymbolSlab> {
-    fused_inverse_mul_symbols_impl(matrix, hdpc_rows, symbols, source_block_symbols, false).0
+    let recording = OperationRecording::for_matrix(&matrix, source_block_symbols);
+    fused_inverse_mul_symbols_impl(matrix, hdpc_rows, symbols, source_block_symbols, recording)
 }
 
 fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
@@ -73,7 +61,7 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     hdpc_rows: DenseOctetMatrix,
     symbols: SymbolSlab,
     source_block_symbols: u32,
-    record_ops: bool,
+    recording: OperationRecording,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     let s = num_ldpc_symbols(source_block_symbols) as usize;
     let width = matrix.width();
@@ -83,7 +71,7 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     assert!(matrix.height() >= s);
 
     let rows = coefficient_rows(&matrix, &hdpc_rows, source_block_symbols);
-    solve(rows, width, symbols, record_ops)
+    solve(rows, width, symbols, recording)
 }
 
 fn coefficient_rows<M: BinaryMatrix>(
@@ -121,7 +109,7 @@ pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
         rows.push(copy_binary_row(&matrix, row));
     }
 
-    let (decoded, ops) = solve(rows, width, symbols, false);
+    let (decoded, ops) = solve(rows, width, symbols, OperationRecording::Skip);
     match decoded {
         Some(decoded) => (verify_no_hdpc_solution(decoded, source_block_symbols), ops),
         None => (None, ops),
@@ -210,15 +198,15 @@ fn solve(
     mut rows: Vec<CoefficientRow>,
     width: usize,
     mut symbols: SymbolSlab,
-    record_ops: bool,
+    recording: OperationRecording,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     assert!(
-        !record_ops || width <= MAX_RECORDED_SOLVER_WIDTH,
-        "operation-recording solver supports at most {MAX_RECORDED_SOLVER_WIDTH} columns"
+        width <= MAX_GENERIC_SOLVER_WIDTH,
+        "generic RaptorQ solver supports at most {MAX_GENERIC_SOLVER_WIDTH} intermediate symbols; optimized large-matrix PI solver is not implemented"
     );
 
     let height = rows.len();
-    let mut ops = if record_ops { Some(Vec::new()) } else { None };
+    let mut ops = recording.new_ops();
     let mut pivot_row = 0usize;
 
     for col in 0..width {
@@ -427,17 +415,49 @@ impl<M: BinaryMatrix> IntermediateSymbolDecoder<M> {
     }
 }
 
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+
+    #[test]
+    fn operation_recording_solver_records_for_supported_width() {
+        let width = 64;
+        let rows: Vec<CoefficientRow> = (0..width).map(|col| vec![(col, Octet::one())]).collect();
+        let symbols = SymbolSlab::with_zeros(width, 1);
+
+        let (decoded, ops) = solve(rows, width, symbols, OperationRecording::Record);
+
+        assert!(decoded.is_some());
+        assert!(ops.is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "generic RaptorQ solver supports at most 1024 intermediate symbols")]
+    fn generic_solver_rejects_width_above_supported_limit() {
+        let width = MAX_GENERIC_SOLVER_WIDTH + 1;
+        let rows: Vec<CoefficientRow> = (0..width).map(|col| vec![(col, Octet::one())]).collect();
+        let symbols = SymbolSlab::with_zeros(width, 1);
+
+        let _ = solve(rows, width, symbols, OperationRecording::Record);
+    }
+
+    #[test]
+    #[should_panic(expected = "generic RaptorQ solver supports at most 1024 intermediate symbols")]
+    fn oversized_source_block_encoding_plan_rejects_at_solver_limit() {
+        crate::SourceBlockEncodingPlan::generate(1_000);
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::constraint_matrix::generate_constraint_matrix;
     use crate::matrix::{BinaryMatrix, DenseBinaryMatrix};
     use crate::sparse_matrix::SparseBinaryMatrix;
-    use crate::systematic_constants::num_intermediate_symbols;
 
     #[test]
     fn large_non_planning_matrix_uses_non_recording_solver_without_ops() {
-        let width = MAX_RECORDED_SOLVER_WIDTH + 1;
+        let width = MAX_GENERIC_SOLVER_WIDTH;
         let mut matrix = DenseBinaryMatrix::new(width, width);
         for row in 0..width {
             matrix.set(row, row, true);
@@ -465,26 +485,6 @@ mod tests {
 
         assert!(decoded.is_some());
         assert!(ops.is_none());
-    }
-
-    #[test]
-    fn large_systematic_plan_returns_non_recording_solve_op_without_factorizing() {
-        let source_symbols = 5_000;
-        let k_prime = extended_source_block_symbols(source_symbols);
-        let symbols = SymbolSlab::with_zeros(num_intermediate_symbols(source_symbols) as usize, 1);
-        let indices: Vec<u32> = (0..k_prime).collect();
-        let (matrix, hdpc_rows) =
-            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
-
-        let (decoded, ops) = fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_symbols);
-
-        assert!(decoded.is_none());
-        assert!(matches!(
-            ops.as_deref(),
-            Some([SymbolOps::Solve {
-                source_block_symbols: 5_000
-            }])
-        ));
     }
 
     #[test]
