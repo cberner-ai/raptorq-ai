@@ -235,12 +235,22 @@ fn solve(
         pivot_row += 1;
     }
 
+    for row in pivot_row..height {
+        if !rows[row].is_empty() || !symbol_is_zero(symbols.get(row)) {
+            return (None, None);
+        }
+    }
+
     let mut decoded = SymbolSlab::with_zeros(width, symbols.symbol_size());
     for row in 0..width {
         decoded.get_mut(row).copy_from_slice(symbols.get(row));
     }
 
     (Some(decoded), ops)
+}
+
+fn symbol_is_zero(symbol: &[u8]) -> bool {
+    symbol.iter().all(|&byte| byte == 0)
 }
 
 fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {
@@ -462,5 +472,31 @@ mod tests {
             &decode_matrix,
             source_symbols
         ));
+    }
+
+    #[test]
+    fn overdetermined_consistent_no_hdpc_system_decodes() {
+        let mut matrix = DenseBinaryMatrix::new(2, 1);
+        matrix.set(0, 0, true);
+        matrix.set(1, 0, true);
+        let symbols = SymbolSlab::from_bytes(vec![0x5a, 0x5a], 1);
+
+        let (decoded, ops) = fused_inverse_mul_symbols_no_hdpc(matrix, symbols, 1);
+
+        assert_eq!(decoded.unwrap().get(0), &[0x5a]);
+        assert!(ops.is_none());
+    }
+
+    #[test]
+    fn overdetermined_inconsistent_no_hdpc_system_fails() {
+        let mut matrix = DenseBinaryMatrix::new(2, 1);
+        matrix.set(0, 0, true);
+        matrix.set(1, 0, true);
+        let symbols = SymbolSlab::from_bytes(vec![0x5a, 0xa5], 1);
+
+        let (decoded, ops) = fused_inverse_mul_symbols_no_hdpc(matrix, symbols, 1);
+
+        assert!(decoded.is_none());
+        assert!(ops.is_none());
     }
 }
