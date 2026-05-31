@@ -1,6 +1,26 @@
-pub const MAX_SOURCE_SYMBOLS_PER_BLOCK: u32 = 56403;
+type SystematicParameters = (u32, u32, u32, u32, u32);
 
-pub const SYSTEMATIC_INDICES_AND_PARAMETERS: &[(u32, u32, u32, u32, u32)] = &[
+pub const MAX_SOURCE_SYMBOLS_PER_BLOCK: u32 = 56403;
+pub(crate) const MAX_SUPPORTED_INTERMEDIATE_SYMBOLS: u32 = 1024;
+
+// Default OTI selection consumes this view. Keep it capped to source blocks the
+// generic solver can handle, while full RFC lookups still use the table below.
+pub(crate) struct SupportedSystematicParameters;
+
+pub(crate) const SYSTEMATIC_INDICES_AND_PARAMETERS: SupportedSystematicParameters =
+    SupportedSystematicParameters;
+
+impl SupportedSystematicParameters {
+    pub(crate) fn iter(&self) -> core::slice::Iter<'static, SystematicParameters> {
+        let supported_len = RFC_SYSTEMATIC_INDICES_AND_PARAMETERS
+            .iter()
+            .position(|&(k_prime, _, s, h, _)| k_prime + s + h > MAX_SUPPORTED_INTERMEDIATE_SYMBOLS)
+            .unwrap_or(RFC_SYSTEMATIC_INDICES_AND_PARAMETERS.len());
+        RFC_SYSTEMATIC_INDICES_AND_PARAMETERS[..supported_len].iter()
+    }
+}
+
+const RFC_SYSTEMATIC_INDICES_AND_PARAMETERS: &[SystematicParameters] = &[
     (10, 254, 7, 10, 17),
     (12, 630, 7, 10, 19),
     (18, 682, 11, 10, 29),
@@ -481,7 +501,7 @@ pub const SYSTEMATIC_INDICES_AND_PARAMETERS: &[(u32, u32, u32, u32, u32)] = &[
 ];
 
 fn parameters(source_symbols: u32) -> (u32, u32, u32, u32, u32) {
-    for &(k_prime, systematic_index, s, h, w) in SYSTEMATIC_INDICES_AND_PARAMETERS {
+    for &(k_prime, systematic_index, s, h, w) in RFC_SYSTEMATIC_INDICES_AND_PARAMETERS {
         if source_symbols <= k_prime {
             return (k_prime, systematic_index, s, h, w);
         }

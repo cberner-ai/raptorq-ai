@@ -14,12 +14,11 @@ use crate::operation_vector::SymbolOps;
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::num_ldpc_symbols;
 use crate::systematic_constants::{
-    calculate_p1, extended_source_block_symbols, num_intermediate_symbols, num_lt_symbols,
-    num_pi_symbols, systematic_index,
+    MAX_SUPPORTED_INTERMEDIATE_SYMBOLS, calculate_p1, extended_source_block_symbols,
+    num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
 };
 
 type CoefficientRow = Vec<(usize, Octet)>;
-const MAX_GENERIC_SOLVER_WIDTH: usize = 1024;
 
 // Systematic planning matrices feed SourceBlockEncodingPlan, which replays concrete row
 // operations. Recording must therefore stay independent of matrix width and feature set.
@@ -201,8 +200,8 @@ fn solve(
     recording: OperationRecording,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     assert!(
-        width <= MAX_GENERIC_SOLVER_WIDTH,
-        "generic RaptorQ solver supports at most {MAX_GENERIC_SOLVER_WIDTH} intermediate symbols; optimized large-matrix PI solver is not implemented"
+        width <= MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize,
+        "generic RaptorQ solver supports at most {MAX_SUPPORTED_INTERMEDIATE_SYMBOLS} intermediate symbols; optimized large-matrix PI solver is not implemented"
     );
 
     let height = rows.len();
@@ -434,7 +433,7 @@ mod recording_tests {
     #[test]
     #[should_panic(expected = "generic RaptorQ solver supports at most 1024 intermediate symbols")]
     fn generic_solver_rejects_width_above_supported_limit() {
-        let width = MAX_GENERIC_SOLVER_WIDTH + 1;
+        let width = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
         let rows: Vec<CoefficientRow> = (0..width).map(|col| vec![(col, Octet::one())]).collect();
         let symbols = SymbolSlab::with_zeros(width, 1);
 
@@ -457,7 +456,7 @@ mod tests {
 
     #[test]
     fn large_non_planning_matrix_uses_non_recording_solver_without_ops() {
-        let width = MAX_GENERIC_SOLVER_WIDTH;
+        let width = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize;
         let mut matrix = DenseBinaryMatrix::new(width, width);
         for row in 0..width {
             matrix.set(row, row, true);
