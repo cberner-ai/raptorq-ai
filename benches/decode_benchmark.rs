@@ -6,7 +6,7 @@ const TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const SYMBOL_COUNTS: [usize; 4] = [10, 100, 250, 500];
 
 fn black_box(value: u64) {
-    if value == rand::rng().random() {
+    if value == rand::rng().random::<u64>() {
         println!("{value}");
     }
 }

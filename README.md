@@ -20,7 +20,7 @@ See the `examples/` directory for usage.
 
 ### Benchmarks
 
-This clean-room implementation currently uses a generic solver for matrices up to 1024
+This clean-room implementation currently uses a generic solver for matrices up to 1120
 intermediate symbols. An optimized large-matrix PI/inactivation solver is not implemented yet.
 
 The following were run on a Ryzen 9 9950X3D @ 4.30GHz
