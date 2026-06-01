@@ -407,6 +407,10 @@ fn solve(
     mut symbols: SymbolSlab,
     recording: OperationRecording,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    if recording == OperationRecording::Skip {
+        return solve_without_recording(rows, width, symbols);
+    }
+
     let height = rows.len();
     let mut ops = recording.new_ops();
     let mut pivot_row = 0usize;
@@ -503,6 +507,76 @@ fn solve(
     }
 
     (Some(decoded), ops)
+}
+
+fn solve_without_recording(
+    mut rows: Vec<CoefficientRow>,
+    width: usize,
+    mut symbols: SymbolSlab,
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    let height = rows.len();
+    let mut row_merge_scratch = Vec::new();
+
+    for col in 0..width {
+        let Some((pivot, pivot_value)) =
+            select_pivot_row(&rows, col, height, width, col, OperationRecording::Skip)
+        else {
+            return (None, None);
+        };
+
+        if pivot != col {
+            rows.swap(pivot, col);
+            symbols.swap_symbols(pivot, col);
+        }
+
+        if pivot_value != Octet::one() {
+            let scalar = pivot_value.inverse();
+            scale_matrix_row(&mut rows[col], col, scalar);
+            mulassign_scalar(symbols.get_mut(col), &scalar);
+        }
+
+        let (pivot_and_before_after, rows_after) = rows.split_at_mut(col + 1);
+        let pivot_coefficients = &pivot_and_before_after[col];
+
+        for (offset, row_coefficients) in rows_after.iter_mut().enumerate() {
+            let row = col + 1 + offset;
+            let factor = coefficient_at(row_coefficients, col);
+            if factor.is_zero() {
+                continue;
+            }
+            add_scaled_matrix_row(
+                row_coefficients,
+                pivot_coefficients,
+                col,
+                factor,
+                &mut row_merge_scratch,
+            );
+            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(col, row);
+            fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
+        }
+    }
+
+    for row in width..height {
+        if !rows[row].is_empty() || !symbol_is_zero(symbols.get(row)) {
+            return (None, None);
+        }
+    }
+
+    let mut decoded = SymbolSlab::with_zeros(width, symbols.symbol_size());
+    // Non-recording solves only need the result, so the upper triangle is resolved here
+    // instead of clearing earlier rows during elimination.
+    for row in (0..width).rev() {
+        decoded.get_mut(row).copy_from_slice(symbols.get(row));
+        for &(col, coefficient) in rows[row].iter().rev() {
+            if col <= row {
+                break;
+            }
+            let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(col, row);
+            fused_addassign_mul_scalar(dest_symbol, dependent_symbol, &coefficient);
+        }
+    }
+
+    (Some(decoded), None)
 }
 
 fn select_pivot_row(
@@ -854,6 +928,34 @@ mod tests {
         let (decoded, ops) = fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, 1);
 
         assert!(decoded.is_some());
+        assert!(ops.is_none());
+    }
+
+    #[test]
+    fn non_recording_solver_back_substitutes_non_unit_pivots() {
+        let x0 = Octet::new(0x11);
+        let x1 = Octet::new(0x22);
+        let x2 = Octet::new(0x33);
+        let rows = vec![
+            vec![(0, Octet::new(5)), (1, Octet::new(2)), (2, Octet::new(3))],
+            vec![(1, Octet::new(7)), (2, Octet::new(4))],
+            vec![(2, Octet::new(9))],
+        ];
+        let symbols = SymbolSlab::from_bytes(
+            vec![
+                (Octet::new(5) * x0 + Octet::new(2) * x1 + Octet::new(3) * x2).value(),
+                (Octet::new(7) * x1 + Octet::new(4) * x2).value(),
+                (Octet::new(9) * x2).value(),
+            ],
+            1,
+        );
+
+        let (decoded, ops) = solve(rows, 3, symbols, OperationRecording::Skip);
+
+        assert_eq!(
+            decoded.unwrap(),
+            SymbolSlab::from_bytes(vec![x0.value(), x1.value(), x2.value()], 1)
+        );
         assert!(ops.is_none());
     }
 
