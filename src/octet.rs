@@ -56,10 +56,29 @@ impl Octet {
     pub const fn is_zero(self) -> bool {
         self.value == 0
     }
+
+    pub(crate) fn mul_table(self) -> &'static [u8; 256] {
+        &GF_MUL_TABLE[self.value as usize]
+    }
 }
 
-#[inline]
-fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+static GF_MUL_TABLE: [[u8; 256]; 256] = generate_gf_mul_table();
+
+const fn generate_gf_mul_table() -> [[u8; 256]; 256] {
+    let mut table = [[0u8; 256]; 256];
+    let mut a = 0usize;
+    while a < 256 {
+        let mut b = 0usize;
+        while b < 256 {
+            table[a][b] = gf_mul_slow(a as u8, b as u8);
+            b += 1;
+        }
+        a += 1;
+    }
+    table
+}
+
+const fn gf_mul_slow(mut a: u8, mut b: u8) -> u8 {
     let mut product = 0u8;
     while b != 0 {
         if b & 1 != 0 {
@@ -73,6 +92,19 @@ fn gf_mul(mut a: u8, mut b: u8) -> u8 {
         }
     }
     product
+}
+
+#[inline]
+fn gf_mul(a: u8, b: u8) -> u8 {
+    if a == 0 || b == 0 {
+        0
+    } else if a == 1 {
+        b
+    } else if b == 1 {
+        a
+    } else {
+        GF_MUL_TABLE[a as usize][b as usize]
+    }
 }
 
 #[allow(clippy::suspicious_arithmetic_impl)]
@@ -149,5 +181,27 @@ impl From<u8> for Octet {
 impl From<Octet> for u8 {
     fn from(value: Octet) -> u8 {
         value.value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gf_mul_table_matches_shift_multiply() {
+        for a in u8::MIN..=u8::MAX {
+            for b in u8::MIN..=u8::MAX {
+                assert_eq!(gf_mul(a, b), gf_mul_slow(a, b));
+            }
+        }
+    }
+
+    #[test]
+    fn nonzero_octets_have_multiplicative_inverses() {
+        for value in 1..=u8::MAX {
+            let octet = Octet::new(value);
+            assert_eq!(octet * octet.inverse(), Octet::one());
+        }
     }
 }
