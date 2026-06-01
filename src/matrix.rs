@@ -85,8 +85,46 @@ impl BinaryMatrix for DenseBinaryMatrix {
 
     fn row_entries(&self, row: usize) -> Vec<usize> {
         assert!(row < self.height);
-        (0..self.width)
-            .filter(|&col| self.get(row, col) != Octet::zero())
-            .collect()
+        let start_bit = row * self.width;
+        let end_bit = start_bit + self.width;
+        let mut entries = Vec::new();
+        let mut bit = start_bit;
+
+        while bit < end_bit {
+            let byte_index = bit / 8;
+            let bit_offset = bit % 8;
+            let bits_in_byte = (8 - bit_offset).min(end_bit - bit);
+            let mask = (((1u16 << bits_in_byte) - 1) as u8) << bit_offset;
+            let mut byte = self.data[byte_index] & mask;
+
+            while byte != 0 {
+                let set_bit = byte.trailing_zeros() as usize;
+                entries.push(byte_index * 8 + set_bit - start_bit);
+                byte &= byte - 1;
+            }
+
+            bit += bits_in_byte;
+        }
+
+        entries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_row_entries_handles_unaligned_rows() {
+        let mut matrix = DenseBinaryMatrix::new(3, 5);
+        matrix.set(0, 0, true);
+        matrix.set(0, 4, true);
+        matrix.set(1, 1, true);
+        matrix.set(1, 3, true);
+        matrix.set(2, 2, true);
+
+        assert_eq!(matrix.row_entries(0), vec![0, 4]);
+        assert_eq!(matrix.row_entries(1), vec![1, 3]);
+        assert_eq!(matrix.row_entries(2), vec![2]);
     }
 }
