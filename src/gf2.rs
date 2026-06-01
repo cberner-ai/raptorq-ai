@@ -84,6 +84,23 @@ impl PackedBinaryRows {
         }
     }
 
+    pub(crate) fn weight_at_or_after(&self, row: usize, start_col: usize) -> u32 {
+        assert!(row < self.height);
+        if start_col >= self.width {
+            return 0;
+        }
+
+        let row_start = self.row_start(row);
+        let first_word = start_col / u64::BITS as usize;
+        let bit_offset = start_col % u64::BITS as usize;
+        let mut weight =
+            (self.words[row_start + first_word] & (u64::MAX << bit_offset)).count_ones();
+        for offset in (first_word + 1)..self.words_per_row {
+            weight += self.words[row_start + offset].count_ones();
+        }
+        weight
+    }
+
     pub(crate) fn visit_ones_at_or_after<F>(&self, row: usize, start_col: usize, mut visit: F)
     where
         F: FnMut(usize),
@@ -181,5 +198,16 @@ mod tests {
         packed.visit_ones_at_or_after(0, 63, |col| visited.push(col));
 
         assert_eq!(visited, vec![63, 64, 95]);
+    }
+
+    #[test]
+    fn weight_counts_suffix_bits() {
+        let rows = vec![vec![1, 63, 64, 95]];
+        let packed = PackedBinaryRows::from_sparse(rows, 96);
+
+        assert_eq!(packed.weight_at_or_after(0, 0), 4);
+        assert_eq!(packed.weight_at_or_after(0, 2), 3);
+        assert_eq!(packed.weight_at_or_after(0, 64), 2);
+        assert_eq!(packed.weight_at_or_after(0, 96), 0);
     }
 }
