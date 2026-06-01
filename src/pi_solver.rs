@@ -649,7 +649,9 @@ fn solve_binary(
     let mut is_pivot_row = vec![false; height];
 
     for col in 0..width {
-        let Some(pivot) = pop_binary_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) else {
+        let Some(pivot) =
+            pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
+        else {
             return (None, None);
         };
         pivot_for_col[col] = Some(pivot);
@@ -705,6 +707,47 @@ fn pop_binary_row_bucket(
     bucket_heads[col] = next_in_bucket[row];
     next_in_bucket[row] = None;
     Some(row)
+}
+
+fn pop_lightest_binary_row_bucket(
+    rows: &PackedBinaryRows,
+    bucket_heads: &mut [Option<usize>],
+    next_in_bucket: &mut [Option<usize>],
+    col: usize,
+) -> Option<usize> {
+    let head = bucket_heads[col]?;
+    if next_in_bucket[head].is_none() {
+        bucket_heads[col] = None;
+        return Some(head);
+    }
+
+    let mut best = head;
+    let mut best_previous = None;
+    let mut best_weight = rows.weight_at_or_after(head, col);
+    let mut previous = head;
+    let mut current = next_in_bucket[head];
+
+    while let Some(row) = current {
+        let weight = rows.weight_at_or_after(row, col);
+        if weight < best_weight {
+            best = row;
+            best_previous = Some(previous);
+            best_weight = weight;
+            if weight == 1 {
+                break;
+            }
+        }
+        previous = row;
+        current = next_in_bucket[row];
+    }
+
+    if let Some(previous) = best_previous {
+        next_in_bucket[previous] = next_in_bucket[best];
+    } else {
+        bucket_heads[col] = next_in_bucket[best];
+    }
+    next_in_bucket[best] = None;
+    Some(best)
 }
 
 fn symbol_is_zero(symbol: &[u8]) -> bool {
