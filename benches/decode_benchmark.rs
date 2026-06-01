@@ -4,6 +4,8 @@ use std::time::Instant;
 
 const TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const SYMBOL_COUNTS: [usize; 4] = [10, 100, 250, 500];
+const CI_TARGET_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+const CI_SYMBOL_COUNTS: [usize; 2] = [10, 100];
 
 fn black_box(value: u64) {
     if value == rand::rng().random() {
@@ -11,16 +13,25 @@ fn black_box(value: u64) {
     }
 }
 
-fn benchmark(symbol_size: u16, overhead: f64) -> u64 {
+fn ci_mode_enabled() -> bool {
+    std::env::args().any(|arg| arg == "--ci")
+}
+
+fn benchmark(
+    symbol_size: u16,
+    overhead: f64,
+    target_total_bytes: usize,
+    symbol_counts: &[usize],
+) -> u64 {
     let mut black_box_value = 0;
-    for &symbol_count in SYMBOL_COUNTS.iter() {
+    for &symbol_count in symbol_counts.iter() {
         let elements = symbol_count * symbol_size as usize;
         let mut data: Vec<u8> = vec![0; elements];
         for byte in data.iter_mut() {
             *byte = rand::rng().random();
         }
 
-        let iterations = TARGET_TOTAL_BYTES / elements;
+        let iterations = (target_total_bytes / elements).max(1);
         let config = ObjectTransmissionInformation::new(0, symbol_size, 0, 1, 1);
         let encoder = SourceBlockEncoder::new(1, &config, &data);
         let elements_and_overhead = (symbol_count as f64 * (1.0 + overhead)) as u32;
@@ -51,8 +62,25 @@ fn benchmark(symbol_size: u16, overhead: f64) -> u64 {
 
 fn main() {
     let symbol_size = 1280;
+    let (target_total_bytes, symbol_counts) = if ci_mode_enabled() {
+        println!("Running CI benchmark subset");
+        (CI_TARGET_TOTAL_BYTES, CI_SYMBOL_COUNTS.as_slice())
+    } else {
+        (TARGET_TOTAL_BYTES, SYMBOL_COUNTS.as_slice())
+    };
+
     println!("Symbol size: {symbol_size} bytes");
-    black_box(benchmark(symbol_size, 0.0));
+    black_box(benchmark(
+        symbol_size,
+        0.0,
+        target_total_bytes,
+        symbol_counts,
+    ));
     println!();
-    black_box(benchmark(symbol_size, 0.05));
+    black_box(benchmark(
+        symbol_size,
+        0.05,
+        target_total_bytes,
+        symbol_counts,
+    ));
 }

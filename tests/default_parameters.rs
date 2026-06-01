@@ -1,10 +1,9 @@
-use raptorq::{Encoder, ObjectTransmissionInformation, calculate_block_offsets};
+use raptorq::{ObjectTransmissionInformation, calculate_block_offsets};
 
 #[test]
 fn defaults_split_one_mib_into_solver_supported_blocks() {
     let data = vec![0u8; 1024 * 1024];
-    let encoder = Encoder::with_defaults(&data, 1024);
-    let config = encoder.get_config();
+    let config = ObjectTransmissionInformation::with_defaults(data.len() as u64, 1024);
 
     assert_eq!(config.source_blocks(), 2);
 
