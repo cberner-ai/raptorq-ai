@@ -562,6 +562,11 @@ fn add_scaled_matrix_row(
     scalar: Octet,
     scratch: &mut CoefficientRow,
 ) {
+    if scalar == Octet::one() {
+        add_unscaled_matrix_row(dest, src, start_col, scratch);
+        return;
+    }
+
     let mut dest_index = 0usize;
     let mut src_index = src.partition_point(|&(col, _)| col < start_col);
     scratch.clear();
@@ -574,10 +579,10 @@ fn add_scaled_matrix_row(
                     scratch.push((dest_col, dest_value));
                     dest_index += 1;
                 } else if src_col < dest_col {
-                    scratch.push((src_col, scaled_coefficient(src_value, scalar)));
+                    scratch.push((src_col, src_value * scalar));
                     src_index += 1;
                 } else {
-                    let value = dest_value + scaled_coefficient(src_value, scalar);
+                    let value = dest_value + src_value * scalar;
                     if !value.is_zero() {
                         scratch.push((dest_col, value));
                     }
@@ -590,7 +595,7 @@ fn add_scaled_matrix_row(
                 dest_index += 1;
             }
             (None, Some(&(src_col, src_value))) => {
-                scratch.push((src_col, scaled_coefficient(src_value, scalar)));
+                scratch.push((src_col, src_value * scalar));
                 src_index += 1;
             }
             (None, None) => break,
@@ -600,12 +605,48 @@ fn add_scaled_matrix_row(
     core::mem::swap(dest, scratch);
 }
 
-fn scaled_coefficient(value: Octet, scalar: Octet) -> Octet {
-    if scalar == Octet::one() {
-        value
-    } else {
-        value * scalar
+fn add_unscaled_matrix_row(
+    dest: &mut CoefficientRow,
+    src: &CoefficientRow,
+    start_col: usize,
+    scratch: &mut CoefficientRow,
+) {
+    let mut dest_index = 0usize;
+    let mut src_index = src.partition_point(|&(col, _)| col < start_col);
+    scratch.clear();
+    scratch.reserve(dest.len() + src.len() - src_index);
+
+    while dest_index < dest.len() || src_index < src.len() {
+        match (dest.get(dest_index), src.get(src_index)) {
+            (Some(&(dest_col, dest_value)), Some(&(src_col, src_value))) => {
+                if dest_col < src_col {
+                    scratch.push((dest_col, dest_value));
+                    dest_index += 1;
+                } else if src_col < dest_col {
+                    scratch.push((src_col, src_value));
+                    src_index += 1;
+                } else {
+                    let value = dest_value + src_value;
+                    if !value.is_zero() {
+                        scratch.push((dest_col, value));
+                    }
+                    dest_index += 1;
+                    src_index += 1;
+                }
+            }
+            (Some(&(dest_col, dest_value)), None) => {
+                scratch.push((dest_col, dest_value));
+                dest_index += 1;
+            }
+            (None, Some(&(src_col, src_value))) => {
+                scratch.push((src_col, src_value));
+                src_index += 1;
+            }
+            (None, None) => break,
+        }
     }
+
+    core::mem::swap(dest, scratch);
 }
 
 #[cfg(feature = "benchmarking")]
