@@ -305,11 +305,9 @@ fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bo
 }
 
 fn copy_binary_row<M: BinaryMatrix>(matrix: &M, row: usize) -> CoefficientRow {
-    matrix
-        .row_entries(row)
-        .into_iter()
-        .map(|col| (col, Octet::one()))
-        .collect()
+    let mut result = Vec::new();
+    matrix.visit_row_entries(row, |col| result.push((col, Octet::one())));
+    result
 }
 
 fn copy_octet_row(matrix: &DenseOctetMatrix, row: usize) -> CoefficientRow {

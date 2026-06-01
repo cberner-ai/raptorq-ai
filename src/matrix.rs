@@ -19,10 +19,21 @@ pub trait BinaryMatrix: Clone {
         self.set(row, col, next);
     }
 
+    fn visit_row_entries<F>(&self, row: usize, mut visit: F)
+    where
+        F: FnMut(usize),
+    {
+        for col in 0..self.width() {
+            if self.get(row, col) != Octet::zero() {
+                visit(col);
+            }
+        }
+    }
+
     fn row_entries(&self, row: usize) -> Vec<usize> {
-        (0..self.width())
-            .filter(|&col| self.get(row, col) != Octet::zero())
-            .collect()
+        let mut entries = Vec::new();
+        self.visit_row_entries(row, |col| entries.push(col));
+        entries
     }
 }
 
@@ -83,11 +94,13 @@ impl BinaryMatrix for DenseBinaryMatrix {
         self.data[byte] ^= mask;
     }
 
-    fn row_entries(&self, row: usize) -> Vec<usize> {
+    fn visit_row_entries<F>(&self, row: usize, mut visit: F)
+    where
+        F: FnMut(usize),
+    {
         assert!(row < self.height);
         let start_bit = row * self.width;
         let end_bit = start_bit + self.width;
-        let mut entries = Vec::new();
         let mut bit = start_bit;
 
         while bit < end_bit {
@@ -99,13 +112,17 @@ impl BinaryMatrix for DenseBinaryMatrix {
 
             while byte != 0 {
                 let set_bit = byte.trailing_zeros() as usize;
-                entries.push(byte_index * 8 + set_bit - start_bit);
+                visit(byte_index * 8 + set_bit - start_bit);
                 byte &= byte - 1;
             }
 
             bit += bits_in_byte;
         }
+    }
 
+    fn row_entries(&self, row: usize) -> Vec<usize> {
+        let mut entries = Vec::new();
+        self.visit_row_entries(row, |col| entries.push(col));
         entries
     }
 }

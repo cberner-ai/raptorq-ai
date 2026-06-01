@@ -69,6 +69,16 @@ impl BinaryMatrix for SparseBinaryMatrix {
         }
     }
 
+    fn visit_row_entries<F>(&self, row: usize, mut visit: F)
+    where
+        F: FnMut(usize),
+    {
+        assert!(row < self.rows.len());
+        for &col in &self.rows[row] {
+            visit(col);
+        }
+    }
+
     fn row_entries(&self, row: usize) -> Vec<usize> {
         assert!(row < self.rows.len());
         self.rows[row].clone()
