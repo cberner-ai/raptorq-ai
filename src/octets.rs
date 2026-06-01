@@ -2,6 +2,13 @@ use crate::octet::Octet;
 
 pub fn add_assign(dest: &mut [u8], src: &[u8]) {
     assert_eq!(dest.len(), src.len());
+    if try_add_assign_avx2(dest, src) {
+        return;
+    }
+    add_assign_scalar(dest, src);
+}
+
+fn add_assign_scalar(dest: &mut [u8], src: &[u8]) {
     for (d, s) in dest.iter_mut().zip(src.iter()) {
         *d ^= *s;
     }
@@ -72,6 +79,23 @@ fn fused_addassign_table(dest: &mut [u8], src: &[u8], table: &[u8; 256]) {
     {
         *d ^= table[*s as usize];
     }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+fn try_add_assign_avx2(dest: &mut [u8], src: &[u8]) -> bool {
+    if dest.len() < 64 || !std::arch::is_x86_feature_detected!("avx2") {
+        return false;
+    }
+
+    unsafe {
+        add_assign_avx2(dest, src);
+    }
+    true
+}
+
+#[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
+fn try_add_assign_avx2(_dest: &mut [u8], _src: &[u8]) -> bool {
+    false
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -167,6 +191,43 @@ unsafe fn fused_addassign_mul_scalar_avx2(dest: &mut [u8], src: &[u8], table: &'
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
+unsafe fn add_assign_avx2(dest: &mut [u8], src: &[u8]) {
+    let mut offset = 0usize;
+    while offset + 128 <= dest.len() {
+        // Pointers stay inside equal-length slices; unaligned loads handle arbitrary alignment.
+        unsafe {
+            xor_32(dest, src, offset);
+            xor_32(dest, src, offset + 32);
+            xor_32(dest, src, offset + 64);
+            xor_32(dest, src, offset + 96);
+        }
+        offset += 128;
+    }
+    while offset + 32 <= dest.len() {
+        unsafe {
+            xor_32(dest, src, offset);
+        }
+        offset += 32;
+    }
+    add_assign_scalar(&mut dest[offset..], &src[offset..]);
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_32(dest: &mut [u8], src: &[u8], offset: usize) {
+    unsafe {
+        let dest_ptr = dest.as_mut_ptr().add(offset).cast::<__m256i>();
+        let src_ptr = src.as_ptr().add(offset).cast::<__m256i>();
+        let updated = _mm256_xor_si256(
+            _mm256_loadu_si256(dest_ptr.cast_const()),
+            _mm256_loadu_si256(src_ptr),
+        );
+        _mm256_storeu_si256(dest_ptr, updated);
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
 fn avx2_nibble_tables(table: &'static [u8; 256]) -> (__m256i, __m256i) {
     let mut low = [0u8; 32];
     let mut high = [0u8; 32];
@@ -209,6 +270,7 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
+    use crate::symbol::Symbol;
 
     #[test]
     fn mulassign_scalar_matches_table() {
@@ -258,6 +320,50 @@ mod tests {
                 assert_eq!(dest, expected);
             }
         }
+    }
+
+    #[test]
+    fn add_assign_boundary_lengths_match_scalar_xor() {
+        for len in [64usize, 95, 127, 128, 129] {
+            let original = patterned_bytes(len);
+            let src = patterned_bytes(len)
+                .into_iter()
+                .map(|byte| byte.rotate_left(3) ^ 0xa5)
+                .collect::<Vec<_>>();
+            let expected = scalar_xor(original.clone(), &src);
+
+            let mut direct = original.clone();
+            add_assign(&mut direct, &src);
+            assert_eq!(direct, expected, "add_assign failed for length {len}");
+
+            let mut symbol = Symbol::new(original.clone());
+            let other = Symbol::new(src.clone());
+            symbol += &other;
+            assert_eq!(
+                symbol.into_bytes(),
+                expected,
+                "Symbol += failed for length {len}"
+            );
+
+            #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let mut avx2_direct = original;
+                unsafe {
+                    add_assign_avx2(&mut avx2_direct, &src);
+                }
+                assert_eq!(
+                    avx2_direct, expected,
+                    "direct AVX2 add_assign failed for length {len}"
+                );
+            }
+        }
+    }
+
+    fn scalar_xor(mut dest: Vec<u8>, src: &[u8]) -> Vec<u8> {
+        for (dest_byte, src_byte) in dest.iter_mut().zip(src.iter()) {
+            *dest_byte ^= *src_byte;
+        }
+        dest
     }
 
     fn patterned_bytes(len: usize) -> Vec<u8> {
