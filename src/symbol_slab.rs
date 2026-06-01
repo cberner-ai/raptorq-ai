@@ -93,9 +93,7 @@ impl SymbolSlab {
             return;
         }
         let (a_symbol, b_symbol) = self.get_disjoint_mut(a, b);
-        for (left, right) in a_symbol.iter_mut().zip(b_symbol.iter_mut()) {
-            core::mem::swap(left, right);
-        }
+        a_symbol.swap_with_slice(b_symbol);
     }
 
     pub fn copy_block_from(&mut self, start_symbol: usize, src: &[u8]) {
