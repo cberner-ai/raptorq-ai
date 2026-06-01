@@ -155,19 +155,19 @@ fn fill_encoded_row<M: BinaryMatrix>(
     let (d, a, mut b, d1, a1, mut b1) = source_tuple;
     xor_one(matrix, row, b as usize);
     for _ in 1..d {
-        b = (b + a) % params.lt_symbols;
+        b = add_mod_once(b, a, params.lt_symbols);
         xor_one(matrix, row, b as usize);
     }
 
     while b1 >= params.pi_symbols {
-        b1 = (b1 + a1) % params.p1;
+        b1 = add_mod_once(b1, a1, params.p1);
     }
     xor_one(matrix, row, (params.lt_symbols + b1) as usize);
 
     for _ in 1..d1 {
-        b1 = (b1 + a1) % params.p1;
+        b1 = add_mod_once(b1, a1, params.p1);
         while b1 >= params.pi_symbols {
-            b1 = (b1 + a1) % params.p1;
+            b1 = add_mod_once(b1, a1, params.p1);
         }
         xor_one(matrix, row, (params.lt_symbols + b1) as usize);
     }
@@ -186,22 +186,30 @@ pub fn enc_indices<F>(
 
     visit(b as usize);
     for _ in 1..d {
-        b = (b + a) % lt_symbols;
+        b = add_mod_once(b, a, lt_symbols);
         visit(b as usize);
     }
 
     while b1 >= pi_symbols {
-        b1 = (b1 + a1) % p1;
+        b1 = add_mod_once(b1, a1, p1);
     }
     visit((lt_symbols + b1) as usize);
 
     for _ in 1..d1 {
-        b1 = (b1 + a1) % p1;
+        b1 = add_mod_once(b1, a1, p1);
         while b1 >= pi_symbols {
-            b1 = (b1 + a1) % p1;
+            b1 = add_mod_once(b1, a1, p1);
         }
         visit((lt_symbols + b1) as usize);
     }
+}
+
+#[inline]
+fn add_mod_once(value: u32, addend: u32, modulus: u32) -> u32 {
+    debug_assert!(value < modulus);
+    debug_assert!(addend < modulus);
+    let sum = value + addend;
+    if sum >= modulus { sum - modulus } else { sum }
 }
 
 #[cfg(feature = "std")]

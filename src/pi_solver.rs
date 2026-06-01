@@ -618,6 +618,15 @@ fn select_pivot_row(
 }
 
 fn pivot_value_and_suffix_len(row: &CoefficientRow, col: usize) -> Option<(Octet, usize)> {
+    if let Some(&(entry_col, value)) = row.first() {
+        if entry_col == col {
+            return Some((value, row.len()));
+        }
+        if entry_col > col {
+            return None;
+        }
+    }
+
     let index = row.partition_point(|&(entry_col, _)| entry_col < col);
     match row.get(index) {
         Some(&(entry_col, value)) if entry_col == col => Some((value, row.len() - index)),
@@ -755,6 +764,16 @@ fn symbol_is_zero(symbol: &[u8]) -> bool {
 }
 
 fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {
+    let Some(&(first_col, first_value)) = row.first() else {
+        return Octet::zero();
+    };
+    if first_col == col {
+        return first_value;
+    }
+    if first_col > col || row.last().is_some_and(|&(last_col, _)| last_col < col) {
+        return Octet::zero();
+    }
+
     row.binary_search_by_key(&col, |&(entry_col, _)| entry_col)
         .map(|index| row[index].1)
         .unwrap_or_else(|_| Octet::zero())
@@ -781,7 +800,11 @@ fn add_scaled_matrix_row(
     }
 
     let mut dest_index = 0usize;
-    let mut src_index = src.partition_point(|&(col, _)| col < start_col);
+    let mut src_index = if src.first().is_some_and(|&(col, _)| col >= start_col) {
+        0
+    } else {
+        src.partition_point(|&(col, _)| col < start_col)
+    };
     scratch.clear();
     scratch.reserve(dest.len() + src.len() - src_index);
 
@@ -825,7 +848,11 @@ fn add_unscaled_matrix_row(
     scratch: &mut CoefficientRow,
 ) {
     let mut dest_index = 0usize;
-    let mut src_index = src.partition_point(|&(col, _)| col < start_col);
+    let mut src_index = if src.first().is_some_and(|&(col, _)| col >= start_col) {
+        0
+    } else {
+        src.partition_point(|&(col, _)| col < start_col)
+    };
     scratch.clear();
     scratch.reserve(dest.len() + src.len() - src_index);
 
