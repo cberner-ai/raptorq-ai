@@ -37,7 +37,7 @@ impl Octet {
 
     pub fn inverse(self) -> Octet {
         assert_ne!(self.value, 0);
-        self.pow(254)
+        Octet::new(GF_INV_TABLE[self.value as usize])
     }
 
     pub fn pow(self, mut power: usize) -> Octet {
@@ -63,6 +63,7 @@ impl Octet {
 }
 
 static GF_MUL_TABLE: [[u8; 256]; 256] = generate_gf_mul_table();
+static GF_INV_TABLE: [u8; 256] = generate_gf_inv_table();
 
 const fn generate_gf_mul_table() -> [[u8; 256]; 256] {
     let mut table = [[0u8; 256]; 256];
@@ -76,6 +77,28 @@ const fn generate_gf_mul_table() -> [[u8; 256]; 256] {
         a += 1;
     }
     table
+}
+
+const fn generate_gf_inv_table() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut value = 1usize;
+    while value < 256 {
+        table[value] = gf_pow_slow(value as u8, 254);
+        value += 1;
+    }
+    table
+}
+
+const fn gf_pow_slow(mut base: u8, mut power: usize) -> u8 {
+    let mut result = 1u8;
+    while power > 0 {
+        if power & 1 == 1 {
+            result = gf_mul_slow(result, base);
+        }
+        base = gf_mul_slow(base, base);
+        power >>= 1;
+    }
+    result
 }
 
 pub(crate) const fn gf_mul_slow(mut a: u8, mut b: u8) -> u8 {
