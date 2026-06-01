@@ -20,8 +20,8 @@ use crate::sparse_matrix::SparseBinaryMatrix;
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::num_ldpc_symbols;
 use crate::systematic_constants::{
-    calculate_p1, extended_source_block_symbols, num_intermediate_symbols, num_lt_symbols,
-    num_pi_symbols, systematic_index,
+    MAX_SUPPORTED_INTERMEDIATE_SYMBOLS, calculate_p1, extended_source_block_symbols,
+    num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
 };
 
 type CoefficientRow = Vec<(usize, Octet)>;
@@ -386,16 +386,35 @@ fn solve(
             }
         }
 
-        let pivot_coefficients = rows[pivot_row].clone();
-        for row in 0..height {
-            if row == pivot_row {
-                continue;
-            }
-            let factor = coefficient_at(&rows[row], col);
+        let (rows_before, pivot_and_after) = rows.split_at_mut(pivot_row);
+        let (pivot_coefficients, rows_after) = pivot_and_after
+            .split_first_mut()
+            .expect("pivot row must exist");
+
+        for (row, row_coefficients) in rows_before.iter_mut().enumerate() {
+            let factor = coefficient_at(row_coefficients, col);
             if factor.is_zero() {
                 continue;
             }
-            add_scaled_matrix_row(&mut rows[row], &pivot_coefficients, col, factor);
+            add_scaled_matrix_row(row_coefficients, pivot_coefficients, col, factor);
+            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
+            fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
+            if let Some(ops) = ops.as_mut() {
+                ops.push(SymbolOps::FusedAdd {
+                    dest: row,
+                    src: pivot_row,
+                    scalar: factor,
+                });
+            }
+        }
+
+        for (offset, row_coefficients) in rows_after.iter_mut().enumerate() {
+            let row = pivot_row + 1 + offset;
+            let factor = coefficient_at(row_coefficients, col);
+            if factor.is_zero() {
+                continue;
+            }
+            add_scaled_matrix_row(row_coefficients, pivot_coefficients, col, factor);
             let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
             fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
             if let Some(ops) = ops.as_mut() {
@@ -449,18 +468,36 @@ fn solve_binary(
             symbols.swap_symbols(pivot, pivot_row);
         }
 
-        let pivot_coefficients = rows[pivot_row].clone();
-        for row in 0..height {
-            if row == pivot_row || !binary_row_contains(&rows[row], col) {
+        let (rows_before, pivot_and_after) = rows.split_at_mut(pivot_row);
+        let (pivot_coefficients, rows_after) = pivot_and_after
+            .split_first_mut()
+            .expect("pivot row must exist");
+
+        for (row, row_coefficients) in rows_before.iter_mut().enumerate() {
+            if !add_binary_row_if_contains(
+                row_coefficients,
+                pivot_coefficients,
+                col,
+                &mut row_merge_scratch,
+            ) {
                 continue;
             }
 
-            add_binary_row(
-                &mut rows[row],
-                &pivot_coefficients,
+            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
+            add_assign(dest_symbol, pivot_symbol);
+        }
+
+        for (offset, row_coefficients) in rows_after.iter_mut().enumerate() {
+            let row = pivot_row + 1 + offset;
+            if !add_binary_row_if_contains(
+                row_coefficients,
+                pivot_coefficients,
                 col,
                 &mut row_merge_scratch,
-            );
+            ) {
+                continue;
+            }
+
             let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
             add_assign(dest_symbol, pivot_symbol);
         }
@@ -547,13 +584,17 @@ fn add_scaled_matrix_row(
     *dest = merged;
 }
 
-fn add_binary_row(
+fn add_binary_row_if_contains(
     dest: &mut Vec<usize>,
     src: &[usize],
     start_col: usize,
     scratch: &mut Vec<usize>,
-) {
+) -> bool {
     let dest_start = dest.partition_point(|&col| col < start_col);
+    if dest.get(dest_start) != Some(&start_col) {
+        return false;
+    }
+
     let mut src_index = src.partition_point(|&col| col < start_col);
     let mut dest_index = dest_start;
     scratch.clear();
@@ -587,6 +628,7 @@ fn add_binary_row(
     }
 
     core::mem::swap(dest, scratch);
+    true
 }
 
 #[cfg(feature = "benchmarking")]
