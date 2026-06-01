@@ -58,21 +58,38 @@ fn bench_decode(c: &mut Criterion) {
         }
         let config = ObjectTransmissionInformation::new(0, symbol_size, 0, 1, 1);
         let encoder = SourceBlockEncoder::new(1, &config, &data);
-        // Generate enough repair packets for all iterations
+        // Generate enough repair packets for all iterations.
         let repair_count = symbol_count + 4;
+        let overhead_repair_count = symbol_count + symbol_count.div_ceil(20);
         let packets = encoder.repair_packets(0, repair_count * 100);
+        let overhead_packets = encoder.repair_packets(0, overhead_repair_count * 100);
 
         group.throughput(Throughput::Bytes(elements as u64));
         group.bench_with_input(
             BenchmarkId::new("repair_only", symbol_count),
             &symbol_count,
             |b, _| {
-                let mut pkt_iter = packets.chunks(repair_count as usize);
+                let packet_chunks: Vec<_> = packets.chunks(repair_count as usize).collect();
+                let mut chunk_index = 0;
                 b.iter(|| {
-                    let chunk = pkt_iter.next().unwrap_or_else(|| {
-                        // Should not happen, but be safe
-                        packets.chunks(repair_count as usize).next().unwrap()
-                    });
+                    let chunk = packet_chunks[chunk_index];
+                    chunk_index = (chunk_index + 1) % packet_chunks.len();
+                    let mut decoder = SourceBlockDecoder::new(1, &config, elements as u64);
+                    decoder.decode(chunk.iter().cloned())
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("repair_5pct_overhead", symbol_count),
+            &symbol_count,
+            |b, _| {
+                let packet_chunks: Vec<_> = overhead_packets
+                    .chunks(overhead_repair_count as usize)
+                    .collect();
+                let mut chunk_index = 0;
+                b.iter(|| {
+                    let chunk = packet_chunks[chunk_index];
+                    chunk_index = (chunk_index + 1) % packet_chunks.len();
                     let mut decoder = SourceBlockDecoder::new(1, &config, elements as u64);
                     decoder.decode(chunk.iter().cloned())
                 });

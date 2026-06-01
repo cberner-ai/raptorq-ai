@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackedBinaryRows {
     height: usize,
+    width: usize,
     words_per_row: usize,
     words: Vec<u64>,
 }
@@ -17,6 +18,7 @@ impl PackedBinaryRows {
         let words_per_row = width.div_ceil(u64::BITS as usize);
         let mut packed = PackedBinaryRows {
             height,
+            width,
             words_per_row,
             words: vec![0; height * words_per_row],
         };
@@ -33,20 +35,6 @@ impl PackedBinaryRows {
     pub(crate) fn contains(&self, row: usize, col: usize) -> bool {
         let word = self.word_index(row, col);
         (self.words[word] & bit_mask(col)) != 0
-    }
-
-    pub(crate) fn swap_rows(&mut self, a: usize, b: usize) {
-        assert!(a < self.height);
-        assert!(b < self.height);
-        if a == b {
-            return;
-        }
-
-        let a_start = self.row_start(a);
-        let b_start = self.row_start(b);
-        for offset in 0..self.words_per_row {
-            self.words.swap(a_start + offset, b_start + offset);
-        }
     }
 
     pub(crate) fn xor_suffix_if_contains(
@@ -69,6 +57,63 @@ impl PackedBinaryRows {
             self.words[dest_start + offset] ^= self.words[src_start + offset];
         }
         true
+    }
+
+    pub(crate) fn first_one_at_or_after(&self, row: usize, start_col: usize) -> Option<usize> {
+        assert!(row < self.height);
+        if start_col >= self.width {
+            return None;
+        }
+
+        let row_start = self.row_start(row);
+        let mut offset = start_col / u64::BITS as usize;
+        let bit_offset = start_col % u64::BITS as usize;
+        let mut word = self.words[row_start + offset] & (u64::MAX << bit_offset);
+
+        loop {
+            if word != 0 {
+                let col = offset * u64::BITS as usize + word.trailing_zeros() as usize;
+                return (col < self.width).then_some(col);
+            }
+
+            offset += 1;
+            if offset >= self.words_per_row {
+                return None;
+            }
+            word = self.words[row_start + offset];
+        }
+    }
+
+    pub(crate) fn visit_ones_at_or_after<F>(&self, row: usize, start_col: usize, mut visit: F)
+    where
+        F: FnMut(usize),
+    {
+        assert!(row < self.height);
+        if start_col >= self.width {
+            return;
+        }
+
+        let row_start = self.row_start(row);
+        let mut offset = start_col / u64::BITS as usize;
+        let bit_offset = start_col % u64::BITS as usize;
+        let mut word = self.words[row_start + offset] & (u64::MAX << bit_offset);
+
+        while offset < self.words_per_row {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let col = offset * u64::BITS as usize + bit;
+                if col >= self.width {
+                    return;
+                }
+                visit(col);
+                word &= word - 1;
+            }
+
+            offset += 1;
+            if offset < self.words_per_row {
+                word = self.words[row_start + offset];
+            }
+        }
     }
 
     pub(crate) fn is_zero(&self, row: usize) -> bool {
@@ -113,5 +158,28 @@ mod tests {
         assert!(!packed.contains(1, 3));
         assert!(packed.contains(1, 64));
         assert!(!packed.contains(1, 70));
+    }
+
+    #[test]
+    fn first_one_scans_across_words() {
+        let rows = vec![vec![1, 63, 64, 95]];
+        let packed = PackedBinaryRows::from_sparse(rows, 96);
+
+        assert_eq!(packed.first_one_at_or_after(0, 0), Some(1));
+        assert_eq!(packed.first_one_at_or_after(0, 2), Some(63));
+        assert_eq!(packed.first_one_at_or_after(0, 64), Some(64));
+        assert_eq!(packed.first_one_at_or_after(0, 65), Some(95));
+        assert_eq!(packed.first_one_at_or_after(0, 96), None);
+    }
+
+    #[test]
+    fn visit_ones_stays_inside_width() {
+        let rows = vec![vec![62, 63, 64, 95]];
+        let packed = PackedBinaryRows::from_sparse(rows, 96);
+        let mut visited = Vec::new();
+
+        packed.visit_ones_at_or_after(0, 63, |col| visited.push(col));
+
+        assert_eq!(visited, vec![63, 64, 95]);
     }
 }

@@ -467,51 +467,74 @@ fn solve_binary(
 
     let height = rows.len();
     let mut rows = PackedBinaryRows::from_sparse(rows, width);
-    let mut pivot_row = 0usize;
-
-    for col in 0..width {
-        let Some(pivot) = (pivot_row..height).find(|&row| rows.contains(row, col)) else {
-            return (None, None);
-        };
-
-        if pivot != pivot_row {
-            rows.swap_rows(pivot, pivot_row);
-            symbols.swap_symbols(pivot, pivot_row);
+    let mut bucket_heads = vec![None; width];
+    let mut next_in_bucket = vec![None; height];
+    for row in 0..height {
+        if let Some(col) = rows.first_one_at_or_after(row, 0) {
+            push_binary_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
         }
-
-        for row in 0..pivot_row {
-            if !rows.xor_suffix_if_contains(row, pivot_row, col) {
-                continue;
-            }
-
-            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
-            add_assign(dest_symbol, pivot_symbol);
-        }
-
-        for row in (pivot_row + 1)..height {
-            if !rows.xor_suffix_if_contains(row, pivot_row, col) {
-                continue;
-            }
-
-            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
-            add_assign(dest_symbol, pivot_symbol);
-        }
-
-        pivot_row += 1;
     }
 
-    for row in pivot_row..height {
-        if !rows.is_zero(row) || !symbol_is_zero(symbols.get(row)) {
+    let mut pivot_for_col = vec![None; width];
+    let mut is_pivot_row = vec![false; height];
+
+    for col in 0..width {
+        let Some(pivot) = pop_binary_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) else {
+            return (None, None);
+        };
+        pivot_for_col[col] = Some(pivot);
+        is_pivot_row[pivot] = true;
+
+        while let Some(row) = pop_binary_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+            rows.xor_suffix_if_contains(row, pivot, col);
+            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot, row);
+            add_assign(dest_symbol, pivot_symbol);
+
+            if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
+                push_binary_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+            }
+        }
+    }
+
+    for (row, is_pivot) in is_pivot_row.into_iter().enumerate() {
+        if !is_pivot && (!rows.is_zero(row) || !symbol_is_zero(symbols.get(row))) {
             return (None, None);
         }
     }
 
     let mut decoded = SymbolSlab::with_zeros(width, symbols.symbol_size());
-    for row in 0..width {
-        decoded.get_mut(row).copy_from_slice(symbols.get(row));
+    for col in (0..width).rev() {
+        let pivot = pivot_for_col[col].expect("pivot was recorded for every decoded column");
+        decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
+        rows.visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
+            let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
+            add_assign(dest_symbol, dependent_symbol);
+        });
     }
 
     (Some(decoded), None)
+}
+
+fn push_binary_row_bucket(
+    bucket_heads: &mut [Option<usize>],
+    next_in_bucket: &mut [Option<usize>],
+    col: usize,
+    row: usize,
+) {
+    debug_assert!(next_in_bucket[row].is_none());
+    next_in_bucket[row] = bucket_heads[col];
+    bucket_heads[col] = Some(row);
+}
+
+fn pop_binary_row_bucket(
+    bucket_heads: &mut [Option<usize>],
+    next_in_bucket: &mut [Option<usize>],
+    col: usize,
+) -> Option<usize> {
+    let row = bucket_heads[col]?;
+    bucket_heads[col] = next_in_bucket[row];
+    next_in_bucket[row] = None;
+    Some(row)
 }
 
 fn symbol_is_zero(symbol: &[u8]) -> bool {
