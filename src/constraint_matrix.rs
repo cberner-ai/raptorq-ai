@@ -1,4 +1,4 @@
-use crate::base::intermediate_tuple;
+use crate::base::deg;
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
@@ -70,16 +70,106 @@ fn fill_encoded_rows<M: BinaryMatrix>(
     k_prime: u32,
     encoded_isis: &[u32],
 ) {
-    let lt_symbols = num_lt_symbols(k_prime);
-    let pi_symbols = num_pi_symbols(k_prime);
-    let sys_index = systematic_index(k_prime);
-    let p1 = calculate_p1(k_prime);
+    let tuple_params = EncodingTupleParameters::new(k_prime);
+    let mut previous_isi_and_y: Option<(u32, u32)> = None;
 
     for (row, isi) in encoded_isis.iter().enumerate() {
-        let tuple = intermediate_tuple(*isi, lt_symbols, sys_index, p1);
-        enc_indices(tuple, lt_symbols, pi_symbols, p1, |col| {
-            xor_one(matrix, row_offset + row, col);
-        });
+        let y = match previous_isi_and_y {
+            Some((previous_isi, previous_y)) if *isi == previous_isi.wrapping_add(1) => {
+                previous_y.wrapping_add(tuple_params.a)
+            }
+            _ => tuple_params.y(*isi),
+        };
+        previous_isi_and_y = Some((*isi, y));
+        fill_encoded_row(
+            matrix,
+            row_offset + row,
+            tuple_params,
+            tuple_params.tuple_from_y(*isi, y),
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EncodingTupleParameters {
+    lt_symbols: u32,
+    pi_symbols: u32,
+    p1: u32,
+    a: u32,
+    b: u32,
+}
+
+impl EncodingTupleParameters {
+    #[inline]
+    fn new(k_prime: u32) -> EncodingTupleParameters {
+        let sys_index = systematic_index(k_prime);
+        let mut a = 53591 + sys_index * 997;
+        if a.is_multiple_of(2) {
+            a += 1;
+        }
+
+        EncodingTupleParameters {
+            lt_symbols: num_lt_symbols(k_prime),
+            pi_symbols: num_pi_symbols(k_prime),
+            p1: calculate_p1(k_prime),
+            a,
+            b: 10267 * (sys_index + 1),
+        }
+    }
+
+    #[inline]
+    fn y(self, internal_symbol_id: u32) -> u32 {
+        self.b.wrapping_add(internal_symbol_id.wrapping_mul(self.a))
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn tuple(self, internal_symbol_id: u32) -> (u32, u32, u32, u32, u32, u32) {
+        self.tuple_from_y(internal_symbol_id, self.y(internal_symbol_id))
+    }
+
+    #[inline]
+    fn tuple_from_y(self, internal_symbol_id: u32, y: u32) -> (u32, u32, u32, u32, u32, u32) {
+        let d = deg(rand(y, 0u32, 1048576), self.lt_symbols);
+        let a = 1 + rand(y, 1u32, self.lt_symbols - 1);
+        let b = rand(y, 2u32, self.lt_symbols);
+        let d1 = if d < 4 {
+            2 + rand(internal_symbol_id, 3u32, 2)
+        } else {
+            2
+        };
+        let a1 = 1 + rand(internal_symbol_id, 4u32, self.p1 - 1);
+        let b1 = rand(internal_symbol_id, 5u32, self.p1);
+
+        (d, a, b, d1, a1, b1)
+    }
+}
+
+#[inline]
+fn fill_encoded_row<M: BinaryMatrix>(
+    matrix: &mut M,
+    row: usize,
+    params: EncodingTupleParameters,
+    source_tuple: (u32, u32, u32, u32, u32, u32),
+) {
+    let (d, a, mut b, d1, a1, mut b1) = source_tuple;
+    xor_one(matrix, row, b as usize);
+    for _ in 1..d {
+        b = (b + a) % params.lt_symbols;
+        xor_one(matrix, row, b as usize);
+    }
+
+    while b1 >= params.pi_symbols {
+        b1 = (b1 + a1) % params.p1;
+    }
+    xor_one(matrix, row, (params.lt_symbols + b1) as usize);
+
+    for _ in 1..d1 {
+        b1 = (b1 + a1) % params.p1;
+        while b1 >= params.pi_symbols {
+            b1 = (b1 + a1) % params.p1;
+        }
+        xor_one(matrix, row, (params.lt_symbols + b1) as usize);
     }
 }
 
@@ -247,6 +337,10 @@ mod tests {
                 calculate_p1(source_symbols),
             );
             assert_eq!(tuple, expected);
+            assert_eq!(
+                EncodingTupleParameters::new(source_symbols).tuple(internal_symbol_id),
+                expected
+            );
         }
     }
 
