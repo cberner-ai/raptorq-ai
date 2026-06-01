@@ -78,7 +78,7 @@ const fn generate_gf_mul_table() -> [[u8; 256]; 256] {
     table
 }
 
-const fn gf_mul_slow(mut a: u8, mut b: u8) -> u8 {
+pub(crate) const fn gf_mul_slow(mut a: u8, mut b: u8) -> u8 {
     let mut product = 0u8;
     while b != 0 {
         if b & 1 != 0 {

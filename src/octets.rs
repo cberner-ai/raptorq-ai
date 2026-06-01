@@ -105,7 +105,7 @@ fn try_mulassign_scalar_avx2(dest: &mut [u8], scalar: &Octet) -> bool {
     }
 
     unsafe {
-        mulassign_scalar_avx2(dest, scalar.mul_table());
+        mulassign_scalar_avx2(dest, scalar.value());
     }
     true
 }
@@ -122,7 +122,7 @@ fn try_fused_addassign_mul_scalar_avx2(dest: &mut [u8], src: &[u8], scalar: &Oct
     }
 
     unsafe {
-        fused_addassign_mul_scalar_avx2(dest, src, scalar.mul_table());
+        fused_addassign_mul_scalar_avx2(dest, src, scalar.value());
     }
     true
 }
@@ -145,8 +145,10 @@ use core::arch::x86_64::{
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
-unsafe fn mulassign_scalar_avx2(dest: &mut [u8], table: &'static [u8; 256]) {
-    let (low_table, high_table) = avx2_nibble_tables(table);
+unsafe fn mulassign_scalar_avx2(dest: &mut [u8], scalar: u8) {
+    let table = Octet::new(scalar).mul_table();
+    let low_table = avx2_low_nibble_table(scalar);
+    let high_table = avx2_high_nibble_table(scalar);
     let mask = _mm256_set1_epi8(0x0f);
     let mut offset = 0usize;
     let vector_len = dest.len() / 32 * 32;
@@ -167,8 +169,10 @@ unsafe fn mulassign_scalar_avx2(dest: &mut [u8], table: &'static [u8; 256]) {
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
-unsafe fn fused_addassign_mul_scalar_avx2(dest: &mut [u8], src: &[u8], table: &'static [u8; 256]) {
-    let (low_table, high_table) = avx2_nibble_tables(table);
+unsafe fn fused_addassign_mul_scalar_avx2(dest: &mut [u8], src: &[u8], scalar: u8) {
+    let table = Octet::new(scalar).mul_table();
+    let low_table = avx2_low_nibble_table(scalar);
+    let high_table = avx2_high_nibble_table(scalar);
     let mask = _mm256_set1_epi8(0x0f);
     let mut offset = 0usize;
     let vector_len = src.len() / 32 * 32;
@@ -227,23 +231,59 @@ unsafe fn xor_32(dest: &mut [u8], src: &[u8], offset: usize) {
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-#[target_feature(enable = "avx2")]
-fn avx2_nibble_tables(table: &'static [u8; 256]) -> (__m256i, __m256i) {
-    let mut low = [0u8; 32];
-    let mut high = [0u8; 32];
-    for i in 0..16 {
-        low[i] = table[i];
-        low[i + 16] = table[i];
-        high[i] = table[i << 4];
-        high[i + 16] = table[i << 4];
-    }
+static AVX2_LOW_NIBBLE_TABLES: [[u8; 32]; 256] = generate_avx2_low_nibble_tables();
 
-    unsafe {
-        (
-            _mm256_loadu_si256(low.as_ptr().cast::<__m256i>()),
-            _mm256_loadu_si256(high.as_ptr().cast::<__m256i>()),
-        )
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+static AVX2_HIGH_NIBBLE_TABLES: [[u8; 32]; 256] = generate_avx2_high_nibble_tables();
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+const fn generate_avx2_low_nibble_tables() -> [[u8; 32]; 256] {
+    let mut tables = [[0u8; 32]; 256];
+    let mut scalar = 0usize;
+    while scalar < 256 {
+        let mut nibble = 0usize;
+        while nibble < 16 {
+            let value = crate::octet::gf_mul_slow(scalar as u8, nibble as u8);
+            tables[scalar][nibble] = value;
+            tables[scalar][nibble + 16] = value;
+            nibble += 1;
+        }
+        scalar += 1;
     }
+    tables
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+const fn generate_avx2_high_nibble_tables() -> [[u8; 32]; 256] {
+    let mut tables = [[0u8; 32]; 256];
+    let mut scalar = 0usize;
+    while scalar < 256 {
+        let mut nibble = 0usize;
+        while nibble < 16 {
+            let value = crate::octet::gf_mul_slow(scalar as u8, (nibble << 4) as u8);
+            tables[scalar][nibble] = value;
+            tables[scalar][nibble + 16] = value;
+            nibble += 1;
+        }
+        scalar += 1;
+    }
+    tables
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+fn avx2_low_nibble_table(scalar: u8) -> __m256i {
+    let low = &AVX2_LOW_NIBBLE_TABLES[scalar as usize];
+
+    unsafe { _mm256_loadu_si256(low.as_ptr().cast::<__m256i>()) }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+fn avx2_high_nibble_table(scalar: u8) -> __m256i {
+    let high = &AVX2_HIGH_NIBBLE_TABLES[scalar as usize];
+
+    unsafe { _mm256_loadu_si256(high.as_ptr().cast::<__m256i>()) }
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
