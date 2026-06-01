@@ -14,6 +14,10 @@ pub trait BinaryMatrix: Clone {
     fn width(&self) -> usize;
     fn get(&self, row: usize, col: usize) -> Octet;
     fn set(&mut self, row: usize, col: usize, value: bool);
+    fn toggle(&mut self, row: usize, col: usize) {
+        let next = self.get(row, col) == Octet::zero();
+        self.set(row, col, next);
+    }
 
     fn row_entries(&self, row: usize) -> Vec<usize> {
         (0..self.width())
@@ -72,6 +76,11 @@ impl BinaryMatrix for DenseBinaryMatrix {
         } else {
             self.data[byte] &= !mask;
         }
+    }
+
+    fn toggle(&mut self, row: usize, col: usize) {
+        let (byte, mask) = self.byte_index(row, col);
+        self.data[byte] ^= mask;
     }
 
     fn row_entries(&self, row: usize) -> Vec<usize> {

@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use crate::base::intermediate_tuple;
 use crate::constraint_matrix::generate_constraint_matrix;
 use crate::constraint_matrix::{enc_indices, generate_hdpc_rows};
+use crate::gf2::PackedBinaryRows;
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
@@ -444,7 +445,7 @@ fn solve(
 }
 
 fn solve_binary(
-    mut rows: Vec<Vec<usize>>,
+    rows: Vec<Vec<usize>>,
     width: usize,
     mut symbols: SymbolSlab,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
@@ -454,32 +455,21 @@ fn solve_binary(
     );
 
     let height = rows.len();
+    let mut rows = PackedBinaryRows::from_sparse(rows, width);
     let mut pivot_row = 0usize;
-    let mut row_merge_scratch = Vec::new();
 
     for col in 0..width {
-        let Some(pivot) = (pivot_row..height).find(|&row| binary_row_contains(&rows[row], col))
-        else {
+        let Some(pivot) = (pivot_row..height).find(|&row| rows.contains(row, col)) else {
             return (None, None);
         };
 
         if pivot != pivot_row {
-            rows.swap(pivot, pivot_row);
+            rows.swap_rows(pivot, pivot_row);
             symbols.swap_symbols(pivot, pivot_row);
         }
 
-        let (rows_before, pivot_and_after) = rows.split_at_mut(pivot_row);
-        let (pivot_coefficients, rows_after) = pivot_and_after
-            .split_first_mut()
-            .expect("pivot row must exist");
-
-        for (row, row_coefficients) in rows_before.iter_mut().enumerate() {
-            if !add_binary_row_if_contains(
-                row_coefficients,
-                pivot_coefficients,
-                col,
-                &mut row_merge_scratch,
-            ) {
+        for row in 0..pivot_row {
+            if !rows.xor_suffix_if_contains(row, pivot_row, col) {
                 continue;
             }
 
@@ -487,14 +477,8 @@ fn solve_binary(
             add_assign(dest_symbol, pivot_symbol);
         }
 
-        for (offset, row_coefficients) in rows_after.iter_mut().enumerate() {
-            let row = pivot_row + 1 + offset;
-            if !add_binary_row_if_contains(
-                row_coefficients,
-                pivot_coefficients,
-                col,
-                &mut row_merge_scratch,
-            ) {
+        for row in (pivot_row + 1)..height {
+            if !rows.xor_suffix_if_contains(row, pivot_row, col) {
                 continue;
             }
 
@@ -506,7 +490,7 @@ fn solve_binary(
     }
 
     for row in pivot_row..height {
-        if !rows[row].is_empty() || !symbol_is_zero(symbols.get(row)) {
+        if !rows.is_zero(row) || !symbol_is_zero(symbols.get(row)) {
             return (None, None);
         }
     }
@@ -521,10 +505,6 @@ fn solve_binary(
 
 fn symbol_is_zero(symbol: &[u8]) -> bool {
     symbol.iter().all(|&byte| byte == 0)
-}
-
-fn binary_row_contains(row: &[usize], col: usize) -> bool {
-    row.binary_search(&col).is_ok()
 }
 
 fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {
@@ -582,53 +562,6 @@ fn add_scaled_matrix_row(
     }
 
     *dest = merged;
-}
-
-fn add_binary_row_if_contains(
-    dest: &mut Vec<usize>,
-    src: &[usize],
-    start_col: usize,
-    scratch: &mut Vec<usize>,
-) -> bool {
-    let dest_start = dest.partition_point(|&col| col < start_col);
-    if dest.get(dest_start) != Some(&start_col) {
-        return false;
-    }
-
-    let mut src_index = src.partition_point(|&col| col < start_col);
-    let mut dest_index = dest_start;
-    scratch.clear();
-    scratch.reserve(dest.len() + src.len() - src_index);
-    scratch.extend_from_slice(&dest[..dest_start]);
-
-    while dest_index < dest.len() || src_index < src.len() {
-        match (dest.get(dest_index), src.get(src_index)) {
-            (Some(&dest_col), Some(&src_col)) => {
-                if dest_col < src_col {
-                    scratch.push(dest_col);
-                    dest_index += 1;
-                } else if src_col < dest_col {
-                    scratch.push(src_col);
-                    src_index += 1;
-                } else {
-                    dest_index += 1;
-                    src_index += 1;
-                }
-            }
-            (Some(&dest_col), None) => {
-                scratch.push(dest_col);
-                dest_index += 1;
-            }
-            (None, Some(&src_col)) => {
-                scratch.push(src_col);
-                src_index += 1;
-            }
-            (None, None) => break,
-        }
-    }
-
-    core::mem::swap(dest, scratch);
-    true
 }
 
 #[cfg(feature = "benchmarking")]

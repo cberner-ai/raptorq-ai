@@ -56,6 +56,19 @@ impl BinaryMatrix for SparseBinaryMatrix {
         }
     }
 
+    fn toggle(&mut self, row: usize, col: usize) {
+        assert!(row < self.rows.len());
+        assert!(col < self.width);
+        match self.rows[row].binary_search(&col) {
+            Ok(index) => {
+                self.rows[row].remove(index);
+            }
+            Err(index) => {
+                self.rows[row].insert(index, col);
+            }
+        }
+    }
+
     fn row_entries(&self, row: usize) -> Vec<usize> {
         assert!(row < self.rows.len());
         self.rows[row].clone()
