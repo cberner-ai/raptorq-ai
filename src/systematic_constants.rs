@@ -9,14 +9,11 @@ pub(crate) struct SupportedSystematicParameters;
 
 pub(crate) const SYSTEMATIC_INDICES_AND_PARAMETERS: SupportedSystematicParameters =
     SupportedSystematicParameters;
+const SUPPORTED_SYSTEMATIC_PARAMETER_COUNT: usize = supported_systematic_parameter_count();
 
 impl SupportedSystematicParameters {
     pub(crate) fn iter(&self) -> core::slice::Iter<'static, SystematicParameters> {
-        let supported_len = RFC_SYSTEMATIC_INDICES_AND_PARAMETERS
-            .iter()
-            .position(|&(k_prime, _, s, h, _)| k_prime + s + h > MAX_SUPPORTED_INTERMEDIATE_SYMBOLS)
-            .unwrap_or(RFC_SYSTEMATIC_INDICES_AND_PARAMETERS.len());
-        RFC_SYSTEMATIC_INDICES_AND_PARAMETERS[..supported_len].iter()
+        RFC_SYSTEMATIC_INDICES_AND_PARAMETERS[..SUPPORTED_SYSTEMATIC_PARAMETER_COUNT].iter()
     }
 }
 
@@ -500,46 +497,69 @@ const RFC_SYSTEMATIC_INDICES_AND_PARAMETERS: &[SystematicParameters] = &[
     (56403, 471, 907, 16, 56951),
 ];
 
-fn parameters(source_symbols: u32) -> (u32, u32, u32, u32, u32) {
-    for &(k_prime, systematic_index, s, h, w) in RFC_SYSTEMATIC_INDICES_AND_PARAMETERS {
-        if source_symbols <= k_prime {
-            return (k_prime, systematic_index, s, h, w);
+const fn supported_systematic_parameter_count() -> usize {
+    let mut len = 0usize;
+    while len < RFC_SYSTEMATIC_INDICES_AND_PARAMETERS.len() {
+        let (k_prime, _, s, h, _) = RFC_SYSTEMATIC_INDICES_AND_PARAMETERS[len];
+        if k_prime + s + h > MAX_SUPPORTED_INTERMEDIATE_SYMBOLS {
+            break;
         }
+        len += 1;
     }
-    panic!("source block has too many symbols");
+    len
 }
 
+#[inline]
+fn parameters(source_symbols: u32) -> SystematicParameters {
+    let index = RFC_SYSTEMATIC_INDICES_AND_PARAMETERS
+        .partition_point(|&(k_prime, _, _, _, _)| k_prime < source_symbols);
+    RFC_SYSTEMATIC_INDICES_AND_PARAMETERS
+        .get(index)
+        .copied()
+        .expect("source block has too many symbols")
+}
+
+#[inline]
 pub fn extended_source_block_symbols(source_symbols: u32) -> u32 {
     parameters(source_symbols).0
 }
 
+#[inline]
 pub fn systematic_index(source_symbols: u32) -> u32 {
     parameters(source_symbols).1
 }
 
+#[inline]
 pub fn num_ldpc_symbols(source_symbols: u32) -> u32 {
     parameters(source_symbols).2
 }
 
+#[inline]
 pub fn num_hdpc_symbols(source_symbols: u32) -> u32 {
     parameters(source_symbols).3
 }
 
+#[inline]
 pub fn num_lt_symbols(source_symbols: u32) -> u32 {
     parameters(source_symbols).4
 }
 
+#[inline]
 pub fn num_intermediate_symbols(source_symbols: u32) -> u32 {
     let (k_prime, _, s, h, _) = parameters(source_symbols);
     k_prime + s + h
 }
 
+#[inline]
 pub fn num_pi_symbols(source_symbols: u32) -> u32 {
-    num_intermediate_symbols(source_symbols) - num_lt_symbols(source_symbols)
+    let (k_prime, _, s, h, w) = parameters(source_symbols);
+    k_prime + s + h - w
 }
 
+#[inline]
 pub fn calculate_p1(source_symbols: u32) -> u32 {
-    next_prime(num_pi_symbols(source_symbols))
+    let (k_prime, _, s, h, w) = parameters(source_symbols);
+    next_prime(k_prime + s + h - w)
 }
 
 fn next_prime(mut value: u32) -> u32 {
