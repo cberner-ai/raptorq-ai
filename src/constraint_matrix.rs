@@ -7,6 +7,13 @@ use crate::systematic_constants::{
     calculate_p1, extended_source_block_symbols, num_hdpc_symbols, num_intermediate_symbols,
     num_ldpc_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
 };
+#[cfg(feature = "std")]
+use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "std")]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(feature = "std")]
+const HDPC_ROWS_CACHE_CAPACITY: usize = 16;
 
 pub fn generate_constraint_matrix<M: BinaryMatrix>(
     source_block_symbols: u32,
@@ -107,8 +114,61 @@ pub fn enc_indices<F>(
     }
 }
 
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct HdpcRowsCache {
+    rows: HashMap<u32, DenseOctetMatrix>,
+    insertion_order: VecDeque<u32>,
+}
+
+#[cfg(feature = "std")]
+type HdpcRowsCacheLock = Mutex<HdpcRowsCache>;
+
+#[cfg(feature = "std")]
+fn hdpc_rows_cache() -> &'static HdpcRowsCacheLock {
+    static CACHE: OnceLock<HdpcRowsCacheLock> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HdpcRowsCache::default()))
+}
+
 pub(crate) fn generate_hdpc_rows(source_block_symbols: u32) -> DenseOctetMatrix {
     let k_prime = extended_source_block_symbols(source_block_symbols);
+
+    #[cfg(feature = "std")]
+    {
+        let cache = hdpc_rows_cache();
+        {
+            let guard = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(rows) = guard.rows.get(&k_prime) {
+                return rows.clone();
+            }
+        }
+
+        let generated = generate_hdpc_rows_uncached(k_prime);
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(rows) = guard.rows.get(&k_prime) {
+            return rows.clone();
+        }
+        if guard.rows.len() >= HDPC_ROWS_CACHE_CAPACITY
+            && let Some(evicted_source_block_symbols) = guard.insertion_order.pop_front()
+        {
+            guard.rows.remove(&evicted_source_block_symbols);
+        }
+        guard.insertion_order.push_back(k_prime);
+        guard.rows.insert(k_prime, generated.clone());
+        return generated;
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        generate_hdpc_rows_uncached(k_prime)
+    }
+}
+
+fn generate_hdpc_rows_uncached(k_prime: u32) -> DenseOctetMatrix {
     let s = num_ldpc_symbols(k_prime);
     let h = num_hdpc_symbols(k_prime);
     let l = num_intermediate_symbols(k_prime);
@@ -145,8 +205,7 @@ pub(crate) fn generate_hdpc_rows(source_block_symbols: u32) -> DenseOctetMatrix 
 }
 
 fn xor_one<M: BinaryMatrix>(matrix: &mut M, row: usize, col: usize) {
-    let next = matrix.get(row, col) == Octet::zero();
-    matrix.set(row, col, next);
+    matrix.toggle(row, col);
 }
 
 #[cfg(test)]
