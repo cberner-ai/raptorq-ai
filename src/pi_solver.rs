@@ -27,6 +27,7 @@ use crate::systematic_constants::{
 
 type CoefficientRow = Vec<(usize, Octet)>;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
+const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 
@@ -116,7 +117,19 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     assert_eq!(hdpc_rows.width(), width);
     assert!(matrix.height() >= s);
 
-    let rows = coefficient_rows(&matrix, &hdpc_rows, source_block_symbols);
+    let (rows, symbols) = match recording {
+        OperationRecording::Record => (
+            coefficient_rows(&matrix, &hdpc_rows, source_block_symbols),
+            symbols,
+        ),
+        OperationRecording::Skip if width >= LIGHTEST_PIVOT_MIN_WIDTH => {
+            coefficient_rows_with_hdpc_last(&matrix, &hdpc_rows, symbols, source_block_symbols)
+        }
+        OperationRecording::Skip => (
+            coefficient_rows(&matrix, &hdpc_rows, source_block_symbols),
+            symbols,
+        ),
+    };
     solve(rows, width, symbols, recording)
 }
 
@@ -255,6 +268,44 @@ fn coefficient_rows<M: BinaryMatrix>(
     rows
 }
 
+fn coefficient_rows_with_hdpc_last<M: BinaryMatrix>(
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    symbols: SymbolSlab,
+    source_block_symbols: u32,
+) -> (Vec<CoefficientRow>, SymbolSlab) {
+    let s = num_ldpc_symbols(source_block_symbols) as usize;
+    let total_rows = matrix.height() + hdpc_rows.height();
+    let mut rows = Vec::with_capacity(total_rows);
+    let mut reordered_symbols = SymbolSlab::with_zeros(total_rows, symbols.symbol_size());
+
+    for row in 0..s {
+        rows.push(copy_binary_row(matrix, row));
+        reordered_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(row));
+    }
+
+    for row in s..matrix.height() {
+        rows.push(copy_binary_row(matrix, row));
+        let source_row = row + hdpc_rows.height();
+        reordered_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(source_row));
+    }
+
+    for row in 0..hdpc_rows.height() {
+        rows.push(copy_octet_row(hdpc_rows, row));
+        let dest = matrix.height() + row;
+        let source_row = s + row;
+        reordered_symbols
+            .get_mut(dest)
+            .copy_from_slice(symbols.get(source_row));
+    }
+
+    (rows, reordered_symbols)
+}
+
 pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
     matrix: M,
     symbols: SymbolSlab,
@@ -362,8 +413,8 @@ fn solve(
     let mut row_merge_scratch = Vec::new();
 
     for col in 0..width {
-        let Some(pivot) =
-            (pivot_row..height).find(|&row| !coefficient_at(&rows[row], col).is_zero())
+        let Some((pivot, pivot_value)) =
+            select_pivot_row(&rows, pivot_row, height, width, col, recording)
         else {
             return (None, None);
         };
@@ -376,7 +427,6 @@ fn solve(
             }
         }
 
-        let pivot_value = coefficient_at(&rows[pivot_row], col);
         if pivot_value != Octet::one() {
             let scalar = pivot_value.inverse();
             scale_matrix_row(&mut rows[pivot_row], col, scalar);
@@ -453,6 +503,52 @@ fn solve(
     }
 
     (Some(decoded), ops)
+}
+
+fn select_pivot_row(
+    rows: &[CoefficientRow],
+    start_row: usize,
+    height: usize,
+    width: usize,
+    col: usize,
+    recording: OperationRecording,
+) -> Option<(usize, Octet)> {
+    if recording == OperationRecording::Record || width < LIGHTEST_PIVOT_MIN_WIDTH {
+        return (start_row..height).find_map(|row| {
+            let value = coefficient_at(&rows[row], col);
+            (!value.is_zero()).then_some((row, value))
+        });
+    }
+
+    let mut best = None;
+    let mut best_suffix_len = usize::MAX;
+    let mut best_value = Octet::zero();
+
+    for row in start_row..height {
+        let Some((value, suffix_len)) = pivot_value_and_suffix_len(&rows[row], col) else {
+            continue;
+        };
+
+        if suffix_len < best_suffix_len
+            || (suffix_len == best_suffix_len
+                && value == Octet::one()
+                && best_value != Octet::one())
+        {
+            best = Some(row);
+            best_suffix_len = suffix_len;
+            best_value = value;
+        }
+    }
+
+    best.map(|row| (row, best_value))
+}
+
+fn pivot_value_and_suffix_len(row: &CoefficientRow, col: usize) -> Option<(Octet, usize)> {
+    let index = row.partition_point(|&(entry_col, _)| entry_col < col);
+    match row.get(index) {
+        Some(&(entry_col, value)) if entry_col == col => Some((value, row.len() - index)),
+        _ => None,
+    }
 }
 
 fn solve_binary(
@@ -758,6 +854,52 @@ mod tests {
         let (decoded, ops) = fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, 1);
 
         assert!(decoded.is_some());
+        assert!(ops.is_none());
+    }
+
+    #[test]
+    fn non_recording_hdpc_last_ordering_preserves_symbol_mapping() {
+        let source_block_symbols = 10;
+        let width = LIGHTEST_PIVOT_MIN_WIDTH;
+        let s = num_ldpc_symbols(source_block_symbols) as usize;
+        let mut matrix = DenseBinaryMatrix::new(width - 1, width);
+        for row in 0..(width - 1) {
+            matrix.set(row, row, true);
+        }
+
+        let mut hdpc_rows = DenseOctetMatrix::new(1, width);
+        hdpc_rows.set(0, width - 1, Octet::one());
+
+        let mut expected_bytes = Vec::with_capacity(width * 2);
+        for symbol in 0..width {
+            expected_bytes.push((symbol as u8).wrapping_mul(3).wrapping_add(1));
+            expected_bytes.push((symbol as u8) ^ 0xa5);
+        }
+        let expected = SymbolSlab::from_bytes(expected_bytes, 2);
+
+        let mut symbols = SymbolSlab::with_zeros(width, expected.symbol_size());
+        for row in 0..s {
+            symbols.get_mut(row).copy_from_slice(expected.get(row));
+        }
+        symbols.get_mut(s).copy_from_slice(expected.get(width - 1));
+        for row in s..(width - 1) {
+            symbols
+                .get_mut(row + hdpc_rows.height())
+                .copy_from_slice(expected.get(row));
+        }
+
+        let original_rows = coefficient_rows(&matrix, &hdpc_rows, source_block_symbols);
+        let (original, _) = solve(
+            original_rows,
+            width,
+            symbols.clone(),
+            OperationRecording::Record,
+        );
+        let (optimized, ops) =
+            fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_block_symbols);
+
+        assert_eq!(optimized, original);
+        assert_eq!(optimized.unwrap(), expected);
         assert!(ops.is_none());
     }
 
