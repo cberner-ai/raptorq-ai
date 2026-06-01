@@ -67,6 +67,10 @@ jobs:
       - name: Compile benchmarks
         run: cargo bench --features benchmarking --no-run
 
+      - name: Run selected benchmarks
+        if: startsWith(matrix.os, 'ubuntu')
+        run: cargo bench --features benchmarking --bench roundtrip_benchmark -- --quiet
+
       - name: Run tests (no-std)
         run: cargo test --no-default-features
 
