@@ -361,6 +361,7 @@ fn solve(
     let height = rows.len();
     let mut ops = recording.new_ops();
     let mut pivot_row = 0usize;
+    let mut row_merge_scratch = Vec::new();
 
     for col in 0..width {
         let Some(pivot) =
@@ -397,7 +398,13 @@ fn solve(
             if factor.is_zero() {
                 continue;
             }
-            add_scaled_matrix_row(row_coefficients, pivot_coefficients, col, factor);
+            add_scaled_matrix_row(
+                row_coefficients,
+                pivot_coefficients,
+                col,
+                factor,
+                &mut row_merge_scratch,
+            );
             let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
             fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
             if let Some(ops) = ops.as_mut() {
@@ -415,7 +422,13 @@ fn solve(
             if factor.is_zero() {
                 continue;
             }
-            add_scaled_matrix_row(row_coefficients, pivot_coefficients, col, factor);
+            add_scaled_matrix_row(
+                row_coefficients,
+                pivot_coefficients,
+                col,
+                factor,
+                &mut row_merge_scratch,
+            );
             let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
             fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
             if let Some(ops) = ops.as_mut() {
@@ -526,42 +539,52 @@ fn add_scaled_matrix_row(
     src: &CoefficientRow,
     start_col: usize,
     scalar: Octet,
+    scratch: &mut CoefficientRow,
 ) {
-    let mut merged = Vec::with_capacity(dest.len() + src.len());
     let mut dest_index = 0usize;
     let mut src_index = src.partition_point(|&(col, _)| col < start_col);
+    scratch.clear();
+    scratch.reserve(dest.len() + src.len() - src_index);
 
     while dest_index < dest.len() || src_index < src.len() {
         match (dest.get(dest_index), src.get(src_index)) {
             (Some(&(dest_col, dest_value)), Some(&(src_col, src_value))) => {
                 if dest_col < src_col {
-                    merged.push((dest_col, dest_value));
+                    scratch.push((dest_col, dest_value));
                     dest_index += 1;
                 } else if src_col < dest_col {
-                    merged.push((src_col, src_value * scalar));
+                    scratch.push((src_col, scaled_coefficient(src_value, scalar)));
                     src_index += 1;
                 } else {
-                    let value = dest_value + src_value * scalar;
+                    let value = dest_value + scaled_coefficient(src_value, scalar);
                     if !value.is_zero() {
-                        merged.push((dest_col, value));
+                        scratch.push((dest_col, value));
                     }
                     dest_index += 1;
                     src_index += 1;
                 }
             }
             (Some(&(dest_col, dest_value)), None) => {
-                merged.push((dest_col, dest_value));
+                scratch.push((dest_col, dest_value));
                 dest_index += 1;
             }
             (None, Some(&(src_col, src_value))) => {
-                merged.push((src_col, src_value * scalar));
+                scratch.push((src_col, scaled_coefficient(src_value, scalar)));
                 src_index += 1;
             }
             (None, None) => break,
         }
     }
 
-    *dest = merged;
+    core::mem::swap(dest, scratch);
+}
+
+fn scaled_coefficient(value: Octet, scalar: Octet) -> Octet {
+    if scalar == Octet::one() {
+        value
+    } else {
+        value * scalar
+    }
 }
 
 #[cfg(feature = "benchmarking")]
