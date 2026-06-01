@@ -47,10 +47,11 @@ fn benchmark(
         let elapsed = now.elapsed();
         let elapsed = elapsed.as_secs() as f64 + elapsed.subsec_millis() as f64 * 0.001;
         let throughput = (elements * iterations * 8) as f64 / 1024.0 / 1024.0 / elapsed;
+        let processed_mib = (elements * iterations) as f64 / 1024.0 / 1024.0;
         println!(
-            "symbol count = {}, decoded {} MB in {:.3}secs using {:.1}% overhead, throughput: {:.1}Mbit/s",
+            "symbol count = {}, decoded {:.2} MB in {:.3}secs using {:.1}% overhead, throughput: {:.1}Mbit/s",
             symbol_count,
-            elements * iterations / 1024 / 1024,
+            processed_mib,
             elapsed,
             100.0 * overhead,
             throughput
