@@ -16,15 +16,37 @@ from typing import Optional
 COMMENT_MARKER = "<!-- raptorq-benchmark-ci -->"
 MAX_TABLE_ROWS = 80
 MAX_FAILURE_LOG_LINES = 80
-QUICK_BENCH_COMMAND = [
-    "cargo",
-    "bench",
-    "--features",
-    "benchmarking",
-    "--bench",
-    "codec_benchmark",
-    "--",
-    "--quick",
+QUICK_BENCH_COMMANDS = [
+    [
+        "cargo",
+        "bench",
+        "--features",
+        "benchmarking",
+        "--bench",
+        "codec_benchmark",
+        "--",
+        "--quick",
+    ],
+    [
+        "cargo",
+        "bench",
+        "--features",
+        "benchmarking",
+        "--bench",
+        "encode_benchmark",
+        "--",
+        "--ci",
+    ],
+    [
+        "cargo",
+        "bench",
+        "--features",
+        "benchmarking",
+        "--bench",
+        "decode_benchmark",
+        "--",
+        "--ci",
+    ],
 ]
 
 
@@ -160,7 +182,7 @@ def parse_custom_throughput(output: str) -> dict[str, ThroughputMetric]:
     section_re = re.compile(r"Symbol size:\s*(?P<size>\d+) bytes(?: \((?P<mode>[^)]+)\))?")
     throughput_re = re.compile(
         r"symbol count = (?P<count>\d+), (?P<kind>encoded|decoded) "
-        r"(?P<mb>\d+) MB in (?P<secs>[0-9.]+)secs"
+        r"(?P<mb>[0-9]+(?:\.[0-9]+)?) MB in (?P<secs>[0-9.]+)secs"
         r"(?: using (?P<overhead>[0-9.]+)% overhead)?, "
         r"throughput: (?P<mbits>[0-9.]+)Mbit/s"
     )
@@ -226,15 +248,23 @@ def run_benchmarks(label: str, ref: str, target_dir: Path) -> BenchmarkRun:
     target_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
-    bench_result = run_command(QUICK_BENCH_COMMAND, env=env)
-    output = "\n".join(part for part in [checkout_output, bench_result.output] if part)
+    outputs = [checkout_output]
+    success = True
+    for command in QUICK_BENCH_COMMANDS:
+        bench_result = run_command(command, env=env)
+        outputs.append(bench_result.output)
+        if bench_result.returncode != 0:
+            success = False
+            break
+
+    output = "\n".join(part for part in outputs if part)
     elapsed = time.monotonic() - started
 
     return BenchmarkRun(
         label=label,
         ref=ref,
         sha=sha,
-        success=bench_result.returncode == 0,
+        success=success,
         output=output,
         target_dir=target_dir,
         elapsed_seconds=elapsed,
