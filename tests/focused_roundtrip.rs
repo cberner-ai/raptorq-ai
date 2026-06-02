@@ -117,6 +117,30 @@ fn corrupt_exact_no_hdpc_repair_set_does_not_decode() {
 }
 
 #[test]
+fn corrupt_redundant_k1_repair_set_does_not_decode() {
+    let symbol_count = 1;
+    let data = deterministic_data(symbol_count);
+    let config = ObjectTransmissionInformation::new(0, SYMBOL_SIZE, 0, 1, 1);
+    let encoder = SourceBlockEncoder::new(0, &config, &data);
+    let repair_packets = encoder.repair_packets(0, 12);
+
+    let mut good_decoder = SourceBlockDecoder::new(0, &config, data.len() as u64);
+    assert_eq!(
+        good_decoder.decode(repair_packets.clone()),
+        Some(data.clone())
+    );
+
+    let mut corrupt_packets = repair_packets;
+    let packet = &mut corrupt_packets[3];
+    let mut corrupt_payload = packet.data().to_vec();
+    corrupt_payload[0] ^= 0xff;
+    *packet = EncodingPacket::new(packet.payload_id().clone(), corrupt_payload);
+
+    let mut decoder = SourceBlockDecoder::new(0, &config, data.len() as u64);
+    assert_eq!(decoder.decode(corrupt_packets), None);
+}
+
+#[test]
 fn large_source_block_encoding_plan_generation_does_not_panic() {
     let _plan = SourceBlockEncodingPlan::generate(5_000);
 }

@@ -25,6 +25,7 @@ impl PackedBinaryRows {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_sparse(rows: Vec<Vec<usize>>, width: usize) -> PackedBinaryRows {
         let height = rows.len();
         let mut packed = PackedBinaryRows::new(height, width);
