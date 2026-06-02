@@ -1,6 +1,7 @@
+#[inline]
 pub fn rand(y: u32, i: u32, m: u32) -> u32 {
-    assert!(i < 256);
-    assert!(m > 0);
+    debug_assert!(i < 256);
+    debug_assert!(m > 0);
 
     let x0 = (y.wrapping_add(i) & 0xff) as usize;
     let x1 = ((y >> 8).wrapping_add(i) & 0xff) as usize;

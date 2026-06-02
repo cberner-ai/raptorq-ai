@@ -118,6 +118,15 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     assert_eq!(hdpc_rows.width(), width);
     assert!(matrix.height() >= s);
 
+    if recording == OperationRecording::Skip
+        && total_rows == width
+        && width <= MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize
+        && let Some(decoded) =
+            try_hybrid_binary_hdpc_solve(&matrix, &hdpc_rows, &symbols, source_block_symbols)
+    {
+        return (Some(decoded), None);
+    }
+
     let (rows, symbols) = match recording {
         OperationRecording::Record => (
             coefficient_rows(&matrix, &hdpc_rows, source_block_symbols),
@@ -356,6 +365,190 @@ fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bo
     true
 }
 
+// Exact repair systems have L rows. The non-HDPC rows are binary and leave only
+// a small free-column system for HDPC to resolve over GF(256).
+fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    symbols: &SymbolSlab,
+    source_block_symbols: u32,
+) -> Option<SymbolSlab> {
+    let s = num_ldpc_symbols(source_block_symbols) as usize;
+    let h = hdpc_rows.height();
+    let width = matrix.width();
+    let binary_height = matrix.height();
+    let symbol_size = symbols.symbol_size();
+
+    let mut binary_symbols = SymbolSlab::with_zeros(binary_height, symbol_size);
+    for row in 0..s {
+        binary_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(row));
+    }
+    for row in s..binary_height {
+        binary_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(row + h));
+    }
+
+    let mut rows = Vec::with_capacity(binary_height);
+    for row in 0..binary_height {
+        rows.push(matrix.row_entries(row));
+    }
+    let mut rows = PackedBinaryRows::from_sparse(rows, width);
+    let mut bucket_heads = vec![None; width];
+    let mut next_in_bucket = vec![None; binary_height];
+    for row in 0..binary_height {
+        if let Some(col) = rows.first_one_at_or_after(row, 0) {
+            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+        }
+    }
+
+    let mut pivot_for_col = vec![None; width];
+    let mut is_pivot_row = vec![false; binary_height];
+    for col in 0..width {
+        let Some(pivot) =
+            pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
+        else {
+            continue;
+        };
+        pivot_for_col[col] = Some(pivot);
+        is_pivot_row[pivot] = true;
+
+        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+            rows.xor_suffix(row, pivot, col);
+            let (pivot_symbol, dest_symbol) = binary_symbols.get_disjoint_mut(pivot, row);
+            add_assign(dest_symbol, pivot_symbol);
+
+            if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+            }
+        }
+    }
+
+    for (row, is_pivot) in is_pivot_row.into_iter().enumerate() {
+        if !is_pivot && (!rows.is_zero(row) || !symbol_is_zero(binary_symbols.get(row))) {
+            return None;
+        }
+    }
+
+    let free_cols = pivot_for_col
+        .iter()
+        .enumerate()
+        .filter_map(|(col, pivot)| pivot.is_none().then_some(col))
+        .collect::<Vec<_>>();
+    if free_cols.len() > h {
+        return None;
+    }
+
+    let mut hdpc_symbols = SymbolSlab::with_zeros(h, symbol_size);
+    for row in 0..h {
+        hdpc_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(s + row));
+    }
+    let mut hdpc_coefficients = (0..h)
+        .map(|row| copy_octet_row(hdpc_rows, row))
+        .collect::<Vec<_>>();
+    let mut pivot_coefficients = Vec::new();
+    let mut row_merge_scratch = Vec::new();
+
+    for (col, pivot) in pivot_for_col.iter().copied().enumerate() {
+        let Some(pivot) = pivot else {
+            continue;
+        };
+
+        pivot_coefficients.clear();
+        rows.visit_ones_at_or_after(pivot, col, |entry_col| {
+            pivot_coefficients.push((entry_col, Octet::one()));
+        });
+
+        for row in 0..h {
+            let factor = coefficient_at(&hdpc_coefficients[row], col);
+            if factor.is_zero() {
+                continue;
+            }
+            add_scaled_matrix_row(
+                &mut hdpc_coefficients[row],
+                &pivot_coefficients,
+                col,
+                factor,
+                &mut row_merge_scratch,
+            );
+            fused_addassign_mul_scalar(
+                hdpc_symbols.get_mut(row),
+                binary_symbols.get(pivot),
+                &factor,
+            );
+        }
+    }
+
+    let free_values = solve_hdpc_free_variables(
+        hdpc_coefficients,
+        hdpc_symbols,
+        &free_cols,
+        width,
+        symbol_size,
+    )?;
+
+    let mut decoded = SymbolSlab::with_zeros(width, symbol_size);
+    for (free_index, &col) in free_cols.iter().enumerate() {
+        decoded
+            .get_mut(col)
+            .copy_from_slice(free_values.get(free_index));
+    }
+    for col in (0..width).rev() {
+        if let Some(pivot) = pivot_for_col[col] {
+            decoded
+                .get_mut(col)
+                .copy_from_slice(binary_symbols.get(pivot));
+            rows.visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
+                let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
+                add_assign(dest_symbol, dependent_symbol);
+            });
+        }
+    }
+
+    Some(decoded)
+}
+
+fn solve_hdpc_free_variables(
+    hdpc_coefficients: Vec<CoefficientRow>,
+    hdpc_symbols: SymbolSlab,
+    free_cols: &[usize],
+    width: usize,
+    symbol_size: usize,
+) -> Option<SymbolSlab> {
+    if free_cols.is_empty() {
+        for row in 0..hdpc_coefficients.len() {
+            if !hdpc_coefficients[row].is_empty() || !symbol_is_zero(hdpc_symbols.get(row)) {
+                return None;
+            }
+        }
+        return Some(SymbolSlab::with_zeros(0, symbol_size));
+    }
+
+    let mut free_index_by_col = vec![usize::MAX; width];
+    for (index, &col) in free_cols.iter().enumerate() {
+        free_index_by_col[col] = index;
+    }
+
+    let mut free_rows = Vec::with_capacity(hdpc_coefficients.len());
+    for row in hdpc_coefficients {
+        let mut free_row = Vec::with_capacity(row.len());
+        for (col, value) in row {
+            let free_index = free_index_by_col[col];
+            if free_index == usize::MAX {
+                return None;
+            }
+            free_row.push((free_index, value));
+        }
+        free_rows.push(free_row);
+    }
+
+    solve_without_recording(free_rows, free_cols.len(), hdpc_symbols).0
+}
+
 fn copy_binary_row<M: BinaryMatrix>(matrix: &M, row: usize) -> CoefficientRow {
     let mut result = Vec::new();
     matrix.visit_row_entries(row, |col| result.push((col, Octet::one())));
@@ -414,6 +607,8 @@ fn solve(
 
     let height = rows.len();
     let mut ops = recording.new_ops();
+    let symbols_are_zero =
+        recording == OperationRecording::Record && symbol_is_zero(symbols.as_bytes());
     let mut pivot_row = 0usize;
     let mut row_merge_scratch = Vec::new();
 
@@ -426,7 +621,9 @@ fn solve(
 
         if pivot != pivot_row {
             rows.swap(pivot, pivot_row);
-            symbols.swap_symbols(pivot, pivot_row);
+            if !symbols_are_zero {
+                symbols.swap_symbols(pivot, pivot_row);
+            }
             if let Some(ops) = ops.as_mut() {
                 ops.push(SymbolOps::Swap(pivot, pivot_row));
             }
@@ -435,7 +632,9 @@ fn solve(
         if pivot_value != Octet::one() {
             let scalar = pivot_value.inverse();
             scale_matrix_row(&mut rows[pivot_row], col, scalar);
-            mulassign_scalar(symbols.get_mut(pivot_row), &scalar);
+            if !symbols_are_zero {
+                mulassign_scalar(symbols.get_mut(pivot_row), &scalar);
+            }
             if let Some(ops) = ops.as_mut() {
                 ops.push(SymbolOps::Scale(pivot_row, scalar));
             }
@@ -458,8 +657,10 @@ fn solve(
                 factor,
                 &mut row_merge_scratch,
             );
-            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
-            fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
+            if !symbols_are_zero {
+                let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
+                fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
+            }
             if let Some(ops) = ops.as_mut() {
                 ops.push(SymbolOps::FusedAdd {
                     dest: row,
@@ -482,8 +683,10 @@ fn solve(
                 factor,
                 &mut row_merge_scratch,
             );
-            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
-            fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
+            if !symbols_are_zero {
+                let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
+                fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
+            }
             if let Some(ops) = ops.as_mut() {
                 ops.push(SymbolOps::FusedAdd {
                     dest: row,
@@ -497,7 +700,7 @@ fn solve(
     }
 
     for row in pivot_row..height {
-        if !rows[row].is_empty() || !symbol_is_zero(symbols.get(row)) {
+        if !rows[row].is_empty() || (!symbols_are_zero && !symbol_is_zero(symbols.get(row))) {
             return (None, None);
         }
     }
