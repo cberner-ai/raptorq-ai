@@ -28,6 +28,7 @@ use crate::systematic_constants::{
 type CoefficientRow = Vec<(usize, Octet)>;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
+const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 
@@ -510,6 +511,100 @@ fn solve(
 }
 
 fn solve_without_recording(
+    rows: Vec<CoefficientRow>,
+    width: usize,
+    symbols: SymbolSlab,
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    if width >= COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH {
+        solve_without_recording_bucketed(rows, width, symbols)
+    } else {
+        solve_without_recording_scan(rows, width, symbols)
+    }
+}
+
+fn solve_without_recording_bucketed(
+    mut rows: Vec<CoefficientRow>,
+    width: usize,
+    mut symbols: SymbolSlab,
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    let height = rows.len();
+    let mut row_merge_scratch = Vec::new();
+    let mut bucket_heads = vec![None; width];
+    let mut next_in_bucket = vec![None; height];
+    for (row, coefficients) in rows.iter().enumerate() {
+        if let Some(&(col, _)) = coefficients.first() {
+            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+        }
+    }
+    let mut pivot_for_col = vec![None; width];
+    let mut is_pivot_row = vec![false; height];
+
+    for col in 0..width {
+        let Some((pivot, pivot_value)) =
+            pop_lightest_coefficient_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
+        else {
+            return (None, None);
+        };
+        pivot_for_col[col] = Some(pivot);
+        is_pivot_row[pivot] = true;
+
+        if pivot_value != Octet::one() {
+            let scalar = pivot_value.inverse();
+            scale_matrix_row(&mut rows[pivot], col, scalar);
+            mulassign_scalar(symbols.get_mut(pivot), &scalar);
+        }
+
+        let pivot_coefficients = rows[pivot].clone();
+
+        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+            debug_assert_ne!(row, pivot);
+            debug_assert_eq!(
+                rows[row].first().map(|&(entry_col, _)| entry_col),
+                Some(col)
+            );
+            let factor = rows[row][0].1;
+            add_scaled_matrix_row(
+                &mut rows[row],
+                &pivot_coefficients,
+                col,
+                factor,
+                &mut row_merge_scratch,
+            );
+            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot, row);
+            fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
+
+            if let Some(&(next_col, _)) = rows[row].first() {
+                debug_assert!(next_col > col);
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+            }
+        }
+    }
+
+    for (row, is_pivot) in is_pivot_row.into_iter().enumerate() {
+        if !is_pivot && (!rows[row].is_empty() || !symbol_is_zero(symbols.get(row))) {
+            return (None, None);
+        }
+    }
+
+    let mut decoded = SymbolSlab::with_zeros(width, symbols.symbol_size());
+    // Non-recording solves only need the result, so the upper triangle is resolved here
+    // instead of clearing earlier rows during elimination.
+    for col in (0..width).rev() {
+        let pivot = pivot_for_col[col].expect("pivot was recorded for every decoded column");
+        decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
+        for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
+            if dependent_col <= col {
+                break;
+            }
+            let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
+            fused_addassign_mul_scalar(dest_symbol, dependent_symbol, &coefficient);
+        }
+    }
+
+    (Some(decoded), None)
+}
+
+fn solve_without_recording_scan(
     mut rows: Vec<CoefficientRow>,
     width: usize,
     mut symbols: SymbolSlab,
@@ -563,8 +658,6 @@ fn solve_without_recording(
     }
 
     let mut decoded = SymbolSlab::with_zeros(width, symbols.symbol_size());
-    // Non-recording solves only need the result, so the upper triangle is resolved here
-    // instead of clearing earlier rows during elimination.
     for row in (0..width).rev() {
         decoded.get_mut(row).copy_from_slice(symbols.get(row));
         for &(col, coefficient) in rows[row].iter().rev() {
@@ -650,7 +743,7 @@ fn solve_binary(
     let mut next_in_bucket = vec![None; height];
     for row in 0..height {
         if let Some(col) = rows.first_one_at_or_after(row, 0) {
-            push_binary_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
         }
     }
 
@@ -666,13 +759,13 @@ fn solve_binary(
         pivot_for_col[col] = Some(pivot);
         is_pivot_row[pivot] = true;
 
-        while let Some(row) = pop_binary_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
-            rows.xor_suffix_if_contains(row, pivot, col);
+        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+            rows.xor_suffix(row, pivot, col);
             let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot, row);
             add_assign(dest_symbol, pivot_symbol);
 
             if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
-                push_binary_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
             }
         }
     }
@@ -696,7 +789,7 @@ fn solve_binary(
     (Some(decoded), None)
 }
 
-fn push_binary_row_bucket(
+fn push_row_bucket(
     bucket_heads: &mut [Option<usize>],
     next_in_bucket: &mut [Option<usize>],
     col: usize,
@@ -707,7 +800,7 @@ fn push_binary_row_bucket(
     bucket_heads[col] = Some(row);
 }
 
-fn pop_binary_row_bucket(
+fn pop_row_bucket(
     bucket_heads: &mut [Option<usize>],
     next_in_bucket: &mut [Option<usize>],
     col: usize,
@@ -716,6 +809,62 @@ fn pop_binary_row_bucket(
     bucket_heads[col] = next_in_bucket[row];
     next_in_bucket[row] = None;
     Some(row)
+}
+
+fn pop_lightest_coefficient_row_bucket(
+    rows: &[CoefficientRow],
+    bucket_heads: &mut [Option<usize>],
+    next_in_bucket: &mut [Option<usize>],
+    col: usize,
+) -> Option<(usize, Octet)> {
+    let head = bucket_heads[col]?;
+    debug_assert_eq!(
+        rows[head].first().map(|&(entry_col, _)| entry_col),
+        Some(col)
+    );
+    if next_in_bucket[head].is_none() {
+        bucket_heads[col] = None;
+        return Some((head, rows[head][0].1));
+    }
+
+    let mut best = head;
+    let mut best_previous = None;
+    let mut best_suffix_len = rows[head].len();
+    let mut best_value = rows[head][0].1;
+    let mut previous = head;
+    let mut current = next_in_bucket[head];
+
+    while let Some(row) = current {
+        debug_assert_eq!(
+            rows[row].first().map(|&(entry_col, _)| entry_col),
+            Some(col)
+        );
+        let value = rows[row][0].1;
+        let suffix_len = rows[row].len();
+        if suffix_len < best_suffix_len
+            || (suffix_len == best_suffix_len
+                && value == Octet::one()
+                && best_value != Octet::one())
+        {
+            best = row;
+            best_previous = Some(previous);
+            best_suffix_len = suffix_len;
+            best_value = value;
+            if suffix_len == 1 && value == Octet::one() {
+                break;
+            }
+        }
+        previous = row;
+        current = next_in_bucket[row];
+    }
+
+    if let Some(previous) = best_previous {
+        next_in_bucket[previous] = next_in_bucket[best];
+    } else {
+        bucket_heads[col] = next_in_bucket[best];
+    }
+    next_in_bucket[best] = None;
+    Some((best, best_value))
 }
 
 fn pop_lightest_binary_row_bucket(
@@ -1026,6 +1175,64 @@ mod tests {
             decoded.unwrap(),
             SymbolSlab::from_bytes(vec![x0.value(), x1.value(), x2.value()], 1)
         );
+        assert!(ops.is_none());
+    }
+
+    fn bucketed_rebucket_system(
+        inconsistent: bool,
+    ) -> (Vec<CoefficientRow>, SymbolSlab, [Octet; 3]) {
+        let width = COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH;
+        let x0 = Octet::new(0x11);
+        let x1 = Octet::new(0x22);
+        let x2 = Octet::new(0x33);
+        let one = Octet::one();
+
+        let mut rows = Vec::with_capacity(width + 1);
+        rows.push(vec![(0, one)]);
+        rows.push(vec![(0, one), (1, one), (2, one)]);
+        rows.push(vec![(1, Octet::new(7))]);
+        for col in 3..width {
+            rows.push(vec![(col, one)]);
+        }
+        rows.push(vec![(0, one), (2, one)]);
+
+        let mut redundant_symbol = x0 + x2;
+        if inconsistent {
+            redundant_symbol += one;
+        }
+        let mut symbol_bytes = Vec::with_capacity(width + 1);
+        symbol_bytes.push(x0.value());
+        symbol_bytes.push((x0 + x1 + x2).value());
+        symbol_bytes.push((Octet::new(7) * x1).value());
+        symbol_bytes.extend(core::iter::repeat_n(0, width - 3));
+        symbol_bytes.push(redundant_symbol.value());
+        let symbols = SymbolSlab::from_bytes(symbol_bytes, 1);
+
+        (rows, symbols, [x0, x1, x2])
+    }
+
+    #[test]
+    fn bucketed_non_recording_solver_rebuckets_eliminated_rows() {
+        let width = COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH;
+        let (rows, symbols, [x0, x1, x2]) = bucketed_rebucket_system(false);
+
+        let (decoded, ops) = solve(rows, width, symbols, OperationRecording::Skip);
+
+        let decoded = decoded.unwrap();
+        assert_eq!(decoded.get(0), &[x0.value()]);
+        assert_eq!(decoded.get(1), &[x1.value()]);
+        assert_eq!(decoded.get(2), &[x2.value()]);
+        assert!(ops.is_none());
+    }
+
+    #[test]
+    fn bucketed_non_recording_solver_rejects_inconsistent_rebucketed_row() {
+        let width = COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH;
+        let (rows, symbols, _) = bucketed_rebucket_system(true);
+
+        let (decoded, ops) = solve(rows, width, symbols, OperationRecording::Skip);
+
+        assert!(decoded.is_none());
         assert!(ops.is_none());
     }
 
