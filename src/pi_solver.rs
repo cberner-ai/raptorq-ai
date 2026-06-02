@@ -57,7 +57,7 @@ impl OperationRecording {
     }
 }
 
-pub fn fused_inverse_mul_symbols<M: BinaryMatrix>(
+pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
     matrix: M,
     hdpc_rows: DenseOctetMatrix,
     symbols: SymbolSlab,
@@ -321,14 +321,15 @@ pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
     symbols: SymbolSlab,
     source_block_symbols: u32,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
-    let width = matrix.width();
     assert_eq!(symbols.len(), matrix.height());
-    let mut rows = Vec::with_capacity(matrix.height());
+    let width = matrix.width();
+    let mut sparse_rows = Vec::with_capacity(matrix.height());
     for row in 0..matrix.height() {
-        rows.push(matrix.row_entries(row));
+        sparse_rows.push(matrix.row_entries(row));
     }
+    let rows = PackedBinaryRows::from_sparse(sparse_rows, width);
 
-    let (decoded, ops) = solve_binary(rows, width, symbols);
+    let (decoded, ops) = solve_binary(rows, symbols);
     match decoded {
         Some(decoded) => (verify_no_hdpc_solution(decoded, source_block_symbols), ops),
         None => (None, ops),
@@ -391,11 +392,7 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
             .copy_from_slice(symbols.get(row + h));
     }
 
-    let mut rows = Vec::with_capacity(binary_height);
-    for row in 0..binary_height {
-        rows.push(matrix.row_entries(row));
-    }
-    let mut rows = PackedBinaryRows::from_sparse(rows, width);
+    let mut rows = matrix.packed_rows();
     let mut bucket_heads = vec![None; width];
     let mut next_in_bucket = vec![None; binary_height];
     for row in 0..binary_height {
@@ -941,17 +938,17 @@ fn pivot_value_and_suffix_len(row: &CoefficientRow, col: usize) -> Option<(Octet
 }
 
 fn solve_binary(
-    rows: Vec<Vec<usize>>,
-    width: usize,
+    mut rows: PackedBinaryRows,
     mut symbols: SymbolSlab,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    let width = rows.width();
     assert!(
         width <= MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize,
         "generic RaptorQ solver supports at most {MAX_SUPPORTED_INTERMEDIATE_SYMBOLS} intermediate symbols; optimized large-matrix PI solver is not implemented"
     );
 
-    let height = rows.len();
-    let mut rows = PackedBinaryRows::from_sparse(rows, width);
+    let height = rows.height();
+    assert_eq!(height, symbols.len());
     let mut bucket_heads = vec![None; width];
     let mut next_in_bucket = vec![None; height];
     for row in 0..height {

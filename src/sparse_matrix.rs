@@ -4,6 +4,7 @@ use std::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::gf2::PackedBinaryRows;
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 #[cfg(feature = "serde_support")]
@@ -147,6 +148,16 @@ impl BinaryMatrix for SparseBinaryMatrix {
             row.sort_unstable();
         }
         self.rows_normalized = true;
+    }
+
+    fn packed_rows(&self) -> PackedBinaryRows {
+        let mut packed = PackedBinaryRows::new(self.rows.len(), self.width);
+        for (row, entries) in self.rows.iter().enumerate() {
+            for &col in entries {
+                packed.set(row, col);
+            }
+        }
+        packed
     }
 
     fn visit_row_entries<F>(&self, row: usize, mut visit: F)
