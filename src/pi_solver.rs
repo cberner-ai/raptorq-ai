@@ -987,7 +987,7 @@ mod tests {
 
     #[test]
     fn large_non_planning_matrix_uses_non_recording_solver_without_ops() {
-        let width = 1024;
+        let width = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize;
         let mut matrix = DenseBinaryMatrix::new(width, width);
         for row in 0..width {
             matrix.set(row, row, true);
