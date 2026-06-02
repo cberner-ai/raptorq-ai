@@ -447,33 +447,22 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
             .get_mut(row)
             .copy_from_slice(symbols.get(s + row));
     }
-    let mut hdpc_coefficients = (0..h)
-        .map(|row| copy_octet_row(hdpc_rows, row))
-        .collect::<Vec<_>>();
-    let mut pivot_cols = Vec::new();
-    let mut row_merge_scratch = Vec::new();
+    let mut hdpc_coefficients = dense_hdpc_coefficients(hdpc_rows);
 
     for (col, pivot) in pivot_for_col.iter().copied().enumerate() {
         let Some(pivot) = pivot else {
             continue;
         };
 
-        pivot_cols.clear();
-        rows.visit_ones_at_or_after(pivot, col, |entry_col| {
-            pivot_cols.push(entry_col);
-        });
-
         for row in 0..h {
-            let factor = coefficient_at(&hdpc_coefficients[row], col);
+            let row_start = row * width;
+            let factor = hdpc_coefficients[row_start + col];
             if factor.is_zero() {
                 continue;
             }
-            add_scaled_binary_matrix_row(
-                &mut hdpc_coefficients[row],
-                &pivot_cols,
-                factor,
-                &mut row_merge_scratch,
-            );
+            rows.visit_ones_at_or_after(pivot, col, |entry_col| {
+                hdpc_coefficients[row_start + entry_col] += factor;
+            });
             fused_addassign_mul_scalar(
                 hdpc_symbols.get_mut(row),
                 binary_symbols.get(pivot),
@@ -482,7 +471,7 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
         }
     }
 
-    let free_values = solve_hdpc_free_variables(
+    let free_values = solve_hdpc_free_variables_dense(
         hdpc_coefficients,
         hdpc_symbols,
         &free_cols,
@@ -511,16 +500,33 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     Some(decoded)
 }
 
-fn solve_hdpc_free_variables(
-    hdpc_coefficients: Vec<CoefficientRow>,
+fn dense_hdpc_coefficients(matrix: &DenseOctetMatrix) -> Vec<Octet> {
+    let mut coefficients = vec![Octet::zero(); matrix.height() * matrix.width()];
+    for row in 0..matrix.height() {
+        let row_start = row * matrix.width();
+        for col in 0..matrix.width() {
+            coefficients[row_start + col] = matrix.get(row, col);
+        }
+    }
+    coefficients
+}
+
+fn solve_hdpc_free_variables_dense(
+    hdpc_coefficients: Vec<Octet>,
     hdpc_symbols: SymbolSlab,
     free_cols: &[usize],
     width: usize,
     symbol_size: usize,
 ) -> Option<SymbolSlab> {
+    let h = hdpc_symbols.len();
+    assert_eq!(hdpc_coefficients.len(), h * width);
+
     if free_cols.is_empty() {
-        for row in 0..hdpc_coefficients.len() {
-            if !hdpc_coefficients[row].is_empty() || !symbol_is_zero(hdpc_symbols.get(row)) {
+        if hdpc_coefficients.iter().any(|value| !value.is_zero()) {
+            return None;
+        }
+        for row in 0..h {
+            if !symbol_is_zero(hdpc_symbols.get(row)) {
                 return None;
             }
         }
@@ -532,10 +538,15 @@ fn solve_hdpc_free_variables(
         free_index_by_col[col] = index;
     }
 
-    let mut free_rows = Vec::with_capacity(hdpc_coefficients.len());
-    for row in hdpc_coefficients {
-        let mut free_row = Vec::with_capacity(row.len());
-        for (col, value) in row {
+    let mut free_rows = Vec::with_capacity(h);
+    for row in 0..h {
+        let row_start = row * width;
+        let mut free_row = Vec::with_capacity(free_cols.len());
+        for col in 0..width {
+            let value = hdpc_coefficients[row_start + col];
+            if value.is_zero() {
+                continue;
+            }
             let free_index = free_index_by_col[col];
             if free_index == usize::MAX {
                 return None;
@@ -1138,6 +1149,7 @@ fn scale_matrix_row(row: &mut CoefficientRow, start_col: usize, scalar: Octet) {
     }
 }
 
+#[cfg(all(test, feature = "std"))]
 fn add_scaled_binary_matrix_row(
     dest: &mut CoefficientRow,
     src_cols: &[usize],
