@@ -57,6 +57,10 @@ impl SymbolSlab {
         &self.bytes
     }
 
+    pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
     pub fn get(&self, index: usize) -> &[u8] {
         let start = index * self.symbol_size;
         &self.bytes[start..start + self.symbol_size]

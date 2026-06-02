@@ -649,6 +649,7 @@ fn solve(
         recording == OperationRecording::Record && symbol_is_zero(symbols.as_bytes());
     let mut pivot_row = 0usize;
     let mut row_merge_scratch = Vec::new();
+    let mut fused_add_batch = Vec::new();
 
     for col in 0..width {
         let Some((pivot, pivot_value)) =
@@ -682,6 +683,7 @@ fn solve(
         let (pivot_coefficients, rows_after) = pivot_and_after
             .split_first_mut()
             .expect("pivot row must exist");
+        fused_add_batch.clear();
 
         for (row, row_coefficients) in rows_before.iter_mut().enumerate() {
             let factor = coefficient_at(row_coefficients, col);
@@ -699,13 +701,7 @@ fn solve(
                 let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
                 fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
             }
-            if let Some(ops) = ops.as_mut() {
-                ops.push(SymbolOps::FusedAdd {
-                    dest: row,
-                    src: pivot_row,
-                    scalar: factor,
-                });
-            }
+            fused_add_batch.push((row, factor));
         }
 
         for (offset, row_coefficients) in rows_after.iter_mut().enumerate() {
@@ -725,14 +721,9 @@ fn solve(
                 let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot_row, row);
                 fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
             }
-            if let Some(ops) = ops.as_mut() {
-                ops.push(SymbolOps::FusedAdd {
-                    dest: row,
-                    src: pivot_row,
-                    scalar: factor,
-                });
-            }
+            fused_add_batch.push((row, factor));
         }
+        push_recorded_fused_add_ops(&mut ops, pivot_row, &mut fused_add_batch);
 
         pivot_row += 1;
     }
@@ -749,6 +740,31 @@ fn solve(
     }
 
     (Some(decoded), ops)
+}
+
+fn push_recorded_fused_add_ops(
+    ops: &mut Option<Vec<SymbolOps>>,
+    src: usize,
+    batch: &mut Vec<(usize, Octet)>,
+) {
+    let Some(ops) = ops.as_mut() else {
+        batch.clear();
+        return;
+    };
+    match batch.len() {
+        0 => {}
+        1 => {
+            let (dest, scalar) = batch[0];
+            ops.push(SymbolOps::FusedAdd { dest, src, scalar });
+            batch.clear();
+        }
+        _ => {
+            ops.push(SymbolOps::FusedAddBatch {
+                src,
+                dests: core::mem::take(batch).into_boxed_slice(),
+            });
+        }
+    }
 }
 
 fn solve_without_recording(
@@ -1376,15 +1392,23 @@ impl<M: BinaryMatrix> IntermediateSymbolDecoder<M> {
     pub fn get_symbol_mul_ops(&self) -> usize {
         self.ops
             .iter()
-            .filter(|op| matches!(op, SymbolOps::Scale(..) | SymbolOps::FusedAdd { .. }))
-            .count()
+            .map(|op| match op {
+                SymbolOps::Scale(..) | SymbolOps::FusedAdd { .. } => 1,
+                SymbolOps::FusedAddBatch { dests, .. } => dests.len(),
+                _ => 0,
+            })
+            .sum()
     }
 
     pub fn get_symbol_add_ops(&self) -> usize {
         self.ops
             .iter()
-            .filter(|op| matches!(op, SymbolOps::FusedAdd { .. }))
-            .count()
+            .map(|op| match op {
+                SymbolOps::FusedAdd { .. } => 1,
+                SymbolOps::FusedAddBatch { dests, .. } => dests.len(),
+                _ => 0,
+            })
+            .sum()
     }
 
     pub fn get_symbol_mul_ops_by_phase(&self) -> [usize; 5] {
