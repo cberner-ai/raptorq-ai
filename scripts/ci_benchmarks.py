@@ -296,7 +296,7 @@ def format_elapsed(seconds: float) -> str:
 def format_mbits(value: Optional[float]) -> str:
     if value is None:
         return "n/a"
-    return f"{value:.1f} Mbit/s"
+    return f"{value:.3f} Mbit/s"
 
 
 def format_criterion_throughput(metric: Optional[CriterionMetric]) -> str:
