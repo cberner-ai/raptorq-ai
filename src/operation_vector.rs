@@ -1,3 +1,9 @@
+#[cfg(feature = "std")]
+use std::boxed::Box;
+
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+
 use crate::octet::Octet;
 use crate::octets::{add_assign, fused_addassign_mul_scalar, mulassign_scalar};
 #[cfg(feature = "std")]
@@ -17,6 +23,10 @@ pub enum SymbolOps {
         dest: usize,
         src: usize,
         scalar: Octet,
+    },
+    FusedAddBatch {
+        src: usize,
+        dests: Box<[(usize, Octet)]>,
     },
     #[cfg(feature = "std")]
     ApplyCachedSystematicPlan {
@@ -38,6 +48,9 @@ pub fn perform_op(op: &SymbolOps, symbols: &mut SymbolSlab) {
         }
         SymbolOps::FusedAdd { dest, src, scalar } => {
             fused_addassign_symbol(symbols, dest, src, scalar);
+        }
+        SymbolOps::FusedAddBatch { src, ref dests } => {
+            fused_addassign_symbol_batch(symbols, src, dests);
         }
         #[cfg(feature = "std")]
         SymbolOps::ApplyCachedSystematicPlan {
@@ -75,6 +88,37 @@ fn fused_addassign_symbol(symbols: &mut SymbolSlab, dest: usize, src: usize, sca
     }
 }
 
+fn fused_addassign_symbol_batch(symbols: &mut SymbolSlab, src: usize, dests: &[(usize, Octet)]) {
+    if dests.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let bytes = symbols.as_mut_bytes();
+    let src_start = src * symbol_size;
+    assert!(src_start + symbol_size <= bytes.len());
+    let src_ptr = unsafe { bytes.as_ptr().add(src_start) };
+
+    for &(dest, scalar) in dests {
+        if scalar.is_zero() {
+            continue;
+        }
+        assert_ne!(dest, src);
+        let dest_start = dest * symbol_size;
+        assert!(dest_start + symbol_size <= bytes.len());
+        unsafe {
+            let src_symbol = core::slice::from_raw_parts(src_ptr, symbol_size);
+            let dest_symbol =
+                core::slice::from_raw_parts_mut(bytes.as_mut_ptr().add(dest_start), symbol_size);
+            if scalar == Octet::one() {
+                add_assign(dest_symbol, src_symbol);
+            } else {
+                fused_addassign_mul_scalar(dest_symbol, src_symbol, &scalar);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +141,35 @@ mod tests {
         add_assign(dest_symbol, src_symbol);
 
         assert_eq!(add, fused);
+    }
+
+    #[test]
+    fn batch_fused_add_matches_individual_ops() {
+        let mut batch = SymbolSlab::from_bytes(
+            vec![3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59],
+            4,
+        );
+        let mut individual = batch.clone();
+        let dests = vec![(1, Octet::one()), (2, Octet::new(7)), (3, Octet::new(19))];
+
+        perform_op(
+            &SymbolOps::FusedAddBatch {
+                src: 0,
+                dests: dests.clone().into_boxed_slice(),
+            },
+            &mut batch,
+        );
+        for (dest, scalar) in dests {
+            perform_op(
+                &SymbolOps::FusedAdd {
+                    dest,
+                    src: 0,
+                    scalar,
+                },
+                &mut individual,
+            );
+        }
+
+        assert_eq!(individual, batch);
     }
 }
