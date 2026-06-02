@@ -1,6 +1,6 @@
 use rand::RngExt;
 use raptorq::{ObjectTransmissionInformation, SourceBlockEncoder, SourceBlockEncodingPlan};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const SYMBOL_COUNTS: [usize; 4] = [10, 100, 250, 500];
@@ -15,6 +15,10 @@ fn black_box(value: u64) {
 
 fn ci_mode_enabled() -> bool {
     std::env::args().any(|arg| arg == "--ci")
+}
+
+fn elapsed_seconds(elapsed: Duration) -> f64 {
+    elapsed.as_nanos() as f64 / 1_000_000_000.0
 }
 
 fn benchmark(
@@ -49,12 +53,11 @@ fn benchmark(
             let packets = encoder.repair_packets(0, 1);
             black_box_value += packets[0].data()[0] as u64;
         }
-        let elapsed = now.elapsed();
-        let elapsed = elapsed.as_secs() as f64 + elapsed.subsec_millis() as f64 * 0.001;
+        let elapsed = elapsed_seconds(now.elapsed());
         let throughput = (elements * iterations * 8) as f64 / 1024.0 / 1024.0 / elapsed;
         let processed_mib = (elements * iterations) as f64 / 1024.0 / 1024.0;
         println!(
-            "symbol count = {}, encoded {:.2} MB in {:.3}secs, throughput: {:.1}Mbit/s",
+            "symbol count = {}, encoded {:.2} MB in {:.9}secs, throughput: {:.3}Mbit/s",
             symbol_count, processed_mib, elapsed, throughput
         );
     }

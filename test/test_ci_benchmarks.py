@@ -17,11 +17,11 @@ ENCODE_OUTPUT = """\
      Running benches/encode_benchmark.rs (target/release/deps/encode_benchmark)
 Running CI benchmark subset
 Symbol size: 1280 bytes (without pre-built plan)
-symbol count = 10, encoded 1 MB in 0.004secs, throughput: 3979.5Mbit/s
-symbol count = 100, encoded 1.95 MB in 0.008secs, throughput: 1953.1Mbit/s
+symbol count = 10, encoded 1 MB in 0.004123456secs, throughput: 3979.543Mbit/s
+symbol count = 100, encoded 1.95 MB in 0.008123456secs, throughput: 1953.123Mbit/s
 
 Symbol size: 1280 bytes (with pre-built plan)
-symbol count = 10, encoded 1.99 MB in 0.004secs, throughput: 3979.5Mbit/s
+symbol count = 10, encoded 1.99 MB in 0.004123456secs, throughput: 3979.543Mbit/s
 """
 
 
@@ -29,8 +29,8 @@ DECODE_OUTPUT = """\
      Running benches/decode_benchmark.rs (target/release/deps/decode_benchmark)
 Running CI benchmark subset
 Symbol size: 1280 bytes
-symbol count = 10, decoded 1 MB in 0.007secs using 0.0% overhead, throughput: 2274.0Mbit/s
-symbol count = 100, decoded 1.95 MB in 0.010secs using 5.0% overhead, throughput: 1562.5Mbit/s
+symbol count = 10, decoded 1 MB in 0.007123456secs using 0.0% overhead, throughput: 2274.321Mbit/s
+symbol count = 100, decoded 1.95 MB in 0.010123456secs using 5.0% overhead, throughput: 1562.543Mbit/s
 """
 
 
@@ -54,14 +54,17 @@ class CiBenchmarkTests(unittest.TestCase):
             metrics[
                 "encode_benchmark/encoded/without pre-built plan/symbols=10"
             ].mbits_per_second,
-            3979.5,
+            3979.543,
         )
         self.assertEqual(
             metrics[
                 "decode_benchmark/decoded/1280 bytes/symbols=100/overhead=5.0%"
             ].mbits_per_second,
-            1562.5,
+            1562.543,
         )
+
+    def test_format_mbits_preserves_custom_benchmark_precision(self):
+        self.assertEqual(ci_benchmarks.format_mbits(3979.54321), "3979.543 Mbit/s")
 
     def test_run_benchmarks_aggregates_all_quick_benchmark_commands(self):
         calls = []
