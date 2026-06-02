@@ -35,6 +35,7 @@ pub fn generate_constraint_matrix_no_hdpc<M: BinaryMatrix>(
 
     fill_ldpc_rows(&mut matrix, k_prime);
     fill_encoded_rows(&mut matrix, s as usize, k_prime, encoded_isis);
+    matrix.normalize_rows();
 
     matrix
 }
@@ -44,6 +45,10 @@ fn fill_ldpc_rows<M: BinaryMatrix>(matrix: &mut M, k_prime: u32) {
     let p = num_pi_symbols(k_prime);
     let w = num_lt_symbols(k_prime);
     let b = w - s;
+    let reserve_per_row = (3 * b).div_ceil(s) as usize + 3;
+    for row in 0..s {
+        matrix.reserve_row_entries(row as usize, reserve_per_row);
+    }
 
     for i in 0..b {
         let a = 1 + i / s;
@@ -153,6 +158,8 @@ fn fill_encoded_row<M: BinaryMatrix>(
     source_tuple: (u32, u32, u32, u32, u32, u32),
 ) {
     let (d, a, mut b, d1, a1, mut b1) = source_tuple;
+    matrix.reserve_row_entries(row, (d + d1) as usize);
+
     xor_one(matrix, row, b as usize);
     for _ in 1..d {
         b = add_mod_once(b, a, params.lt_symbols);

@@ -14,6 +14,8 @@ pub trait BinaryMatrix: Clone {
     fn width(&self) -> usize;
     fn get(&self, row: usize, col: usize) -> Octet;
     fn set(&mut self, row: usize, col: usize, value: bool);
+    fn reserve_row_entries(&mut self, _row: usize, _additional: usize) {}
+    fn normalize_rows(&mut self) {}
     fn toggle(&mut self, row: usize, col: usize) {
         let next = self.get(row, col) == Octet::zero();
         self.set(row, col, next);
