@@ -8,8 +8,16 @@ pub fn rand(y: u32, i: u32, m: u32) -> u32 {
     let x2 = ((y >> 16).wrapping_add(i) & 0xff) as usize;
     let x3 = ((y >> 24).wrapping_add(i) & 0xff) as usize;
 
-    (V0[x0] ^ V1[x1] ^ V2[x2] ^ V3[x3]) % m
+    let value = V0[x0] ^ V1[x1] ^ V2[x2] ^ V3[x3];
+    match m {
+        DEGREE_RANDOM_MODULUS => value & (DEGREE_RANDOM_MODULUS - 1),
+        D1_RANDOM_MODULUS => value & (D1_RANDOM_MODULUS - 1),
+        _ => value % m,
+    }
 }
+
+const DEGREE_RANDOM_MODULUS: u32 = 1_048_576;
+const D1_RANDOM_MODULUS: u32 = 2;
 
 const V0: [u32; 256] = [
     251291136, 3952231631, 3370958628, 4070167936, 123631495, 3351110283, 3218676425, 2011642291,
@@ -167,5 +175,20 @@ mod tests {
         let x3 = ((y >> 24).wrapping_add(i) & 0xff) as usize;
 
         assert_eq!(rand(y, i, m), (V0[x0] ^ V1[x1] ^ V2[x2] ^ V3[x3]) % m);
+    }
+
+    #[test]
+    fn rand_uses_equivalent_power_of_two_reduction() {
+        let y = 0x1234_5678_u32;
+        let i = 17_u32;
+
+        assert_eq!(
+            rand(y, i, DEGREE_RANDOM_MODULUS),
+            (V0[0x89] ^ V1[0x67] ^ V2[0x45] ^ V3[0x23]) % DEGREE_RANDOM_MODULUS
+        );
+        assert_eq!(
+            rand(y, i, D1_RANDOM_MODULUS),
+            (V0[0x89] ^ V1[0x67] ^ V2[0x45] ^ V3[0x23]) % D1_RANDOM_MODULUS
+        );
     }
 }
