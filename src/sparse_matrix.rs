@@ -9,11 +9,36 @@ use crate::octet::Octet;
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+const APPEND_BUILD_MIN_WIDTH: usize = 512;
+
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct SparseBinaryMatrix {
     width: usize,
     rows: Vec<Vec<usize>>,
+    #[cfg_attr(feature = "serde_support", serde(skip, default))]
+    rows_normalized: bool,
+}
+
+impl PartialEq for SparseBinaryMatrix {
+    fn eq(&self, other: &Self) -> bool {
+        if self.width != other.width || self.rows.len() != other.rows.len() {
+            return false;
+        }
+
+        self.rows
+            .iter()
+            .zip(other.rows.iter())
+            .all(|(left, right)| sorted_entries(left) == sorted_entries(right))
+    }
+}
+
+impl Eq for SparseBinaryMatrix {}
+
+fn sorted_entries(entries: &[usize]) -> Vec<usize> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_unstable();
+    sorted
 }
 
 impl BinaryMatrix for SparseBinaryMatrix {
@@ -21,6 +46,7 @@ impl BinaryMatrix for SparseBinaryMatrix {
         SparseBinaryMatrix {
             width,
             rows: vec![Vec::new(); height],
+            rows_normalized: true,
         }
     }
 
@@ -35,7 +61,12 @@ impl BinaryMatrix for SparseBinaryMatrix {
     fn get(&self, row: usize, col: usize) -> Octet {
         assert!(row < self.rows.len());
         assert!(col < self.width);
-        if self.rows[row].binary_search(&col).is_ok() {
+        let contains = if self.rows_normalized {
+            self.rows[row].binary_search(&col).is_ok()
+        } else {
+            self.rows[row].contains(&col)
+        };
+        if contains {
             Octet::one()
         } else {
             Octet::zero()
@@ -45,28 +76,77 @@ impl BinaryMatrix for SparseBinaryMatrix {
     fn set(&mut self, row: usize, col: usize, value: bool) {
         assert!(row < self.rows.len());
         assert!(col < self.width);
-        match self.rows[row].binary_search(&col) {
-            Ok(index) if !value => {
-                self.rows[row].remove(index);
+        if self.width < APPEND_BUILD_MIN_WIDTH {
+            match self.rows[row].binary_search(&col) {
+                Ok(index) if !value => {
+                    self.rows[row].remove(index);
+                }
+                Err(index) if value => {
+                    self.rows[row].insert(index, col);
+                }
+                _ => {}
             }
-            Err(index) if value => {
-                self.rows[row].insert(index, col);
+            return;
+        }
+
+        let row_entries = &mut self.rows[row];
+        let mut changed = false;
+        match row_entries.iter().position(|&entry| entry == col) {
+            Some(index) if !value => {
+                row_entries.swap_remove(index);
+                changed = true;
+            }
+            None if value => {
+                row_entries.push(col);
+                changed = true;
             }
             _ => {}
         }
+        if changed {
+            self.rows_normalized = false;
+        }
+    }
+
+    fn reserve_row_entries(&mut self, row: usize, additional: usize) {
+        assert!(row < self.rows.len());
+        self.rows[row].reserve(additional);
     }
 
     fn toggle(&mut self, row: usize, col: usize) {
         assert!(row < self.rows.len());
         assert!(col < self.width);
-        match self.rows[row].binary_search(&col) {
-            Ok(index) => {
-                self.rows[row].remove(index);
+        if self.width < APPEND_BUILD_MIN_WIDTH {
+            match self.rows[row].binary_search(&col) {
+                Ok(index) => {
+                    self.rows[row].remove(index);
+                }
+                Err(index) => {
+                    self.rows[row].insert(index, col);
+                }
             }
-            Err(index) => {
-                self.rows[row].insert(index, col);
+            return;
+        }
+
+        let row_entries = &mut self.rows[row];
+        match row_entries.iter().position(|&entry| entry == col) {
+            Some(index) => {
+                row_entries.swap_remove(index);
+            }
+            None => {
+                row_entries.push(col);
             }
         }
+        self.rows_normalized = false;
+    }
+
+    fn normalize_rows(&mut self) {
+        if self.rows_normalized {
+            return;
+        }
+        for row in &mut self.rows {
+            row.sort_unstable();
+        }
+        self.rows_normalized = true;
     }
 
     fn visit_row_entries<F>(&self, row: usize, mut visit: F)
@@ -74,13 +154,52 @@ impl BinaryMatrix for SparseBinaryMatrix {
         F: FnMut(usize),
     {
         assert!(row < self.rows.len());
-        for &col in &self.rows[row] {
-            visit(col);
+        if self.rows_normalized {
+            for &col in &self.rows[row] {
+                visit(col);
+            }
+        } else {
+            let entries = sorted_entries(&self.rows[row]);
+            for col in entries {
+                visit(col);
+            }
         }
     }
 
     fn row_entries(&self, row: usize) -> Vec<usize> {
         assert!(row < self.rows.len());
-        self.rows[row].clone()
+        let mut entries = self.rows[row].clone();
+        if !self.rows_normalized {
+            entries.sort_unstable();
+        }
+        entries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_rows_are_sorted_when_read_after_unsorted_toggles() {
+        let mut matrix = SparseBinaryMatrix::new(1, APPEND_BUILD_MIN_WIDTH);
+        matrix.toggle(0, 1);
+        matrix.toggle(0, 5);
+        matrix.toggle(0, 3);
+        matrix.set(0, 7, true);
+        matrix.set(0, 1, false);
+
+        assert!(!matrix.rows_normalized);
+        assert_ne!(matrix.rows[0], vec![3, 5, 7]);
+        assert_eq!(matrix.row_entries(0), vec![3, 5, 7]);
+
+        let mut visited = Vec::new();
+        matrix.visit_row_entries(0, |col| visited.push(col));
+        assert_eq!(visited, vec![3, 5, 7]);
+
+        matrix.normalize_rows();
+        assert!(matrix.rows_normalized);
+        assert_eq!(matrix.rows[0], vec![3, 5, 7]);
+        assert_eq!(matrix.row_entries(0), vec![3, 5, 7]);
     }
 }
