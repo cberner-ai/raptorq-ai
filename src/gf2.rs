@@ -37,15 +37,8 @@ impl PackedBinaryRows {
         (self.words[word] & bit_mask(col)) != 0
     }
 
-    pub(crate) fn xor_suffix_if_contains(
-        &mut self,
-        dest: usize,
-        src: usize,
-        start_col: usize,
-    ) -> bool {
-        if !self.contains(dest, start_col) {
-            return false;
-        }
+    pub(crate) fn xor_suffix(&mut self, dest: usize, src: usize, start_col: usize) {
+        debug_assert!(self.contains(dest, start_col));
 
         let first_word = start_col / u64::BITS as usize;
         let first_mask = u64::MAX << (start_col % u64::BITS as usize);
@@ -56,7 +49,6 @@ impl PackedBinaryRows {
         for offset in (first_word + 1)..self.words_per_row {
             self.words[dest_start + offset] ^= self.words[src_start + offset];
         }
-        true
     }
 
     pub(crate) fn first_one_at_or_after(&self, row: usize, start_col: usize) -> Option<usize> {
@@ -169,7 +161,7 @@ mod tests {
         let rows = vec![vec![1, 3, 70], vec![0, 3, 64, 70]];
         let mut packed = PackedBinaryRows::from_sparse(rows, 96);
 
-        assert!(packed.xor_suffix_if_contains(1, 0, 3));
+        packed.xor_suffix(1, 0, 3);
 
         assert!(packed.contains(1, 0));
         assert!(!packed.contains(1, 3));
