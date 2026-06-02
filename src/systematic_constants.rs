@@ -1,7 +1,7 @@
 type SystematicParameters = (u32, u32, u32, u32, u32);
 
 pub const MAX_SOURCE_SYMBOLS_PER_BLOCK: u32 = 56403;
-pub(crate) const MAX_SUPPORTED_INTERMEDIATE_SYMBOLS: u32 = 1024;
+pub(crate) const MAX_SUPPORTED_INTERMEDIATE_SYMBOLS: u32 = 2048;
 
 // Default OTI selection consumes this view. Keep it capped to source blocks the
 // generic solver can handle, while full RFC lookups still use the table below.
