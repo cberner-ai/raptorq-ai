@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 const TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const SYMBOL_COUNTS: [usize; 4] = [10, 100, 250, 500];
 const CI_TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-const CI_SYMBOL_COUNTS: [usize; 7] = [10, 50, 100, 250, 500, 750, 1000];
+const CI_SYMBOL_COUNTS: [usize; 7] = [10, 100, 250, 500, 1000, 2000, 5000];
 
 fn black_box(value: u64) {
     if value == rand::rng().random() {

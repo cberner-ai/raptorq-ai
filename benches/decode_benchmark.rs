@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 const TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const SYMBOL_COUNTS: [usize; 4] = [10, 100, 250, 500];
 const CI_TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-const CI_SYMBOL_COUNTS: [usize; 7] = [10, 50, 100, 250, 500, 750, 1000];
+const CI_SYMBOL_COUNTS: [usize; 7] = [10, 100, 250, 500, 1000, 2000, 5000];
+const CI_OVERHEAD_SYMBOL_COUNTS: [usize; 5] = [10, 100, 250, 500, 1000];
 
 fn black_box(value: u64) {
     if value == rand::rng().random() {
@@ -66,11 +67,19 @@ fn benchmark(
 
 fn main() {
     let symbol_size = 1280;
-    let (target_total_bytes, symbol_counts) = if ci_mode_enabled() {
+    let (target_total_bytes, symbol_counts, overhead_symbol_counts) = if ci_mode_enabled() {
         println!("Running CI benchmark subset");
-        (CI_TARGET_TOTAL_BYTES, CI_SYMBOL_COUNTS.as_slice())
+        (
+            CI_TARGET_TOTAL_BYTES,
+            CI_SYMBOL_COUNTS.as_slice(),
+            CI_OVERHEAD_SYMBOL_COUNTS.as_slice(),
+        )
     } else {
-        (TARGET_TOTAL_BYTES, SYMBOL_COUNTS.as_slice())
+        (
+            TARGET_TOTAL_BYTES,
+            SYMBOL_COUNTS.as_slice(),
+            SYMBOL_COUNTS.as_slice(),
+        )
     };
 
     println!("Symbol size: {symbol_size} bytes");
@@ -85,6 +94,6 @@ fn main() {
         symbol_size,
         0.05,
         target_total_bytes,
-        symbol_counts,
+        overhead_symbol_counts,
     ));
 }
