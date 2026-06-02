@@ -5,7 +5,7 @@ use std::boxed::Box;
 use alloc::boxed::Box;
 
 use crate::octet::Octet;
-use crate::octets::{add_assign, fused_addassign_mul_scalar, mulassign_scalar};
+use crate::octets::{add_assign, bytes_are_zero, fused_addassign_mul_scalar, mulassign_scalar};
 #[cfg(feature = "std")]
 use crate::pi_solver::apply_cached_systematic_plan;
 #[cfg(not(feature = "std"))]
@@ -99,7 +99,7 @@ fn fused_addassign_symbol_batch(symbols: &mut SymbolSlab, src: usize, dests: &[(
     assert!(src_start + symbol_size <= bytes.len());
     let src_ptr = unsafe { bytes.as_ptr().add(src_start) };
     let src_symbol = unsafe { core::slice::from_raw_parts(src_ptr, symbol_size) };
-    if symbol_is_zero(src_symbol) {
+    if bytes_are_zero(src_symbol) {
         return;
     }
     let bytes_ptr = bytes.as_mut_ptr();
@@ -121,10 +121,6 @@ fn fused_addassign_symbol_batch(symbols: &mut SymbolSlab, src: usize, dests: &[(
             }
         }
     }
-}
-
-fn symbol_is_zero(symbol: &[u8]) -> bool {
-    symbol.iter().all(|&byte| byte == 0)
 }
 
 #[cfg(test)]
