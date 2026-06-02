@@ -4,6 +4,7 @@ use std::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::gf2::PackedBinaryRows;
 use crate::octet::Octet;
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,9 @@ pub trait BinaryMatrix: Clone {
     fn set(&mut self, row: usize, col: usize, value: bool);
     fn reserve_row_entries(&mut self, _row: usize, _additional: usize) {}
     fn normalize_rows(&mut self) {}
+    fn packed_rows(&self) -> PackedBinaryRows {
+        PackedBinaryRows::from_matrix(self)
+    }
     fn toggle(&mut self, row: usize, col: usize) {
         let next = self.get(row, col) == Octet::zero();
         self.set(row, col, next);

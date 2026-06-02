@@ -4,8 +4,10 @@ use std::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::matrix::BinaryMatrix;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PackedBinaryRows {
+pub struct PackedBinaryRows {
     height: usize,
     width: usize,
     words_per_row: usize,
@@ -13,15 +15,19 @@ pub(crate) struct PackedBinaryRows {
 }
 
 impl PackedBinaryRows {
-    pub(crate) fn from_sparse(rows: Vec<Vec<usize>>, width: usize) -> PackedBinaryRows {
-        let height = rows.len();
+    pub(crate) fn new(height: usize, width: usize) -> PackedBinaryRows {
         let words_per_row = width.div_ceil(u64::BITS as usize);
-        let mut packed = PackedBinaryRows {
+        PackedBinaryRows {
             height,
             width,
             words_per_row,
             words: vec![0; height * words_per_row],
-        };
+        }
+    }
+
+    pub(crate) fn from_sparse(rows: Vec<Vec<usize>>, width: usize) -> PackedBinaryRows {
+        let height = rows.len();
+        let mut packed = PackedBinaryRows::new(height, width);
 
         for (row, entries) in rows.into_iter().enumerate() {
             for col in entries {
@@ -30,6 +36,24 @@ impl PackedBinaryRows {
         }
 
         packed
+    }
+
+    pub(crate) fn from_matrix<M: BinaryMatrix>(matrix: &M) -> PackedBinaryRows {
+        let mut packed = PackedBinaryRows::new(matrix.height(), matrix.width());
+
+        for row in 0..matrix.height() {
+            matrix.visit_row_entries(row, |col| packed.set(row, col));
+        }
+
+        packed
+    }
+
+    pub(crate) fn width(&self) -> usize {
+        self.width
+    }
+
+    pub(crate) fn height(&self) -> usize {
+        self.height
     }
 
     pub(crate) fn contains(&self, row: usize, col: usize) -> bool {
@@ -133,7 +157,7 @@ impl PackedBinaryRows {
             .all(|&word| word == 0)
     }
 
-    fn set(&mut self, row: usize, col: usize) {
+    pub(crate) fn set(&mut self, row: usize, col: usize) {
         let word = self.word_index(row, col);
         self.words[word] |= bit_mask(col);
     }
@@ -201,5 +225,26 @@ mod tests {
         assert_eq!(packed.weight_at_or_after(0, 2), 3);
         assert_eq!(packed.weight_at_or_after(0, 64), 2);
         assert_eq!(packed.weight_at_or_after(0, 96), 0);
+    }
+
+    #[test]
+    fn from_matrix_packs_visited_entries() {
+        use crate::matrix::{BinaryMatrix, DenseBinaryMatrix};
+
+        let mut matrix = DenseBinaryMatrix::new(2, 96);
+        matrix.set(0, 1, true);
+        matrix.set(0, 64, true);
+        matrix.set(1, 3, true);
+        matrix.set(1, 95, true);
+
+        let packed = PackedBinaryRows::from_matrix(&matrix);
+
+        assert_eq!(packed.width(), 96);
+        assert_eq!(packed.height(), 2);
+        assert!(packed.contains(0, 1));
+        assert!(packed.contains(0, 64));
+        assert!(packed.contains(1, 3));
+        assert!(packed.contains(1, 95));
+        assert!(!packed.contains(0, 95));
     }
 }
