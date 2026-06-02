@@ -450,7 +450,7 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     let mut hdpc_coefficients = (0..h)
         .map(|row| copy_octet_row(hdpc_rows, row))
         .collect::<Vec<_>>();
-    let mut pivot_coefficients = Vec::new();
+    let mut pivot_cols = Vec::new();
     let mut row_merge_scratch = Vec::new();
 
     for (col, pivot) in pivot_for_col.iter().copied().enumerate() {
@@ -458,9 +458,9 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
             continue;
         };
 
-        pivot_coefficients.clear();
+        pivot_cols.clear();
         rows.visit_ones_at_or_after(pivot, col, |entry_col| {
-            pivot_coefficients.push((entry_col, Octet::one()));
+            pivot_cols.push(entry_col);
         });
 
         for row in 0..h {
@@ -468,10 +468,9 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
             if factor.is_zero() {
                 continue;
             }
-            add_scaled_matrix_row(
+            add_scaled_binary_matrix_row(
                 &mut hdpc_coefficients[row],
-                &pivot_coefficients,
-                col,
+                &pivot_cols,
                 factor,
                 &mut row_merge_scratch,
             );
@@ -1139,6 +1138,50 @@ fn scale_matrix_row(row: &mut CoefficientRow, start_col: usize, scalar: Octet) {
     }
 }
 
+fn add_scaled_binary_matrix_row(
+    dest: &mut CoefficientRow,
+    src_cols: &[usize],
+    scalar: Octet,
+    scratch: &mut CoefficientRow,
+) {
+    let mut dest_index = 0usize;
+    let mut src_index = 0usize;
+    scratch.clear();
+    scratch.reserve(dest.len() + src_cols.len());
+
+    while dest_index < dest.len() || src_index < src_cols.len() {
+        match (dest.get(dest_index), src_cols.get(src_index)) {
+            (Some(&(dest_col, dest_value)), Some(&src_col)) => {
+                if dest_col < src_col {
+                    scratch.push((dest_col, dest_value));
+                    dest_index += 1;
+                } else if src_col < dest_col {
+                    scratch.push((src_col, scalar));
+                    src_index += 1;
+                } else {
+                    let value = dest_value + scalar;
+                    if !value.is_zero() {
+                        scratch.push((dest_col, value));
+                    }
+                    dest_index += 1;
+                    src_index += 1;
+                }
+            }
+            (Some(&(dest_col, dest_value)), None) => {
+                scratch.push((dest_col, dest_value));
+                dest_index += 1;
+            }
+            (None, Some(&src_col)) => {
+                scratch.push((src_col, scalar));
+                src_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    core::mem::swap(dest, scratch);
+}
+
 fn add_scaled_matrix_row(
     dest: &mut CoefficientRow,
     src: &CoefficientRow,
@@ -1379,6 +1422,34 @@ mod tests {
             SymbolSlab::from_bytes(vec![x0.value(), x1.value(), x2.value()], 1)
         );
         assert!(ops.is_none());
+    }
+
+    #[test]
+    fn scaled_binary_matrix_row_matches_unit_coefficient_merge() {
+        let src_cols = vec![0, 2, 5, 8];
+        let src_row = src_cols
+            .iter()
+            .map(|&col| (col, Octet::one()))
+            .collect::<Vec<_>>();
+
+        for scalar in [Octet::one(), Octet::new(7)] {
+            let dest = vec![
+                (0, scalar),
+                (1, Octet::new(3)),
+                (4, Octet::new(9)),
+                (5, Octet::new(2)),
+                (9, Octet::new(11)),
+            ];
+            let mut generic = dest.clone();
+            let mut binary = dest;
+            let mut generic_scratch = Vec::new();
+            let mut binary_scratch = Vec::new();
+
+            add_scaled_matrix_row(&mut generic, &src_row, 0, scalar, &mut generic_scratch);
+            add_scaled_binary_matrix_row(&mut binary, &src_cols, scalar, &mut binary_scratch);
+
+            assert_eq!(binary, generic);
+        }
     }
 
     fn bucketed_rebucket_system(
