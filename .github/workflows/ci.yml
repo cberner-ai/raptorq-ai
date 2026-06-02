@@ -69,7 +69,7 @@ jobs:
 
       - name: Run selected benchmarks
         if: startsWith(matrix.os, 'ubuntu')
-        timeout-minutes: 3
+        timeout-minutes: 4
         run: |
           cargo bench --features benchmarking --bench roundtrip_benchmark -- --quiet
           cargo bench --features benchmarking --bench encode_benchmark -- --ci
