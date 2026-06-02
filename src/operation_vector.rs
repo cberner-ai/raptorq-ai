@@ -98,6 +98,11 @@ fn fused_addassign_symbol_batch(symbols: &mut SymbolSlab, src: usize, dests: &[(
     let src_start = src * symbol_size;
     assert!(src_start + symbol_size <= bytes.len());
     let src_ptr = unsafe { bytes.as_ptr().add(src_start) };
+    let src_symbol = unsafe { core::slice::from_raw_parts(src_ptr, symbol_size) };
+    if symbol_is_zero(src_symbol) {
+        return;
+    }
+    let bytes_ptr = bytes.as_mut_ptr();
 
     for &(dest, scalar) in dests {
         if scalar.is_zero() {
@@ -107,9 +112,8 @@ fn fused_addassign_symbol_batch(symbols: &mut SymbolSlab, src: usize, dests: &[(
         let dest_start = dest * symbol_size;
         assert!(dest_start + symbol_size <= bytes.len());
         unsafe {
-            let src_symbol = core::slice::from_raw_parts(src_ptr, symbol_size);
             let dest_symbol =
-                core::slice::from_raw_parts_mut(bytes.as_mut_ptr().add(dest_start), symbol_size);
+                core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
             if scalar == Octet::one() {
                 add_assign(dest_symbol, src_symbol);
             } else {
@@ -117,6 +121,10 @@ fn fused_addassign_symbol_batch(symbols: &mut SymbolSlab, src: usize, dests: &[(
             }
         }
     }
+}
+
+fn symbol_is_zero(symbol: &[u8]) -> bool {
+    symbol.iter().all(|&byte| byte == 0)
 }
 
 #[cfg(test)]
@@ -171,5 +179,22 @@ mod tests {
         }
 
         assert_eq!(individual, batch);
+    }
+
+    #[test]
+    fn zero_source_batch_does_not_change_destinations() {
+        let mut symbols =
+            SymbolSlab::from_bytes(vec![0, 0, 0, 0, 13, 17, 19, 23, 29, 31, 37, 41], 4);
+        let expected = symbols.clone();
+
+        perform_op(
+            &SymbolOps::FusedAddBatch {
+                src: 0,
+                dests: vec![(1, Octet::one()), (2, Octet::new(7))].into_boxed_slice(),
+            },
+            &mut symbols,
+        );
+
+        assert_eq!(expected, symbols);
     }
 }
