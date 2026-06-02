@@ -42,6 +42,23 @@ pub fn fused_addassign_mul_scalar(dest: &mut [u8], src: &[u8], scalar: &Octet) {
     fused_addassign_table(dest, src, table);
 }
 
+pub(crate) fn bytes_are_zero(bytes: &[u8]) -> bool {
+    let prefix_len = bytes.len().min(16);
+    if !bytes_are_zero_scalar(&bytes[..prefix_len]) {
+        return false;
+    }
+
+    let rest = &bytes[prefix_len..];
+    if let Some(result) = try_bytes_are_zero_avx2(rest) {
+        return result;
+    }
+    bytes_are_zero_scalar(rest)
+}
+
+fn bytes_are_zero_scalar(bytes: &[u8]) -> bool {
+    bytes.iter().all(|&byte| byte == 0)
+}
+
 fn mulassign_table(dest: &mut [u8], table: &[u8; 256]) {
     let mut chunks = dest.chunks_exact_mut(8);
     for chunk in chunks.by_ref() {
@@ -132,14 +149,30 @@ fn try_fused_addassign_mul_scalar_avx2(_dest: &mut [u8], _src: &[u8], _scalar: &
     false
 }
 
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+fn try_bytes_are_zero_avx2(bytes: &[u8]) -> Option<bool> {
+    if bytes.len() < 64 || !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+
+    Some(unsafe { bytes_are_zero_avx2(bytes) })
+}
+
+#[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
+fn try_bytes_are_zero_avx2(_bytes: &[u8]) -> Option<bool> {
+    None
+}
+
 #[cfg(all(feature = "std", target_arch = "x86"))]
 use core::arch::x86::{
-    __m256i, _mm256_and_si256, _mm256_loadu_si256, _mm256_set1_epi8, _mm256_shuffle_epi8,
+    __m256i, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+    _mm256_or_si256, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8,
     _mm256_srli_epi16, _mm256_storeu_si256, _mm256_xor_si256,
 };
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 use core::arch::x86_64::{
-    __m256i, _mm256_and_si256, _mm256_loadu_si256, _mm256_set1_epi8, _mm256_shuffle_epi8,
+    __m256i, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+    _mm256_or_si256, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8,
     _mm256_srli_epi16, _mm256_storeu_si256, _mm256_xor_si256,
 };
 
@@ -214,6 +247,49 @@ unsafe fn add_assign_avx2(dest: &mut [u8], src: &[u8]) {
         offset += 32;
     }
     add_assign_scalar(&mut dest[offset..], &src[offset..]);
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn bytes_are_zero_avx2(bytes: &[u8]) -> bool {
+    let zero = _mm256_setzero_si256();
+    let mut combined = zero;
+    let mut offset = 0usize;
+
+    while offset + 128 <= bytes.len() {
+        unsafe {
+            combined = _mm256_or_si256(
+                combined,
+                _mm256_loadu_si256(bytes.as_ptr().add(offset).cast::<__m256i>()),
+            );
+            combined = _mm256_or_si256(
+                combined,
+                _mm256_loadu_si256(bytes.as_ptr().add(offset + 32).cast::<__m256i>()),
+            );
+            combined = _mm256_or_si256(
+                combined,
+                _mm256_loadu_si256(bytes.as_ptr().add(offset + 64).cast::<__m256i>()),
+            );
+            combined = _mm256_or_si256(
+                combined,
+                _mm256_loadu_si256(bytes.as_ptr().add(offset + 96).cast::<__m256i>()),
+            );
+        }
+        offset += 128;
+    }
+
+    while offset + 32 <= bytes.len() {
+        unsafe {
+            combined = _mm256_or_si256(
+                combined,
+                _mm256_loadu_si256(bytes.as_ptr().add(offset).cast::<__m256i>()),
+            );
+        }
+        offset += 32;
+    }
+
+    _mm256_movemask_epi8(_mm256_cmpeq_epi8(combined, zero)) == -1
+        && bytes_are_zero_scalar(&bytes[offset..])
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -394,6 +470,26 @@ mod tests {
                 assert_eq!(
                     avx2_direct, expected,
                     "direct AVX2 add_assign failed for length {len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bytes_are_zero_matches_scalar_for_boundary_lengths() {
+        for len in [0usize, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129] {
+            let zeros = vec![0u8; len];
+            assert!(bytes_are_zero(&zeros), "zero check failed for length {len}");
+
+            for index in [0usize, len.saturating_sub(1), len / 2] {
+                if index >= len {
+                    continue;
+                }
+                let mut bytes = zeros.clone();
+                bytes[index] = 1;
+                assert!(
+                    !bytes_are_zero(&bytes),
+                    "nonzero byte at {index} was missed for length {len}"
                 );
             }
         }
