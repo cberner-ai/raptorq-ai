@@ -49,6 +49,24 @@ fn repair_only_round_trip_for_small_systematic_sizes() {
 }
 
 #[test]
+fn exact_repair_only_round_trip_for_medium_systematic_sizes() {
+    for symbol_count in [100, 250, 500] {
+        let data = deterministic_data(symbol_count);
+        let config = ObjectTransmissionInformation::new(0, SYMBOL_SIZE, 0, 1, 1);
+        let encoder = SourceBlockEncoder::new(0, &config, &data);
+        let mut decoder = SourceBlockDecoder::new(0, &config, data.len() as u64);
+
+        let result = decoder.decode(encoder.repair_packets(0, symbol_count as u32));
+
+        assert_eq!(
+            result,
+            Some(data),
+            "exact repair-only failed for K={symbol_count}"
+        );
+    }
+}
+
+#[test]
 fn contradictory_redundant_repair_rows_do_not_decode() {
     let symbol_count = 10;
     let data = deterministic_data(symbol_count);
