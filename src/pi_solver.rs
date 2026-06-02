@@ -29,6 +29,7 @@ type CoefficientRow = Vec<(usize, Octet)>;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
+const OVERDETERMINED_HYBRID_MAX_WIDTH: usize = 384;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 
@@ -118,8 +119,10 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     assert_eq!(hdpc_rows.width(), width);
     assert!(matrix.height() >= s);
 
+    let overdetermined_hybrid_candidate =
+        total_rows > width && width <= OVERDETERMINED_HYBRID_MAX_WIDTH;
     if recording == OperationRecording::Skip
-        && total_rows == width
+        && (total_rows == width || overdetermined_hybrid_candidate)
         && width <= MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize
         && let Some(decoded) =
             try_hybrid_binary_hdpc_solve(&matrix, &hdpc_rows, &symbols, source_block_symbols)
@@ -366,8 +369,8 @@ fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bo
     true
 }
 
-// Exact repair systems have L rows. The non-HDPC rows are binary and leave only
-// a small free-column system for HDPC to resolve over GF(256).
+// Repair systems with at least L rows can often be reduced mostly over GF(2).
+// Any remaining free columns form a small GF(256) system for the HDPC rows.
 fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     matrix: &M,
     hdpc_rows: &DenseOctetMatrix,
@@ -379,6 +382,7 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     let width = matrix.width();
     let binary_height = matrix.height();
     let symbol_size = symbols.symbol_size();
+    let overdetermined = binary_height + h > width;
 
     let mut binary_symbols = SymbolSlab::with_zeros(binary_height, symbol_size);
     for row in 0..s {
@@ -438,6 +442,12 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
         return None;
     }
 
+    if overdetermined && free_cols.is_empty() {
+        let decoded =
+            binary_decoded_solution(&rows, &pivot_for_col, &binary_symbols, width, symbol_size);
+        return hdpc_rows_satisfied(&decoded, hdpc_rows).then_some(decoded);
+    }
+
     let mut hdpc_symbols = SymbolSlab::with_zeros(h, symbol_size);
     for row in 0..h {
         hdpc_symbols
@@ -495,6 +505,27 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     }
 
     Some(decoded)
+}
+
+fn binary_decoded_solution(
+    rows: &PackedBinaryRows,
+    pivot_for_col: &[Option<usize>],
+    binary_symbols: &SymbolSlab,
+    width: usize,
+    symbol_size: usize,
+) -> SymbolSlab {
+    let mut decoded = SymbolSlab::with_zeros(width, symbol_size);
+    for col in (0..width).rev() {
+        let pivot = pivot_for_col[col].expect("full-rank binary solve has every pivot");
+        decoded
+            .get_mut(col)
+            .copy_from_slice(binary_symbols.get(pivot));
+        rows.visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
+            let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
+            add_assign(dest_symbol, dependent_symbol);
+        });
+    }
+    decoded
 }
 
 fn dense_hdpc_coefficients(matrix: &DenseOctetMatrix) -> Vec<Octet> {
@@ -1562,6 +1593,78 @@ mod tests {
 
         assert_eq!(optimized, original);
         assert_eq!(optimized.unwrap(), expected);
+        assert!(ops.is_none());
+    }
+
+    struct OverdeterminedHybridSystem {
+        matrix: DenseBinaryMatrix,
+        hdpc_rows: DenseOctetMatrix,
+        symbols: SymbolSlab,
+        corrupt_symbol_row: usize,
+        source_block_symbols: u32,
+    }
+
+    fn overdetermined_full_rank_hybrid_system() -> OverdeterminedHybridSystem {
+        let source_block_symbols = 10;
+        let width = LIGHTEST_PIVOT_MIN_WIDTH;
+        let h = 1;
+        let binary_height = width + 1;
+        let symbol_size = 2;
+        let s = num_ldpc_symbols(source_block_symbols) as usize;
+        let corruptible_repair_row = s;
+        let mut matrix = DenseBinaryMatrix::new(binary_height, width);
+        for col in 0..width {
+            matrix.set(col, col, true);
+        }
+        matrix.set(width, 1, true);
+
+        let mut hdpc_rows = DenseOctetMatrix::new(h, width);
+        hdpc_rows.set(0, corruptible_repair_row, Octet::one());
+        let symbols = SymbolSlab::with_zeros(binary_height + h, symbol_size);
+
+        assert!(width <= OVERDETERMINED_HYBRID_MAX_WIDTH);
+        assert!(binary_height + h > width);
+
+        OverdeterminedHybridSystem {
+            matrix,
+            hdpc_rows,
+            symbols,
+            corrupt_symbol_row: corruptible_repair_row + h,
+            source_block_symbols,
+        }
+    }
+
+    #[test]
+    fn overdetermined_full_rank_hybrid_decode_uses_binary_solution() {
+        let system = overdetermined_full_rank_hybrid_system();
+
+        let (decoded, ops) = fused_inverse_mul_symbols(
+            system.matrix,
+            system.hdpc_rows,
+            system.symbols,
+            system.source_block_symbols,
+        );
+
+        assert_eq!(
+            decoded.unwrap(),
+            SymbolSlab::with_zeros(LIGHTEST_PIVOT_MIN_WIDTH, 2)
+        );
+        assert!(ops.is_none());
+    }
+
+    #[test]
+    fn overdetermined_full_rank_hybrid_decode_rejects_hdpc_failure() {
+        let mut system = overdetermined_full_rank_hybrid_system();
+        system.symbols.get_mut(system.corrupt_symbol_row)[0] = 0x5a;
+
+        let (decoded, ops) = fused_inverse_mul_symbols(
+            system.matrix,
+            system.hdpc_rows,
+            system.symbols,
+            system.source_block_symbols,
+        );
+
+        assert!(decoded.is_none());
         assert!(ops.is_none());
     }
 
