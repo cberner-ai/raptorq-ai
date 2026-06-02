@@ -9,8 +9,9 @@ use std::vec::Vec;
 use alloc::vec::Vec;
 
 use crate::base::intermediate_tuple;
+use crate::constraint_matrix::enc_indices;
 use crate::constraint_matrix::generate_constraint_matrix;
-use crate::constraint_matrix::{enc_indices, generate_hdpc_rows};
+use crate::constraint_matrix::generate_hdpc_rows;
 use crate::gf2::PackedBinaryRows;
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
@@ -325,12 +326,7 @@ pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
     source_block_symbols: u32,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     assert_eq!(symbols.len(), matrix.height());
-    let width = matrix.width();
-    let mut sparse_rows = Vec::with_capacity(matrix.height());
-    for row in 0..matrix.height() {
-        sparse_rows.push(matrix.row_entries(row));
-    }
-    let rows = PackedBinaryRows::from_sparse(sparse_rows, width);
+    let rows = matrix.packed_rows();
 
     let (decoded, ops) = solve_binary(rows, symbols);
     match decoded {
@@ -345,11 +341,7 @@ fn verify_no_hdpc_solution(decoded: SymbolSlab, source_block_symbols: u32) -> Op
     }
 
     let hdpc_rows = generate_hdpc_rows(source_block_symbols);
-    if hdpc_rows_satisfied(&decoded, &hdpc_rows) {
-        Some(decoded)
-    } else {
-        None
-    }
+    hdpc_rows_satisfied(&decoded, &hdpc_rows).then_some(decoded)
 }
 
 fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bool {
