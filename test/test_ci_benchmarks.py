@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import sys
 import tempfile
 import unittest
@@ -6,6 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BENCHES_DIR = REPO_ROOT / "benches"
+CI_SYMBOL_COUNTS = (10, 100, 250, 500, 1000, 2000, 5000, 10000, 20000)
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "ci_benchmarks.py"
 SPEC = importlib.util.spec_from_file_location("ci_benchmarks", SCRIPT_PATH)
 ci_benchmarks = importlib.util.module_from_spec(SPEC)
@@ -13,42 +17,109 @@ sys.modules[SPEC.name] = ci_benchmarks
 SPEC.loader.exec_module(ci_benchmarks)
 
 
+def format_encode_lines(mbits_per_second):
+    return "\n".join(
+        (
+            f"symbol count = {count}, encoded 1.95 MB in 0.008123456secs, "
+            f"throughput: {mbits_per_second:.3f}Mbit/s"
+        )
+        for count in CI_SYMBOL_COUNTS
+    )
+
+
+def format_decode_lines(overhead, mbits_per_second):
+    return "\n".join(
+        (
+            f"symbol count = {count}, decoded 1.95 MB in 0.010123456secs "
+            f"using {overhead:.1f}% overhead, throughput: {mbits_per_second:.3f}Mbit/s"
+        )
+        for count in CI_SYMBOL_COUNTS
+    )
+
+
+def parse_shared_ci_symbol_counts():
+    source = (BENCHES_DIR / "ci_symbol_counts" / "mod.rs").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(
+        r"pub const CI_SYMBOL_COUNTS:\s*\[usize;\s*\d+\]\s*=\s*\[(?P<counts>[^\]]+)\];",
+        source,
+    )
+    if not match:
+        raise AssertionError("CI_SYMBOL_COUNTS constant was not found")
+    return tuple(int(count.strip()) for count in match.group("counts").split(","))
+
+
 ENCODE_OUTPUT = """\
      Running benches/encode_benchmark.rs (target/release/deps/encode_benchmark)
 Running CI benchmark subset
 Symbol size: 1280 bytes (without pre-built plan)
-symbol count = 10, encoded 1 MB in 0.004123456secs, throughput: 3979.543Mbit/s
-symbol count = 100, encoded 1.95 MB in 0.008123456secs, throughput: 1953.123Mbit/s
+{without_plan}
 
 Symbol size: 1280 bytes (with pre-built plan)
-symbol count = 10, encoded 1.99 MB in 0.004123456secs, throughput: 3979.543Mbit/s
-"""
+{with_plan}
+""".format(
+    without_plan=format_encode_lines(3979.543),
+    with_plan=format_encode_lines(1953.123),
+)
 
 
 DECODE_OUTPUT = """\
      Running benches/decode_benchmark.rs (target/release/deps/decode_benchmark)
 Running CI benchmark subset
 Symbol size: 1280 bytes
-symbol count = 10, decoded 1 MB in 0.007123456secs using 0.0% overhead, throughput: 2274.321Mbit/s
-symbol count = 100, decoded 1.95 MB in 0.010123456secs using 5.0% overhead, throughput: 1562.543Mbit/s
-"""
+{without_overhead}
+
+{with_overhead}
+""".format(
+    without_overhead=format_decode_lines(0.0, 2274.321),
+    with_overhead=format_decode_lines(5.0, 1562.543),
+)
 
 
 class CiBenchmarkTests(unittest.TestCase):
+    def test_shared_ci_symbol_counts_match_required_sequence(self):
+        counts = parse_shared_ci_symbol_counts()
+
+        self.assertEqual(counts, CI_SYMBOL_COUNTS)
+        self.assertEqual(counts, tuple(sorted(counts)))
+        self.assertEqual(counts[:-1], (10, 100, 250, 500, 1000, 2000, 5000, 10000))
+        self.assertEqual(counts[-1], 20000)
+
+    def test_ci_benchmark_sources_use_shared_symbol_counts(self):
+        for bench_name in ("encode_benchmark.rs", "decode_benchmark.rs"):
+            source = (BENCHES_DIR / bench_name).read_text(encoding="utf-8")
+            self.assertIn("mod ci_symbol_counts;", source)
+            self.assertIn("use ci_symbol_counts::CI_SYMBOL_COUNTS;", source)
+            self.assertNotIn("const CI_SYMBOL_COUNTS", source)
+            self.assertNotIn("CI_OVERHEAD_SYMBOL_COUNTS", source)
+
     def test_parse_custom_throughput_accepts_integer_and_decimal_mb(self):
         metrics = ci_benchmarks.parse_custom_throughput(
             "\n".join([ENCODE_OUTPUT, DECODE_OUTPUT])
         )
 
-        self.assertEqual(
-            set(metrics),
-            {
-                "encode_benchmark/encoded/without pre-built plan/symbols=10",
-                "encode_benchmark/encoded/without pre-built plan/symbols=100",
-                "encode_benchmark/encoded/with pre-built plan/symbols=10",
-                "decode_benchmark/decoded/1280 bytes/symbols=10/overhead=0.0%",
-                "decode_benchmark/decoded/1280 bytes/symbols=100/overhead=5.0%",
-            },
+        expected_names = {
+            f"encode_benchmark/encoded/without pre-built plan/symbols={count}"
+            for count in CI_SYMBOL_COUNTS
+        }
+        expected_names.update(
+            f"encode_benchmark/encoded/with pre-built plan/symbols={count}"
+            for count in CI_SYMBOL_COUNTS
+        )
+        expected_names.update(
+            f"decode_benchmark/decoded/1280 bytes/symbols={count}/overhead={overhead}%"
+            for count in CI_SYMBOL_COUNTS
+            for overhead in ("0.0", "5.0")
+        )
+        self.assertEqual(set(metrics), expected_names)
+        self.assertIn(
+            "encode_benchmark/encoded/without pre-built plan/symbols=20000",
+            metrics,
+        )
+        self.assertIn(
+            "decode_benchmark/decoded/1280 bytes/symbols=20000/overhead=5.0%",
+            metrics,
         )
         self.assertEqual(
             metrics[
@@ -61,6 +132,46 @@ class CiBenchmarkTests(unittest.TestCase):
                 "decode_benchmark/decoded/1280 bytes/symbols=100/overhead=5.0%"
             ].mbits_per_second,
             1562.543,
+        )
+
+    def test_custom_throughput_groups_share_ci_symbol_counts(self):
+        metrics = ci_benchmarks.parse_custom_throughput(
+            "\n".join([ENCODE_OUTPUT, DECODE_OUTPUT])
+        )
+        counts_by_group = {}
+        for name in metrics:
+            group_name, symbol_count = ci_benchmarks.benchmark_group_and_symbol_count(
+                name
+            )
+            counts_by_group.setdefault(group_name, set()).add(symbol_count)
+
+        self.assertEqual(
+            counts_by_group,
+            {
+                "encode_benchmark/encoded/without pre-built plan": set(CI_SYMBOL_COUNTS),
+                "encode_benchmark/encoded/with pre-built plan": set(CI_SYMBOL_COUNTS),
+                "decode_benchmark/decoded/1280 bytes/overhead=0.0%": set(
+                    CI_SYMBOL_COUNTS
+                ),
+                "decode_benchmark/decoded/1280 bytes/overhead=5.0%": set(
+                    CI_SYMBOL_COUNTS
+                ),
+            },
+        )
+
+    def test_render_custom_table_includes_all_ci_symbol_rows(self):
+        metrics = ci_benchmarks.parse_custom_throughput(
+            "\n".join([ENCODE_OUTPUT, DECODE_OUTPUT])
+        )
+
+        table = ci_benchmarks.render_custom_table(metrics, metrics, "master", "PR")
+
+        rows = [row for row in table.splitlines() if row.startswith("| `")]
+        self.assertEqual(len(rows), 36)
+        self.assertNotIn("additional throughput rows omitted", table)
+        self.assertIn(
+            "decode_benchmark/decoded/1280 bytes/symbols=20000/overhead=5.0%",
+            table,
         )
 
     def test_format_mbits_preserves_custom_benchmark_precision(self):
@@ -142,7 +253,7 @@ class CiBenchmarkTests(unittest.TestCase):
         self.assertIn(ENCODE_OUTPUT, run.output)
         self.assertIn(DECODE_OUTPUT, run.output)
         self.assertEqual([call[0] for call in calls[1:]], ci_benchmarks.QUICK_BENCH_COMMANDS)
-        self.assertEqual(len(run.throughput), 5)
+        self.assertEqual(len(run.throughput), 36)
         for _, env in calls[1:]:
             self.assertEqual(env["CARGO_TARGET_DIR"], str(target_dir))
 

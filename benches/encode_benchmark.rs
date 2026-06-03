@@ -1,3 +1,6 @@
+mod ci_symbol_counts;
+
+use ci_symbol_counts::CI_SYMBOL_COUNTS;
 use rand::RngExt;
 use raptorq::{ObjectTransmissionInformation, SourceBlockEncoder, SourceBlockEncodingPlan};
 use std::time::{Duration, Instant};
@@ -5,7 +8,6 @@ use std::time::{Duration, Instant};
 const TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const SYMBOL_COUNTS: [usize; 4] = [10, 100, 250, 500];
 const CI_TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-const CI_SYMBOL_COUNTS: [usize; 8] = [10, 100, 250, 500, 1000, 2000, 5000, 10000];
 
 fn black_box(value: u64) {
     if value == rand::rng().random() {
