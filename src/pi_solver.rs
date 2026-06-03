@@ -30,6 +30,7 @@ type CoefficientRow = Vec<(usize, Octet)>;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
+const TRIANGULAR_RECORDING_MIN_WIDTH: usize = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
 const SQUARE_HYBRID_MAX_WIDTH: usize = 8192;
 const OVERDETERMINED_HYBRID_MAX_WIDTH: usize = 8192;
 #[cfg(feature = "std")]
@@ -635,6 +636,9 @@ fn solve(
     if recording == OperationRecording::Skip {
         return solve_without_recording(rows, width, symbols);
     }
+    if width >= TRIANGULAR_RECORDING_MIN_WIDTH {
+        return solve_recording_triangular(rows, width, symbols);
+    }
 
     let height = rows.len();
     let mut ops = recording.new_ops();
@@ -733,6 +737,108 @@ fn solve(
     }
 
     (Some(decoded), ops)
+}
+
+fn solve_recording_triangular(
+    mut rows: Vec<CoefficientRow>,
+    width: usize,
+    mut symbols: SymbolSlab,
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    let height = rows.len();
+    let mut ops = OperationRecording::Record.new_ops();
+    let symbols_are_zero = symbol_is_zero(symbols.as_bytes());
+    let mut row_merge_scratch = Vec::new();
+    let mut fused_add_batch = Vec::new();
+
+    for col in 0..width {
+        let Some((pivot, pivot_value)) =
+            select_pivot_row(&rows, col, height, width, col, OperationRecording::Record)
+        else {
+            return (None, None);
+        };
+
+        if pivot != col {
+            rows.swap(pivot, col);
+            if !symbols_are_zero {
+                symbols.swap_symbols(pivot, col);
+            }
+            if let Some(ops) = ops.as_mut() {
+                ops.push(SymbolOps::Swap(pivot, col));
+            }
+        }
+
+        if pivot_value != Octet::one() {
+            let scalar = pivot_value.inverse();
+            scale_matrix_row(&mut rows[col], col, scalar);
+            if !symbols_are_zero {
+                mulassign_scalar(symbols.get_mut(col), &scalar);
+            }
+            if let Some(ops) = ops.as_mut() {
+                ops.push(SymbolOps::Scale(col, scalar));
+            }
+        }
+
+        let (pivot_and_before_after, rows_after) = rows.split_at_mut(col + 1);
+        let pivot_coefficients = &pivot_and_before_after[col];
+        fused_add_batch.clear();
+
+        for (offset, row_coefficients) in rows_after.iter_mut().enumerate() {
+            let row = col + 1 + offset;
+            let factor = coefficient_at(row_coefficients, col);
+            if factor.is_zero() {
+                continue;
+            }
+            add_scaled_matrix_row(
+                row_coefficients,
+                pivot_coefficients,
+                col,
+                factor,
+                &mut row_merge_scratch,
+            );
+            if !symbols_are_zero {
+                let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(col, row);
+                fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
+            }
+            fused_add_batch.push((row, factor));
+        }
+        push_recorded_fused_add_ops(&mut ops, col, &mut fused_add_batch);
+    }
+
+    let mut back_substitution_batches = vec![Vec::new(); width];
+    for dest in 0..width {
+        for &(dependent_col, coefficient) in rows[dest].iter().rev() {
+            if dependent_col <= dest {
+                break;
+            }
+            back_substitution_batches[dependent_col].push((dest, coefficient));
+        }
+    }
+
+    for src in (0..width).rev() {
+        let batch = &mut back_substitution_batches[src];
+        if !symbols_are_zero {
+            apply_fused_add_batch_to_symbols(&mut symbols, src, batch);
+        }
+        push_recorded_fused_add_ops(&mut ops, src, batch);
+    }
+
+    let mut decoded = SymbolSlab::with_zeros(width, symbols.symbol_size());
+    for row in 0..width {
+        decoded.get_mut(row).copy_from_slice(symbols.get(row));
+    }
+
+    (Some(decoded), ops)
+}
+
+fn apply_fused_add_batch_to_symbols(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    batch: &[(usize, Octet)],
+) {
+    for &(dest, factor) in batch {
+        let (src_symbol, dest_symbol) = symbols.get_disjoint_mut(src, dest);
+        fused_addassign_mul_scalar(dest_symbol, src_symbol, &factor);
+    }
 }
 
 fn push_recorded_fused_add_ops(
@@ -1427,6 +1533,44 @@ mod recording_tests {
 
         assert!(decoded.is_some());
         assert!(ops.is_some());
+    }
+
+    #[test]
+    fn triangular_recording_solves_and_replays_wide_system() {
+        let width = TRIANGULAR_RECORDING_MIN_WIDTH;
+        let mut rows: Vec<CoefficientRow> =
+            (0..width).map(|col| vec![(col, Octet::one())]).collect();
+        rows[0] = vec![(0, Octet::one()), (1, Octet::new(3)), (7, Octet::new(11))];
+        rows[1] = vec![(0, Octet::one()), (1, Octet::new(2)), (2, Octet::new(5))];
+
+        let expected = (0..width)
+            .map(|index| Octet::new((index as u8).wrapping_mul(37).wrapping_add(11)))
+            .collect::<Vec<_>>();
+        let rhs = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .fold(Octet::zero(), |acc, &(col, value)| {
+                        acc + value * expected[col]
+                    })
+                    .value()
+            })
+            .collect::<Vec<_>>();
+        let symbols = SymbolSlab::from_bytes(rhs, 1);
+
+        let (decoded, ops) = solve_recording_triangular(rows, width, symbols.clone());
+
+        let expected_bytes = expected
+            .iter()
+            .map(|value| value.value())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded.unwrap().as_bytes(), expected_bytes.as_slice());
+
+        let mut replayed = symbols;
+        for op in ops.unwrap() {
+            crate::operation_vector::perform_op(&op, &mut replayed);
+        }
+        assert_eq!(replayed.as_bytes(), expected_bytes.as_slice());
     }
 }
 
