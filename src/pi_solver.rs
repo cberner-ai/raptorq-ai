@@ -18,6 +18,8 @@ use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
 use crate::octets::{add_assign, fused_addassign_mul_scalar, mulassign_scalar};
 use crate::operation_vector::SymbolOps;
+#[cfg(feature = "std")]
+use crate::operation_vector::fused_addassign_symbol_batch;
 use crate::sparse_matrix::SparseBinaryMatrix;
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::num_ldpc_symbols;
@@ -151,9 +153,18 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
 
 #[cfg(feature = "std")]
 struct CachedSystematicPlan {
-    // Large systematic plans keep matrix state out of replay without storing huge row-op vectors.
-    rows: Vec<CoefficientRow>,
+    // Large systematic plans replay only symbol operations; coefficient elimination is cached.
+    forward_steps: Vec<CachedSystematicForwardStep>,
+    pivot_for_col: Vec<usize>,
+    back_substitution_rows: Vec<Box<[(usize, Octet)]>>,
     width: usize,
+}
+
+#[cfg(feature = "std")]
+struct CachedSystematicForwardStep {
+    pivot: usize,
+    scale: Option<Octet>,
+    dests: Box<[(usize, Octet)]>,
 }
 
 #[cfg(feature = "std")]
@@ -224,22 +235,127 @@ fn generate_systematic_plan(source_block_symbols: u32) -> CachedSystematicPlan {
         generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
     let width = matrix.width();
     let rows = coefficient_rows(&matrix, &hdpc_rows, source_block_symbols);
-    CachedSystematicPlan { rows, width }
+    prepare_cached_systematic_plan(rows, width)
 }
 
 #[cfg(feature = "std")]
 pub(crate) fn apply_cached_systematic_plan(source_block_symbols: u32, symbols: &mut SymbolSlab) {
     let plan = cached_systematic_plan(source_block_symbols);
-    let (decoded, _) = solve(
-        plan.rows.clone(),
-        plan.width,
-        symbols.clone(),
-        OperationRecording::Skip,
-    );
-    let decoded = decoded.expect("cached systematic solve failed");
-    for row in 0..decoded.len() {
-        symbols.get_mut(row).copy_from_slice(decoded.get(row));
+    apply_prepared_systematic_plan(&plan, symbols);
+}
+
+#[cfg(feature = "std")]
+fn prepare_cached_systematic_plan(
+    mut rows: Vec<CoefficientRow>,
+    width: usize,
+) -> CachedSystematicPlan {
+    let height = rows.len();
+    assert_eq!(height, width);
+
+    let mut row_merge_scratch = Vec::new();
+    let mut bucket_heads = vec![None; width];
+    let mut next_in_bucket = vec![None; height];
+    for (row, coefficients) in rows.iter().enumerate() {
+        if let Some(&(col, _)) = coefficients.first() {
+            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+        }
     }
+
+    let mut forward_steps = Vec::with_capacity(width);
+    let mut pivot_for_col = vec![usize::MAX; width];
+    let mut is_pivot_row = vec![false; height];
+
+    for (col, pivot_slot) in pivot_for_col.iter_mut().enumerate() {
+        let (pivot, pivot_value) =
+            pop_lightest_coefficient_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
+                .expect("systematic plan matrix must be full rank");
+        *pivot_slot = pivot;
+        is_pivot_row[pivot] = true;
+
+        let scale = if pivot_value != Octet::one() {
+            let scalar = pivot_value.inverse();
+            scale_matrix_row(&mut rows[pivot], col, scalar);
+            Some(scalar)
+        } else {
+            None
+        };
+
+        let pivot_coefficients = rows[pivot].clone();
+        let mut dests = Vec::new();
+        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+            debug_assert_ne!(row, pivot);
+            let factor = rows[row][0].1;
+            add_scaled_matrix_row(
+                &mut rows[row],
+                &pivot_coefficients,
+                col,
+                factor,
+                &mut row_merge_scratch,
+            );
+            dests.push((row, factor));
+
+            if let Some(&(next_col, _)) = rows[row].first() {
+                debug_assert!(next_col > col);
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+            }
+        }
+
+        forward_steps.push(CachedSystematicForwardStep {
+            pivot,
+            scale,
+            dests: dests.into_boxed_slice(),
+        });
+    }
+
+    for (row, is_pivot) in is_pivot_row.into_iter().enumerate() {
+        assert!(
+            is_pivot || rows[row].is_empty(),
+            "systematic plan matrix has a non-pivot residual row"
+        );
+    }
+
+    let mut back_substitution_rows = Vec::with_capacity(width);
+    for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        let mut dependencies = Vec::new();
+        for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
+            if dependent_col <= col {
+                break;
+            }
+            dependencies.push((dependent_col, coefficient));
+        }
+        back_substitution_rows.push(dependencies.into_boxed_slice());
+    }
+
+    CachedSystematicPlan {
+        forward_steps,
+        pivot_for_col,
+        back_substitution_rows,
+        width,
+    }
+}
+
+#[cfg(feature = "std")]
+fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut SymbolSlab) {
+    assert_eq!(symbols.len(), plan.width);
+
+    for step in &plan.forward_steps {
+        if let Some(scale) = step.scale {
+            mulassign_scalar(symbols.get_mut(step.pivot), &scale);
+        }
+        fused_addassign_symbol_batch(symbols, step.pivot, &step.dests);
+    }
+
+    let mut decoded = SymbolSlab::with_zeros(plan.width, symbols.symbol_size());
+    for col in (0..plan.width).rev() {
+        let pivot = plan.pivot_for_col[col];
+        decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
+        for &(dependent_col, coefficient) in &plan.back_substitution_rows[col] {
+            let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
+            fused_addassign_mul_scalar(dest_symbol, dependent_symbol, &coefficient);
+        }
+    }
+
+    symbols.as_mut_bytes().copy_from_slice(decoded.as_bytes());
 }
 
 #[cfg(not(feature = "std"))]
@@ -1626,6 +1742,28 @@ mod tests {
     }
 
     #[test]
+    fn prepared_systematic_plan_matches_non_recording_solve() {
+        let rows = vec![
+            vec![(0, Octet::new(2)), (1, Octet::new(5)), (3, Octet::new(7))],
+            vec![(0, Octet::new(6)), (1, Octet::new(3)), (2, Octet::new(11))],
+            vec![(1, Octet::new(9)), (2, Octet::new(5)), (3, Octet::new(13))],
+            vec![(2, Octet::new(10)), (3, Octet::new(17))],
+        ];
+        let symbols = SymbolSlab::from_bytes(
+            vec![1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 7, 11, 19, 31],
+            4,
+        );
+
+        let (expected, ops) = solve(rows.clone(), 4, symbols.clone(), OperationRecording::Skip);
+        let plan = prepare_cached_systematic_plan(rows, 4);
+        let mut replayed = symbols;
+        apply_prepared_systematic_plan(&plan, &mut replayed);
+
+        assert_eq!(replayed, expected.unwrap());
+        assert!(ops.is_none());
+    }
+
+    #[test]
     fn scaled_binary_matrix_row_matches_unit_coefficient_merge() {
         let src_cols = vec![0, 2, 5, 8];
         let src_row = src_cols
@@ -1971,7 +2109,9 @@ mod tests {
 
         for source_block_symbols in 0..=SYSTEMATIC_PLAN_CACHE_CAPACITY as u32 {
             let plan = std::sync::Arc::new(CachedSystematicPlan {
-                rows: Vec::new(),
+                forward_steps: Vec::new(),
+                pivot_for_col: Vec::new(),
+                back_substitution_rows: Vec::new(),
                 width: 0,
             });
             insert_systematic_plan(&mut cache, source_block_symbols, plan);
