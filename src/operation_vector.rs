@@ -88,7 +88,11 @@ fn fused_addassign_symbol(symbols: &mut SymbolSlab, dest: usize, src: usize, sca
     }
 }
 
-fn fused_addassign_symbol_batch(symbols: &mut SymbolSlab, src: usize, dests: &[(usize, Octet)]) {
+pub(crate) fn fused_addassign_symbol_batch(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    dests: &[(usize, Octet)],
+) {
     if dests.is_empty() {
         return;
     }
