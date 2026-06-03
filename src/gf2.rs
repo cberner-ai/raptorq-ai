@@ -76,7 +76,6 @@ impl PackedBinaryRows {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn first_one_at_or_after(&self, row: usize, start_col: usize) -> Option<usize> {
         assert!(row < self.height);
         if start_col >= self.width {
@@ -102,44 +101,6 @@ impl PackedBinaryRows {
         }
     }
 
-    pub(crate) fn first_one_and_weight_at_or_after(
-        &self,
-        row: usize,
-        start_col: usize,
-    ) -> Option<(usize, u32)> {
-        assert!(row < self.height);
-        if start_col >= self.width {
-            return None;
-        }
-
-        let row_start = self.row_start(row);
-        let mut offset = start_col / u64::BITS as usize;
-        let bit_offset = start_col % u64::BITS as usize;
-        let mut word = self.words[row_start + offset] & (u64::MAX << bit_offset);
-        let mut first_one = None;
-        let mut weight = 0;
-
-        loop {
-            if word != 0 {
-                if first_one.is_none() {
-                    let col = offset * u64::BITS as usize + word.trailing_zeros() as usize;
-                    if col >= self.width {
-                        return None;
-                    }
-                    first_one = Some(col);
-                }
-                weight += word.count_ones();
-            }
-
-            offset += 1;
-            if offset >= self.words_per_row {
-                return first_one.map(|col| (col, weight));
-            }
-            word = self.words[row_start + offset];
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn weight_at_or_after(&self, row: usize, start_col: usize) -> u32 {
         assert!(row < self.height);
         if start_col >= self.width {
@@ -265,20 +226,6 @@ mod tests {
         assert_eq!(packed.weight_at_or_after(0, 2), 3);
         assert_eq!(packed.weight_at_or_after(0, 64), 2);
         assert_eq!(packed.weight_at_or_after(0, 96), 0);
-    }
-
-    #[test]
-    fn first_one_and_weight_scans_suffix_once() {
-        let rows = vec![vec![1, 63, 64, 95]];
-        let packed = PackedBinaryRows::from_sparse(rows, 96);
-
-        assert_eq!(packed.first_one_and_weight_at_or_after(0, 0), Some((1, 4)));
-        assert_eq!(packed.first_one_and_weight_at_or_after(0, 2), Some((63, 3)));
-        assert_eq!(
-            packed.first_one_and_weight_at_or_after(0, 64),
-            Some((64, 2))
-        );
-        assert_eq!(packed.first_one_and_weight_at_or_after(0, 96), None);
     }
 
     #[test]
