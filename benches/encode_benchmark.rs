@@ -5,8 +5,8 @@ use rand::RngExt;
 use raptorq::{ObjectTransmissionInformation, SourceBlockEncoder, SourceBlockEncodingPlan};
 use std::time::{Duration, Instant};
 
-const TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-const SYMBOL_COUNTS: [usize; 4] = [10, 100, 250, 500];
+const TARGET_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+const SYMBOL_COUNTS: [usize; 10] = [10, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000];
 const CI_TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
 fn black_box(value: u64) {
