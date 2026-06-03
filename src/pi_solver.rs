@@ -30,7 +30,8 @@ type CoefficientRow = Vec<(usize, Octet)>;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
-const OVERDETERMINED_HYBRID_MAX_WIDTH: usize = 384;
+const SQUARE_HYBRID_MAX_WIDTH: usize = 8192;
+const OVERDETERMINED_HYBRID_MAX_WIDTH: usize = 8192;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 
@@ -120,11 +121,11 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     assert_eq!(hdpc_rows.width(), width);
     assert!(matrix.height() >= s);
 
+    let square_hybrid_candidate = total_rows == width && width <= SQUARE_HYBRID_MAX_WIDTH;
     let overdetermined_hybrid_candidate =
         total_rows > width && width <= OVERDETERMINED_HYBRID_MAX_WIDTH;
     if recording == OperationRecording::Skip
-        && (total_rows == width || overdetermined_hybrid_candidate)
-        && width <= MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize
+        && (square_hybrid_candidate || overdetermined_hybrid_candidate)
         && let Some(decoded) =
             try_hybrid_binary_hdpc_solve(&matrix, &hdpc_rows, &symbols, source_block_symbols)
     {
@@ -1679,6 +1680,106 @@ mod tests {
             system.symbols,
             system.source_block_symbols,
         );
+
+        assert!(decoded.is_none());
+        assert!(ops.is_none());
+    }
+
+    // Row iteration is intentionally empty so these tests prove hybrid dispatch.
+    #[derive(Clone)]
+    struct PackedOnlyMatrix {
+        rows: PackedBinaryRows,
+    }
+
+    impl PackedOnlyMatrix {
+        fn new(rows: PackedBinaryRows) -> PackedOnlyMatrix {
+            PackedOnlyMatrix { rows }
+        }
+    }
+
+    impl BinaryMatrix for PackedOnlyMatrix {
+        fn new(_height: usize, _width: usize) -> PackedOnlyMatrix {
+            unimplemented!("test fixture builds packed rows directly")
+        }
+
+        fn height(&self) -> usize {
+            self.rows.height()
+        }
+
+        fn width(&self) -> usize {
+            self.rows.width()
+        }
+
+        fn get(&self, row: usize, col: usize) -> Octet {
+            if self.rows.contains(row, col) {
+                Octet::one()
+            } else {
+                Octet::zero()
+            }
+        }
+
+        fn set(&mut self, _row: usize, _col: usize, _value: bool) {
+            unimplemented!("test fixture builds packed rows directly")
+        }
+
+        fn packed_rows(&self) -> PackedBinaryRows {
+            self.rows.clone()
+        }
+
+        fn visit_row_entries<F>(&self, row: usize, _visit: F)
+        where
+            F: FnMut(usize),
+        {
+            assert!(row < self.height());
+        }
+    }
+
+    fn packed_identity_with_duplicate_row(width: usize) -> PackedBinaryRows {
+        let mut rows = PackedBinaryRows::new(width + 1, width);
+        for col in 0..width {
+            rows.set(col, col);
+        }
+        rows.set(width, 0);
+        rows
+    }
+
+    fn packed_identity_with_free_last_column(width: usize) -> PackedBinaryRows {
+        let mut rows = PackedBinaryRows::new(width - 1, width);
+        for col in 0..(width - 1) {
+            rows.set(col, col);
+        }
+        rows
+    }
+
+    #[test]
+    fn overdetermined_hybrid_decode_handles_width_above_generic_cap() {
+        let width = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
+        let source_block_symbols = 10;
+        let symbol_size = 1;
+        let matrix = PackedOnlyMatrix::new(packed_identity_with_duplicate_row(width));
+
+        let hdpc_rows = DenseOctetMatrix::new(1, width);
+        let symbols = SymbolSlab::with_zeros(matrix.height() + hdpc_rows.height(), symbol_size);
+
+        let (decoded, ops) =
+            fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_block_symbols);
+
+        assert_eq!(decoded.unwrap(), SymbolSlab::with_zeros(width, symbol_size));
+        assert!(ops.is_none());
+    }
+
+    #[test]
+    fn square_hybrid_decode_stays_capped_above_square_limit() {
+        let width = SQUARE_HYBRID_MAX_WIDTH + 1;
+        let source_block_symbols = 10;
+        let symbol_size = 1;
+        let matrix = PackedOnlyMatrix::new(packed_identity_with_free_last_column(width));
+        let mut hdpc_rows = DenseOctetMatrix::new(1, width);
+        hdpc_rows.set(0, width - 1, Octet::one());
+        let symbols = SymbolSlab::with_zeros(matrix.height() + hdpc_rows.height(), symbol_size);
+
+        let (decoded, ops) =
+            fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_block_symbols);
 
         assert!(decoded.is_none());
         assert!(ops.is_none());
