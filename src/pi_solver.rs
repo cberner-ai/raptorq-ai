@@ -35,6 +35,10 @@ const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
 const TRIANGULAR_RECORDING_MIN_WIDTH: usize = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
 const SQUARE_HYBRID_MAX_WIDTH: usize = 16_384;
 const OVERDETERMINED_HYBRID_MAX_WIDTH: usize = 16_384;
+#[cfg(not(test))]
+const SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 4096;
+#[cfg(test)]
+const SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 1;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 
@@ -123,6 +127,14 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     assert_eq!(symbols.len(), total_rows);
     assert_eq!(hdpc_rows.width(), width);
     assert!(matrix.height() >= s);
+
+    #[cfg(feature = "std")]
+    if recording == OperationRecording::Skip
+        && let Some(decoded) =
+            try_single_repair_systematic_decode(&matrix, &hdpc_rows, &symbols, source_block_symbols)
+    {
+        return (Some(decoded), None);
+    }
 
     let square_hybrid_candidate = total_rows == width && width <= SQUARE_HYBRID_MAX_WIDTH;
     let overdetermined_hybrid_candidate =
@@ -774,23 +786,169 @@ fn is_full_systematic_planning_matrix<M: BinaryMatrix>(
         return false;
     }
 
-    let lt_symbols = num_lt_symbols(source_block_symbols);
-    let pi_symbols = num_pi_symbols(source_block_symbols);
-    let sys_index = systematic_index(source_block_symbols);
-    let p1 = calculate_p1(source_block_symbols);
     for isi in 0..k_prime {
-        let tuple = intermediate_tuple(isi, lt_symbols, sys_index, p1);
-        let mut expected = Vec::new();
-        enc_indices(tuple, lt_symbols, pi_symbols, p1, |col| {
-            expected.push(col);
-        });
-        expected.sort_unstable();
+        let expected = systematic_constraint_row_entries(source_block_symbols, isi);
         if matrix.row_entries((s + isi) as usize) != expected {
             return false;
         }
     }
 
     true
+}
+
+fn systematic_constraint_row_entries(source_block_symbols: u32, isi: u32) -> Vec<usize> {
+    let lt_symbols = num_lt_symbols(source_block_symbols);
+    let pi_symbols = num_pi_symbols(source_block_symbols);
+    let sys_index = systematic_index(source_block_symbols);
+    let p1 = calculate_p1(source_block_symbols);
+    let tuple = intermediate_tuple(isi, lt_symbols, sys_index, p1);
+    let mut entries = Vec::new();
+    enc_indices(tuple, lt_symbols, pi_symbols, p1, |col| {
+        entries.push(col);
+    });
+    entries.sort_unstable();
+    entries
+}
+
+fn matrix_row_matches_systematic<M: BinaryMatrix>(
+    matrix: &M,
+    row: usize,
+    source_block_symbols: u32,
+    isi: usize,
+) -> bool {
+    matrix.row_entries(row) == systematic_constraint_row_entries(source_block_symbols, isi as u32)
+}
+
+#[cfg(feature = "std")]
+struct SingleRepairSystematicRows {
+    missing_isi: usize,
+    repair_matrix_row: usize,
+    systematic_rows: Vec<(usize, usize)>,
+}
+
+#[cfg(feature = "std")]
+fn try_single_repair_systematic_decode<M: BinaryMatrix>(
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    symbols: &SymbolSlab,
+    source_block_symbols: u32,
+) -> Option<SymbolSlab> {
+    let k_prime = extended_source_block_symbols(source_block_symbols) as usize;
+    let s = num_ldpc_symbols(source_block_symbols) as usize;
+    let h = hdpc_rows.height();
+    let width = matrix.width();
+    if width < SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH
+        || width != s + h + k_prime
+        || matrix.height() != s + k_prime
+        || symbols.len() != width
+    {
+        return None;
+    }
+
+    let rows = classify_single_repair_systematic_rows(matrix, source_block_symbols, s, k_prime)?;
+    if rows.missing_isi >= source_block_symbols as usize {
+        return None;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let mut systematic_symbols = SymbolSlab::with_zeros(width, symbol_size);
+    for (isi, matrix_row) in rows.systematic_rows {
+        systematic_symbols
+            .get_mut(s + h + isi)
+            .copy_from_slice(symbols.get(matrix_row + h));
+    }
+
+    let plan = cached_systematic_plan(k_prime as u32);
+    apply_prepared_systematic_plan(&plan, &mut systematic_symbols);
+
+    let mut missing_basis = SymbolSlab::with_zeros(width, 1);
+    missing_basis.get_mut(s + h + rows.missing_isi)[0] = 1;
+    apply_prepared_systematic_plan(&plan, &mut missing_basis);
+
+    let repair_entries = matrix.row_entries(rows.repair_matrix_row);
+    if repair_entries.is_empty() {
+        return None;
+    }
+
+    let mut predicted_repair = vec![0u8; symbol_size];
+    let mut repair_coefficient = Octet::zero();
+    for col in repair_entries {
+        add_assign(&mut predicted_repair, systematic_symbols.get(col));
+        repair_coefficient += Octet::new(missing_basis.get(col)[0]);
+    }
+    if repair_coefficient.is_zero() {
+        return None;
+    }
+
+    let mut missing_symbol = symbols.get(rows.repair_matrix_row + h).to_vec();
+    add_assign(&mut missing_symbol, &predicted_repair);
+    mulassign_scalar(&mut missing_symbol, &repair_coefficient.inverse());
+
+    for col in 0..width {
+        let coefficient = Octet::new(missing_basis.get(col)[0]);
+        if !coefficient.is_zero() {
+            fused_addassign_mul_scalar(
+                systematic_symbols.get_mut(col),
+                &missing_symbol,
+                &coefficient,
+            );
+        }
+    }
+
+    Some(systematic_symbols)
+}
+
+#[cfg(feature = "std")]
+fn classify_single_repair_systematic_rows<M: BinaryMatrix>(
+    matrix: &M,
+    source_block_symbols: u32,
+    s: usize,
+    k_prime: usize,
+) -> Option<SingleRepairSystematicRows> {
+    let mut systematic_rows = Vec::with_capacity(k_prime.saturating_sub(1));
+    let mut expected_isi = 0usize;
+    let mut missing_isi = None;
+    let mut repair_matrix_row = None;
+
+    for offset in 0..k_prime {
+        let row = s + offset;
+        if expected_isi < k_prime
+            && matrix_row_matches_systematic(matrix, row, source_block_symbols, expected_isi)
+        {
+            systematic_rows.push((expected_isi, row));
+            expected_isi += 1;
+            continue;
+        }
+
+        if missing_isi.is_none()
+            && expected_isi + 1 < k_prime
+            && matrix_row_matches_systematic(matrix, row, source_block_symbols, expected_isi + 1)
+        {
+            missing_isi = Some(expected_isi);
+            systematic_rows.push((expected_isi + 1, row));
+            expected_isi += 2;
+            continue;
+        }
+
+        if repair_matrix_row.is_some() {
+            return None;
+        }
+        if missing_isi.is_none() {
+            missing_isi = Some(expected_isi);
+            expected_isi += 1;
+        }
+        repair_matrix_row = Some(row);
+    }
+
+    let missing_isi = missing_isi?;
+    let repair_matrix_row = repair_matrix_row?;
+    (expected_isi == k_prime && systematic_rows.len() + 1 == k_prime).then_some(
+        SingleRepairSystematicRows {
+            missing_isi,
+            repair_matrix_row,
+            systematic_rows,
+        },
+    )
 }
 
 fn solve(
@@ -2212,6 +2370,67 @@ mod tests {
             &decode_matrix,
             source_symbols
         ));
+    }
+
+    #[test]
+    fn single_repair_systematic_decode_recovers_missing_source() {
+        let source_symbols = 10;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        let s = num_ldpc_symbols(source_symbols) as usize;
+        let h = width - s - k_prime as usize;
+        let symbol_size = 3;
+        let missing_isi = 3;
+        let repair_isi = k_prime;
+
+        let mut full_d = SymbolSlab::with_zeros(width, symbol_size);
+        for isi in 0..source_symbols as usize {
+            full_d.get_mut(s + h + isi).copy_from_slice(&[
+                isi as u8 + 1,
+                (isi as u8).wrapping_mul(7).wrapping_add(3),
+                (isi as u8) ^ 0xa5,
+            ]);
+        }
+        let mut expected_intermediate = full_d.clone();
+        apply_cached_systematic_plan(source_symbols, &mut expected_intermediate);
+
+        let encoded_isis = (0..k_prime)
+            .filter(|&isi| isi != missing_isi)
+            .chain(core::iter::once(repair_isi))
+            .collect::<Vec<_>>();
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &encoded_isis);
+        let h = hdpc_rows.height();
+        let mut decode_symbols = SymbolSlab::with_zeros(matrix.height() + h, symbol_size);
+        for (offset, &isi) in encoded_isis.iter().enumerate() {
+            let matrix_row = s + offset;
+            let symbol_row = matrix_row + h;
+            if isi < k_prime {
+                decode_symbols
+                    .get_mut(symbol_row)
+                    .copy_from_slice(full_d.get(s + h + isi as usize));
+                continue;
+            }
+
+            let mut repair = vec![0u8; symbol_size];
+            for col in matrix.row_entries(matrix_row) {
+                add_assign(&mut repair, expected_intermediate.get(col));
+            }
+            decode_symbols.get_mut(symbol_row).copy_from_slice(&repair);
+        }
+
+        let fast_decoded = try_single_repair_systematic_decode(
+            &matrix,
+            &hdpc_rows,
+            &decode_symbols,
+            source_symbols,
+        );
+        assert_eq!(fast_decoded.as_ref(), Some(&expected_intermediate));
+
+        let (decoded, ops) =
+            fused_inverse_mul_symbols(matrix, hdpc_rows, decode_symbols, source_symbols);
+        assert_eq!(decoded, Some(expected_intermediate));
+        assert!(ops.is_none());
     }
 
     #[test]
