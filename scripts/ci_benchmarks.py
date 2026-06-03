@@ -330,13 +330,65 @@ def escape_cell(value: str) -> str:
     return value.replace("|", "\\|")
 
 
+def benchmark_group_and_symbol_count(name: str) -> tuple[str, Optional[int]]:
+    symbol_match = re.search(r"(?:^|/)symbols=(\d+)(?=/|$)", name)
+    if symbol_match:
+        group_name = f"{name[: symbol_match.start()]}{name[symbol_match.end() :]}"
+        group_name = group_name.removeprefix("/")
+        return (group_name, int(symbol_match.group(1)))
+
+    id_match = re.search(r"(?:^|/)(\d+)$", name)
+    if id_match:
+        group_name = name[: id_match.start()]
+        return (group_name, int(id_match.group(1)))
+
+    return (name, None)
+
+
+def benchmark_within_group_sort_key(name: str) -> tuple[int, int, str]:
+    _, symbol_count = benchmark_group_and_symbol_count(name)
+    if symbol_count is None:
+        return (1, 0, name)
+    return (0, symbol_count, name)
+
+
+def sorted_benchmark_names(
+    base_metrics: dict[str, object],
+    head_metrics: dict[str, object],
+) -> list[str]:
+    seen_names: set[str] = set()
+    group_order: list[str] = []
+    names_by_group: dict[str, list[str]] = {}
+
+    for metrics in (base_metrics, head_metrics):
+        for name in metrics:
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+
+            group_name, _ = benchmark_group_and_symbol_count(name)
+            if group_name not in names_by_group:
+                group_order.append(group_name)
+                names_by_group[group_name] = []
+            names_by_group[group_name].append(name)
+
+    return [
+        name
+        for group_name in group_order
+        for name in sorted(
+            names_by_group[group_name],
+            key=benchmark_within_group_sort_key,
+        )
+    ]
+
+
 def render_criterion_table(
     base_metrics: dict[str, CriterionMetric],
     head_metrics: dict[str, CriterionMetric],
     base_label: str,
     head_label: str,
 ) -> str:
-    names = sorted(set(base_metrics) | set(head_metrics))
+    names = sorted_benchmark_names(base_metrics, head_metrics)
     if not names:
         return "No Criterion result files were found."
 
@@ -369,7 +421,7 @@ def render_custom_table(
     base_label: str,
     head_label: str,
 ) -> str:
-    names = sorted(set(base_metrics) | set(head_metrics))
+    names = sorted_benchmark_names(base_metrics, head_metrics)
     if not names:
         return "No custom throughput lines were found."
 

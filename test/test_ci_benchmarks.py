@@ -66,6 +66,56 @@ class CiBenchmarkTests(unittest.TestCase):
     def test_format_mbits_preserves_custom_benchmark_precision(self):
         self.assertEqual(ci_benchmarks.format_mbits(3979.54321), "3979.543 Mbit/s")
 
+    def test_render_custom_table_groups_rows_before_sorting_by_symbol_count(self):
+        metrics = {
+            name: ci_benchmarks.ThroughputMetric(name, 1000.0)
+            for name in [
+                "encode_benchmark/encoded/without pre-built plan/symbols=100",
+                "encode_benchmark/encoded/without pre-built plan/symbols=10",
+                "encode_benchmark/encoded/with pre-built plan/symbols=100",
+                "encode_benchmark/encoded/with pre-built plan/symbols=10",
+                "decode_benchmark/decoded/1280 bytes/symbols=50/overhead=0.0%",
+            ]
+        }
+
+        table = ci_benchmarks.render_custom_table(metrics, metrics, "master", "PR")
+
+        rows = table.splitlines()[2:]
+        rendered_names = [row.split("|")[1].strip(" `") for row in rows]
+        self.assertEqual(
+            rendered_names,
+            [
+                "encode_benchmark/encoded/without pre-built plan/symbols=10",
+                "encode_benchmark/encoded/without pre-built plan/symbols=100",
+                "encode_benchmark/encoded/with pre-built plan/symbols=10",
+                "encode_benchmark/encoded/with pre-built plan/symbols=100",
+                "decode_benchmark/decoded/1280 bytes/symbols=50/overhead=0.0%",
+            ],
+        )
+
+    def test_render_criterion_table_groups_rows_before_sorting_numeric_ids(self):
+        metrics = {
+            name: ci_benchmarks.CriterionMetric(name, 1000.0, None, None, None)
+            for name in [
+                "roundtrip/source_only/100",
+                "roundtrip/source_only/10",
+                "roundtrip/repair_only/50",
+            ]
+        }
+
+        table = ci_benchmarks.render_criterion_table(metrics, metrics, "master", "PR")
+
+        rows = table.splitlines()[2:]
+        rendered_names = [row.split("|")[1].strip(" `") for row in rows]
+        self.assertEqual(
+            rendered_names,
+            [
+                "roundtrip/source_only/10",
+                "roundtrip/source_only/100",
+                "roundtrip/repair_only/50",
+            ],
+        )
+
     def test_run_benchmarks_aggregates_all_quick_benchmark_commands(self):
         calls = []
 
