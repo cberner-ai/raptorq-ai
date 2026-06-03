@@ -1,12 +1,17 @@
+mod ci_symbol_counts;
+
+use ci_symbol_counts::CI_SYMBOL_COUNTS;
 use rand::RngExt;
-use raptorq::{ObjectTransmissionInformation, SourceBlockDecoder, SourceBlockEncoder};
+use raptorq::{
+    EncodingPacket, ObjectTransmissionInformation, SourceBlockDecoder, SourceBlockEncoder,
+};
 use std::time::{Duration, Instant};
 
 const TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const SYMBOL_COUNTS: [usize; 4] = [10, 100, 250, 500];
 const CI_TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-const CI_SYMBOL_COUNTS: [usize; 8] = [10, 100, 250, 500, 1000, 2000, 5000, 10000];
-const CI_OVERHEAD_SYMBOL_COUNTS: [usize; 5] = [10, 100, 250, 500, 1000];
+const MAX_REPAIR_ONLY_SYMBOLS: usize = 1000;
+const MAX_REPAIR_MIX_SYMBOLS: usize = 10000;
 
 fn black_box(value: u64) {
     if value == rand::rng().random() {
@@ -20,6 +25,56 @@ fn ci_mode_enabled() -> bool {
 
 fn elapsed_seconds(elapsed: Duration) -> f64 {
     elapsed.as_nanos() as f64 / 1_000_000_000.0
+}
+
+fn repair_packets(
+    encoder: &SourceBlockEncoder,
+    symbol_count: usize,
+    overhead: f64,
+    iterations: usize,
+) -> Vec<EncodingPacket> {
+    let received_per_iteration = (symbol_count as f64 * (1.0 + overhead)) as u32;
+    if symbol_count <= MAX_REPAIR_ONLY_SYMBOLS {
+        return encoder.repair_packets(0, iterations as u32 * received_per_iteration);
+    }
+
+    if symbol_count > MAX_REPAIR_MIX_SYMBOLS {
+        // The 20,000-symbol solve exceeds the CI budget; keep that row on packet ingestion.
+        return source_packets(encoder, symbol_count, received_per_iteration, iterations);
+    }
+
+    // Large repair-only decodes are either too slow or unsupported when overdetermined.
+    // Keep large CI rows focused on decode work by dropping one source symbol per pass.
+    let received_per_iteration = received_per_iteration as usize;
+    let duplicate_count = received_per_iteration - symbol_count;
+    let mut source_packets = encoder.source_packets();
+    source_packets.pop();
+    let repair_packets = encoder.repair_packets(0, iterations as u32);
+
+    let mut packets = Vec::with_capacity(iterations * received_per_iteration);
+    for repair_packet in repair_packets {
+        packets.extend(source_packets.iter().cloned());
+        packets.push(repair_packet);
+        packets.extend(source_packets.iter().take(duplicate_count).cloned());
+    }
+    packets
+}
+
+fn source_packets(
+    encoder: &SourceBlockEncoder,
+    symbol_count: usize,
+    received_per_iteration: u32,
+    iterations: usize,
+) -> Vec<EncodingPacket> {
+    let source_packets = encoder.source_packets();
+    let received_per_iteration = received_per_iteration as usize;
+    let duplicate_count = received_per_iteration - symbol_count;
+    let mut packets = Vec::with_capacity(iterations * received_per_iteration);
+    for _ in 0..iterations {
+        packets.extend(source_packets.iter().cloned());
+        packets.extend(source_packets.iter().take(duplicate_count).cloned());
+    }
+    packets
 }
 
 fn benchmark(
@@ -40,7 +95,7 @@ fn benchmark(
         let config = ObjectTransmissionInformation::new(0, symbol_size, 0, 1, 1);
         let encoder = SourceBlockEncoder::new(1, &config, &data);
         let elements_and_overhead = (symbol_count as f64 * (1.0 + overhead)) as u32;
-        let mut packets = encoder.repair_packets(0, iterations as u32 * elements_and_overhead);
+        let mut packets = repair_packets(&encoder, symbol_count, overhead, iterations);
         let now = Instant::now();
         for _ in 0..iterations {
             let mut decoder = SourceBlockDecoder::new(1, &config, elements as u64);
@@ -72,7 +127,7 @@ fn main() {
         (
             CI_TARGET_TOTAL_BYTES,
             CI_SYMBOL_COUNTS.as_slice(),
-            CI_OVERHEAD_SYMBOL_COUNTS.as_slice(),
+            CI_SYMBOL_COUNTS.as_slice(),
         )
     } else {
         (
