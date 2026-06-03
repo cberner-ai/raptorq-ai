@@ -155,7 +155,7 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
 struct CachedSystematicPlan {
     // Large systematic plans replay only symbol operations; coefficient elimination is cached.
     forward_steps: Vec<CachedSystematicForwardStep>,
-    pivot_for_col: Vec<usize>,
+    pivot_symbol_cycles: Vec<Box<[usize]>>,
     back_substitution_rows: Vec<Box<[(usize, Octet)]>>,
     width: usize,
 }
@@ -328,7 +328,7 @@ fn prepare_cached_systematic_plan(
 
     CachedSystematicPlan {
         forward_steps,
-        pivot_for_col,
+        pivot_symbol_cycles: pivot_symbol_cycles(&pivot_for_col),
         back_substitution_rows,
         width,
     }
@@ -345,17 +345,67 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
         fused_addassign_symbol_batch(symbols, step.pivot, &step.dests);
     }
 
-    let mut decoded = SymbolSlab::with_zeros(plan.width, symbols.symbol_size());
+    move_pivot_symbols_to_columns(symbols, &plan.pivot_symbol_cycles);
     for col in (0..plan.width).rev() {
-        let pivot = plan.pivot_for_col[col];
-        decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
         for &(dependent_col, coefficient) in &plan.back_substitution_rows[col] {
-            let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
+            let (dependent_symbol, dest_symbol) = symbols.get_disjoint_mut(dependent_col, col);
             fused_addassign_mul_scalar(dest_symbol, dependent_symbol, &coefficient);
         }
     }
+}
 
-    symbols.as_mut_bytes().copy_from_slice(decoded.as_bytes());
+#[cfg(feature = "std")]
+fn pivot_symbol_cycles(pivot_for_col: &[usize]) -> Vec<Box<[usize]>> {
+    let mut dest_for_pivot = vec![usize::MAX; pivot_for_col.len()];
+    for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        assert!(pivot < pivot_for_col.len());
+        assert_eq!(dest_for_pivot[pivot], usize::MAX);
+        dest_for_pivot[pivot] = col;
+    }
+
+    let mut cycles = Vec::new();
+    let mut visited = vec![false; pivot_for_col.len()];
+    for start in 0..dest_for_pivot.len() {
+        if visited[start] {
+            continue;
+        }
+
+        let mut cycle = Vec::new();
+        let mut current = start;
+        loop {
+            visited[current] = true;
+            cycle.push(current);
+            let next = dest_for_pivot[current];
+            assert!(next < dest_for_pivot.len());
+            if next == start {
+                break;
+            }
+            assert!(!visited[next]);
+            current = next;
+        }
+
+        if cycle.len() > 1 {
+            cycles.push(cycle.into_boxed_slice());
+        }
+    }
+
+    cycles
+}
+
+#[cfg(feature = "std")]
+fn move_pivot_symbols_to_columns(symbols: &mut SymbolSlab, cycles: &[Box<[usize]>]) {
+    if cycles.is_empty() {
+        return;
+    }
+
+    let mut scratch = vec![0u8; symbols.symbol_size()];
+    for cycle in cycles {
+        scratch.copy_from_slice(symbols.get(cycle[0]));
+        for &next in &cycle[1..] {
+            scratch.swap_with_slice(symbols.get_mut(next));
+        }
+        symbols.get_mut(cycle[0]).copy_from_slice(&scratch);
+    }
 }
 
 #[cfg(not(feature = "std"))]
@@ -1764,6 +1814,22 @@ mod tests {
     }
 
     #[test]
+    fn prepared_systematic_plan_replays_pivot_permutation_in_place() {
+        let rows = vec![
+            vec![(0, Octet::one()), (1, Octet::one())],
+            vec![(0, Octet::one())],
+            vec![(2, Octet::one())],
+        ];
+        let symbols = SymbolSlab::from_bytes(vec![9, 4, 12], 1);
+        let plan = prepare_cached_systematic_plan(rows, 3);
+        let mut replayed = symbols;
+
+        apply_prepared_systematic_plan(&plan, &mut replayed);
+
+        assert_eq!(replayed.as_bytes(), &[4, 13, 12]);
+    }
+
+    #[test]
     fn scaled_binary_matrix_row_matches_unit_coefficient_merge() {
         let src_cols = vec![0, 2, 5, 8];
         let src_row = src_cols
@@ -2110,7 +2176,7 @@ mod tests {
         for source_block_symbols in 0..=SYSTEMATIC_PLAN_CACHE_CAPACITY as u32 {
             let plan = std::sync::Arc::new(CachedSystematicPlan {
                 forward_steps: Vec::new(),
-                pivot_for_col: Vec::new(),
+                pivot_symbol_cycles: Vec::new(),
                 back_substitution_rows: Vec::new(),
                 width: 0,
             });
