@@ -509,10 +509,8 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     let mut rows = matrix.packed_rows();
     let mut bucket_heads = vec![None; width];
     let mut next_in_bucket = vec![None; binary_height];
-    let mut row_weights = vec![0; binary_height];
     for row in 0..binary_height {
-        if let Some((col, weight)) = rows.first_one_and_weight_at_or_after(row, 0) {
-            row_weights[row] = weight;
+        if let Some(col) = rows.first_one_at_or_after(row, 0) {
             push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
         }
     }
@@ -520,12 +518,9 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     let mut pivot_for_col = vec![None; width];
     let mut is_pivot_row = vec![false; binary_height];
     for col in 0..width {
-        let Some(pivot) = pop_lightest_binary_row_bucket(
-            &row_weights,
-            &mut bucket_heads,
-            &mut next_in_bucket,
-            col,
-        ) else {
+        let Some(pivot) =
+            pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
+        else {
             continue;
         };
         pivot_for_col[col] = Some(pivot);
@@ -536,11 +531,8 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
             let (pivot_symbol, dest_symbol) = binary_symbols.get_disjoint_mut(pivot, row);
             add_assign(dest_symbol, pivot_symbol);
 
-            if let Some((next_col, weight)) = rows.first_one_and_weight_at_or_after(row, col + 1) {
-                row_weights[row] = weight;
+            if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
                 push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
-            } else {
-                row_weights[row] = 0;
             }
         }
     }
@@ -1221,10 +1213,8 @@ fn solve_binary(
     assert_eq!(height, symbols.len());
     let mut bucket_heads = vec![None; width];
     let mut next_in_bucket = vec![None; height];
-    let mut row_weights = vec![0; height];
     for row in 0..height {
-        if let Some((col, weight)) = rows.first_one_and_weight_at_or_after(row, 0) {
-            row_weights[row] = weight;
+        if let Some(col) = rows.first_one_at_or_after(row, 0) {
             push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
         }
     }
@@ -1233,12 +1223,9 @@ fn solve_binary(
     let mut is_pivot_row = vec![false; height];
 
     for col in 0..width {
-        let Some(pivot) = pop_lightest_binary_row_bucket(
-            &row_weights,
-            &mut bucket_heads,
-            &mut next_in_bucket,
-            col,
-        ) else {
+        let Some(pivot) =
+            pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
+        else {
             return (None, None);
         };
         pivot_for_col[col] = Some(pivot);
@@ -1249,11 +1236,8 @@ fn solve_binary(
             let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot, row);
             add_assign(dest_symbol, pivot_symbol);
 
-            if let Some((next_col, weight)) = rows.first_one_and_weight_at_or_after(row, col + 1) {
-                row_weights[row] = weight;
+            if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
                 push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
-            } else {
-                row_weights[row] = 0;
             }
         }
     }
@@ -1356,7 +1340,7 @@ fn pop_lightest_coefficient_row_bucket(
 }
 
 fn pop_lightest_binary_row_bucket(
-    row_weights: &[u32],
+    rows: &PackedBinaryRows,
     bucket_heads: &mut [Option<usize>],
     next_in_bucket: &mut [Option<usize>],
     col: usize,
@@ -1369,12 +1353,12 @@ fn pop_lightest_binary_row_bucket(
 
     let mut best = head;
     let mut best_previous = None;
-    let mut best_weight = row_weights[head];
+    let mut best_weight = rows.weight_at_or_after(head, col);
     let mut previous = head;
     let mut current = next_in_bucket[head];
 
     while let Some(row) = current {
-        let weight = row_weights[row];
+        let weight = rows.weight_at_or_after(row, col);
         if weight < best_weight {
             best = row;
             best_previous = Some(previous);
