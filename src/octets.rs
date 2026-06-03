@@ -179,7 +179,6 @@ use core::arch::x86_64::{
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
 unsafe fn mulassign_scalar_avx2(dest: &mut [u8], scalar: u8) {
-    let table = Octet::new(scalar).mul_table();
     let low_table = avx2_low_nibble_table(scalar);
     let high_table = avx2_high_nibble_table(scalar);
     let mask = _mm256_set1_epi8(0x0f);
@@ -195,15 +194,17 @@ unsafe fn mulassign_scalar_avx2(dest: &mut [u8], scalar: u8) {
         offset += 32;
     }
 
-    for byte in &mut dest[offset..] {
-        *byte = table[*byte as usize];
+    if offset < dest.len() {
+        let table = Octet::new(scalar).mul_table();
+        for byte in &mut dest[offset..] {
+            *byte = table[*byte as usize];
+        }
     }
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
 unsafe fn fused_addassign_mul_scalar_avx2(dest: &mut [u8], src: &[u8], scalar: u8) {
-    let table = Octet::new(scalar).mul_table();
     let low_table = avx2_low_nibble_table(scalar);
     let high_table = avx2_high_nibble_table(scalar);
     let mask = _mm256_set1_epi8(0x0f);
@@ -221,8 +222,11 @@ unsafe fn fused_addassign_mul_scalar_avx2(dest: &mut [u8], src: &[u8], scalar: u
         offset += 32;
     }
 
-    for (d, s) in dest[offset..].iter_mut().zip(src[offset..].iter()) {
-        *d ^= table[*s as usize];
+    if offset < src.len() {
+        let table = Octet::new(scalar).mul_table();
+        for (d, s) in dest[offset..].iter_mut().zip(src[offset..].iter()) {
+            *d ^= table[*s as usize];
+        }
     }
 }
 
