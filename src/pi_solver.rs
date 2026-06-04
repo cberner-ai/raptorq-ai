@@ -41,6 +41,10 @@ const SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 4096;
 const SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 1;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
+#[cfg(feature = "std")]
+const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = 16_384;
+#[cfg(feature = "std")]
+const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 
 // Systematic planning matrices feed SourceBlockEncodingPlan, which replays concrete row
 // operations. Recording must therefore stay independent of matrix width and feature set.
@@ -168,7 +172,7 @@ struct CachedSystematicPlan {
     // Large systematic plans replay only symbol operations; coefficient elimination is cached.
     forward_steps: Vec<CachedSystematicForwardStep>,
     pivot_symbol_cycles: Vec<Box<[usize]>>,
-    back_substitution_rows: Vec<Box<[(usize, Octet)]>>,
+    back_substitution: CachedSystematicBackSubstitution,
     width: usize,
 }
 
@@ -177,6 +181,12 @@ struct CachedSystematicForwardStep {
     pivot: usize,
     scale: Option<Octet>,
     dests: Box<[(usize, Octet)]>,
+}
+
+#[cfg(feature = "std")]
+enum CachedSystematicBackSubstitution {
+    Rows(Vec<Box<[(usize, Octet)]>>),
+    Batches(Vec<Box<[(usize, Octet)]>>),
 }
 
 #[cfg(feature = "std")]
@@ -292,23 +302,45 @@ fn prepare_cached_systematic_plan(
             None
         };
 
-        let pivot_coefficients = rows[pivot].clone();
         let mut dests = Vec::new();
-        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
-            debug_assert_ne!(row, pivot);
-            let factor = rows[row][0].1;
-            add_scaled_matrix_row(
-                &mut rows[row],
-                &pivot_coefficients,
-                col,
-                factor,
-                &mut row_merge_scratch,
-            );
-            dests.push((row, factor));
+        if width >= CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH {
+            while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+                debug_assert_ne!(row, pivot);
+                let factor = rows[row][0].1;
+                let (pivot_coefficients, row_coefficients) =
+                    disjoint_coefficient_rows_mut(&mut rows, pivot, row);
+                add_scaled_matrix_row(
+                    row_coefficients,
+                    pivot_coefficients,
+                    col,
+                    factor,
+                    &mut row_merge_scratch,
+                );
+                dests.push((row, factor));
 
-            if let Some(&(next_col, _)) = rows[row].first() {
-                debug_assert!(next_col > col);
-                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                if let Some(&(next_col, _)) = rows[row].first() {
+                    debug_assert!(next_col > col);
+                    push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                }
+            }
+        } else {
+            let pivot_coefficients = rows[pivot].clone();
+            while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+                debug_assert_ne!(row, pivot);
+                let factor = rows[row][0].1;
+                add_scaled_matrix_row(
+                    &mut rows[row],
+                    &pivot_coefficients,
+                    col,
+                    factor,
+                    &mut row_merge_scratch,
+                );
+                dests.push((row, factor));
+
+                if let Some(&(next_col, _)) = rows[row].first() {
+                    debug_assert!(next_col > col);
+                    push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                }
             }
         }
 
@@ -326,22 +358,38 @@ fn prepare_cached_systematic_plan(
         );
     }
 
-    let mut back_substitution_rows = Vec::with_capacity(width);
-    for (col, &pivot) in pivot_for_col.iter().enumerate() {
-        let mut dependencies = Vec::new();
-        for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
-            if dependent_col <= col {
-                break;
+    let back_substitution = if width >= BATCHED_BACK_SUBSTITUTION_MIN_WIDTH {
+        let mut batches = vec![Vec::new(); width];
+        for (col, &pivot) in pivot_for_col.iter().enumerate() {
+            for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
+                if dependent_col <= col {
+                    break;
+                }
+                batches[dependent_col].push((col, coefficient));
             }
-            dependencies.push((dependent_col, coefficient));
         }
-        back_substitution_rows.push(dependencies.into_boxed_slice());
-    }
+        CachedSystematicBackSubstitution::Batches(
+            batches.into_iter().map(Vec::into_boxed_slice).collect(),
+        )
+    } else {
+        let mut rows_by_dest = Vec::with_capacity(width);
+        for (col, &pivot) in pivot_for_col.iter().enumerate() {
+            let mut dependencies = Vec::new();
+            for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
+                if dependent_col <= col {
+                    break;
+                }
+                dependencies.push((dependent_col, coefficient));
+            }
+            rows_by_dest.push(dependencies.into_boxed_slice());
+        }
+        CachedSystematicBackSubstitution::Rows(rows_by_dest)
+    };
 
     CachedSystematicPlan {
         forward_steps,
         pivot_symbol_cycles: pivot_symbol_cycles(&pivot_for_col),
-        back_substitution_rows,
+        back_substitution,
         width,
     }
 }
@@ -358,10 +406,20 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
     }
 
     move_pivot_symbols_to_columns(symbols, &plan.pivot_symbol_cycles);
-    for col in (0..plan.width).rev() {
-        for &(dependent_col, coefficient) in &plan.back_substitution_rows[col] {
-            let (dependent_symbol, dest_symbol) = symbols.get_disjoint_mut(dependent_col, col);
-            fused_addassign_mul_scalar(dest_symbol, dependent_symbol, &coefficient);
+    match &plan.back_substitution {
+        CachedSystematicBackSubstitution::Rows(rows) => {
+            for col in (0..plan.width).rev() {
+                for &(dependent_col, coefficient) in &rows[col] {
+                    let (dependent_symbol, dest_symbol) =
+                        symbols.get_disjoint_mut(dependent_col, col);
+                    fused_addassign_mul_scalar(dest_symbol, dependent_symbol, &coefficient);
+                }
+            }
+        }
+        CachedSystematicBackSubstitution::Batches(batches) => {
+            for src in (0..plan.width).rev() {
+                fused_addassign_symbol_batch(symbols, src, &batches[src]);
+            }
         }
     }
 }
@@ -1715,6 +1773,21 @@ fn add_scaled_matrix_row(
     core::mem::swap(dest, scratch);
 }
 
+fn disjoint_coefficient_rows_mut(
+    rows: &mut [CoefficientRow],
+    src: usize,
+    dest: usize,
+) -> (&CoefficientRow, &mut CoefficientRow) {
+    assert_ne!(src, dest);
+    if src < dest {
+        let (before_dest, dest_and_after) = rows.split_at_mut(dest);
+        (&before_dest[src], &mut dest_and_after[0])
+    } else {
+        let (before_src, src_and_after) = rows.split_at_mut(src);
+        (&src_and_after[0], &mut before_src[dest])
+    }
+}
+
 fn add_unscaled_matrix_row(
     dest: &mut CoefficientRow,
     src: &CoefficientRow,
@@ -2335,7 +2408,7 @@ mod tests {
             let plan = std::sync::Arc::new(CachedSystematicPlan {
                 forward_steps: Vec::new(),
                 pivot_symbol_cycles: Vec::new(),
-                back_substitution_rows: Vec::new(),
+                back_substitution: CachedSystematicBackSubstitution::Rows(Vec::new()),
                 width: 0,
             });
             insert_systematic_plan(&mut cache, source_block_symbols, plan);
