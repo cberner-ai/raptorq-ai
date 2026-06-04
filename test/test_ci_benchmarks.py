@@ -24,6 +24,7 @@ ENCODE_DEFAULT_SYMBOL_COUNTS = (
 DECODE_DEFAULT_SYMBOL_COUNTS = (10, 100, 250, 500, 1000)
 CI_SYMBOL_COUNTS = (10, 100, 250, 500, 1000, 2000, 5000, 10000, 20000)
 CI_DECODE_SYMBOL_COUNTS = (10, 100, 250, 500, 1000)
+CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS = (20000,)
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "ci_benchmarks.py"
 SPEC = importlib.util.spec_from_file_location("ci_benchmarks", SCRIPT_PATH)
 ci_benchmarks = importlib.util.module_from_spec(SPEC)
@@ -51,8 +52,26 @@ def format_decode_lines(overhead, mbits_per_second):
     )
 
 
+def format_mixed_one_repair_decode_lines(mbits_per_second):
+    return "\n".join(
+        (
+            f"symbol count = {count}, decoded 1.95 MB in 0.020123456secs "
+            f"using 0.0% overhead, throughput: {mbits_per_second:.3f}Mbit/s"
+        )
+        for count in CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS
+    )
+
+
 def read_bench_source(bench_name):
     return (BENCHES_DIR / bench_name).read_text(encoding="utf-8")
+
+
+def top_level_function_source(source, function_name):
+    start = source.index(f"fn {function_name}(")
+    next_function = source.find("\nfn ", start + 1)
+    if next_function == -1:
+        return source[start:]
+    return source[start:next_function]
 
 
 def parse_usize_array(source, const_name):
@@ -100,9 +119,13 @@ Symbol size: 1280 bytes
 {without_overhead}
 
 {with_overhead}
+
+Symbol size: 1280 bytes (mixed one-repair)
+{mixed_one_repair}
 """.format(
     without_overhead=format_decode_lines(0.0, 2274.321),
     with_overhead=format_decode_lines(5.0, 1562.543),
+    mixed_one_repair=format_mixed_one_repair_decode_lines(1826.934),
 )
 
 
@@ -110,9 +133,16 @@ class CiBenchmarkTests(unittest.TestCase):
     def test_shared_ci_symbol_counts_match_required_sequence(self):
         counts = parse_ci_symbol_counts("CI_SYMBOL_COUNTS")
         decode_counts = parse_ci_symbol_counts("CI_DECODE_SYMBOL_COUNTS")
+        mixed_one_repair_counts = parse_ci_symbol_counts(
+            "CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS"
+        )
 
         self.assertEqual(counts, CI_SYMBOL_COUNTS)
         self.assertEqual(decode_counts, CI_DECODE_SYMBOL_COUNTS)
+        self.assertEqual(
+            mixed_one_repair_counts,
+            CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS,
+        )
         self.assertEqual(counts, tuple(sorted(counts)))
         self.assertEqual(decode_counts, tuple(sorted(decode_counts)))
         self.assertEqual(counts[:-1], (10, 100, 250, 500, 1000, 2000, 5000, 10000))
@@ -120,6 +150,7 @@ class CiBenchmarkTests(unittest.TestCase):
         self.assertEqual(decode_counts, counts[:5])
         self.assertTrue(set(counts).issubset(ENCODE_DEFAULT_SYMBOL_COUNTS))
         self.assertEqual(decode_counts, DECODE_DEFAULT_SYMBOL_COUNTS)
+        self.assertEqual(mixed_one_repair_counts, (counts[-1],))
         self.assertLess(len(counts), len(ENCODE_DEFAULT_SYMBOL_COUNTS))
         self.assertLess(len(decode_counts), len(counts))
 
@@ -137,7 +168,12 @@ class CiBenchmarkTests(unittest.TestCase):
             "use ci_symbol_counts::CI_DECODE_SYMBOL_COUNTS;",
             decode_source,
         )
+        self.assertIn(
+            "use ci_symbol_counts::CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS;",
+            decode_source,
+        )
         self.assertNotIn("const CI_DECODE_SYMBOL_COUNTS", decode_source)
+        self.assertNotIn("const CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS", decode_source)
         self.assertNotIn("CI_OVERHEAD_SYMBOL_COUNTS", decode_source)
 
     def test_encode_benchmark_restores_original_workload_and_counts(self):
@@ -199,21 +235,22 @@ class CiBenchmarkTests(unittest.TestCase):
 
     def test_decode_benchmark_uses_repair_only_chunks_for_all_rows(self):
         source = read_bench_source("decode_benchmark.rs")
+        repair_only_source = top_level_function_source(source, "benchmark")
 
         self.assertIn(
             "let elements_and_overhead = (symbol_count as f64 * (1.0 + overhead)) as u32;",
-            source,
+            repair_only_source,
         )
         self.assertIn(
             "let mut packets = encoder.repair_packets(0, iterations as u32 * elements_and_overhead);",
-            source,
+            repair_only_source,
         )
         self.assertIn(
             "let start = packets.len() - elements_and_overhead as usize;",
-            source,
+            repair_only_source,
         )
-        self.assertIn("decoder.decode(packets.drain(start..))", source)
-        self.assertNotRegex(source, r"fn\s+repair_packets\s*\(")
+        self.assertIn("decoder.decode(packets.drain(start..))", repair_only_source)
+        self.assertNotRegex(repair_only_source, r"fn\s+repair_packets\s*\(")
         for forbidden in (
             "EncodingPacket",
             "source_packets",
@@ -222,7 +259,19 @@ class CiBenchmarkTests(unittest.TestCase):
             "duplicate_count",
             "received_per_iteration",
         ):
-            self.assertNotIn(forbidden, source)
+            self.assertNotIn(forbidden, repair_only_source)
+
+    def test_decode_benchmark_has_dedicated_mixed_one_repair_row(self):
+        source = read_bench_source("decode_benchmark.rs")
+        mixed_source = top_level_function_source(source, "benchmark_mixed_one_repair")
+
+        self.assertIn("fn mixed_one_repair_packets(", source)
+        self.assertIn("source_packets.pop();", source)
+        self.assertIn("let repair_packets = encoder.repair_packets(0, iterations as u32);", source)
+        self.assertIn("CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS.as_slice()", source)
+        self.assertIn("Symbol size: {symbol_size} bytes (mixed one-repair)", source)
+        self.assertIn("mixed_one_repair_packets(&encoder, symbol_count, iterations)", mixed_source)
+        self.assertIn("let start = packets.len() - symbol_count;", mixed_source)
 
     def test_encode_benchmark_preserves_original_modes(self):
         source = read_bench_source("encode_benchmark.rs")
@@ -251,6 +300,10 @@ class CiBenchmarkTests(unittest.TestCase):
             for count in CI_DECODE_SYMBOL_COUNTS
             for overhead in ("0.0", "5.0")
         )
+        expected_names.update(
+            f"decode_benchmark/decoded/mixed one-repair/symbols={count}/overhead=0.0%"
+            for count in CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS
+        )
         self.assertEqual(set(metrics), expected_names)
         self.assertIn(
             "encode_benchmark/encoded/without pre-built plan/symbols=20000",
@@ -258,6 +311,10 @@ class CiBenchmarkTests(unittest.TestCase):
         )
         self.assertNotIn(
             "decode_benchmark/decoded/1280 bytes/symbols=20000/overhead=5.0%",
+            metrics,
+        )
+        self.assertIn(
+            "decode_benchmark/decoded/mixed one-repair/symbols=20000/overhead=0.0%",
             metrics,
         )
         self.assertEqual(
@@ -320,6 +377,9 @@ symbol count = 10, decoded 127 MB in 0.456secs using 0.0% overhead, throughput: 
                 "decode_benchmark/decoded/1280 bytes/overhead=5.0%": set(
                     CI_DECODE_SYMBOL_COUNTS
                 ),
+                "decode_benchmark/decoded/mixed one-repair/overhead=0.0%": set(
+                    CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS
+                ),
             },
         )
 
@@ -331,7 +391,7 @@ symbol count = 10, decoded 127 MB in 0.456secs using 0.0% overhead, throughput: 
         table = ci_benchmarks.render_custom_table(metrics, metrics, "master", "PR")
 
         rows = [row for row in table.splitlines() if row.startswith("| `")]
-        self.assertEqual(len(rows), 28)
+        self.assertEqual(len(rows), 29)
         self.assertNotIn("additional throughput rows omitted", table)
         self.assertNotIn(
             "decode_benchmark/decoded/1280 bytes/symbols=20000/overhead=5.0%",
@@ -339,6 +399,10 @@ symbol count = 10, decoded 127 MB in 0.456secs using 0.0% overhead, throughput: 
         )
         self.assertIn(
             "encode_benchmark/encoded/without pre-built plan/symbols=20000",
+            table,
+        )
+        self.assertIn(
+            "decode_benchmark/decoded/mixed one-repair/symbols=20000/overhead=0.0%",
             table,
         )
 
@@ -421,7 +485,7 @@ symbol count = 10, decoded 127 MB in 0.456secs using 0.0% overhead, throughput: 
         self.assertIn(ENCODE_OUTPUT, run.output)
         self.assertIn(DECODE_OUTPUT, run.output)
         self.assertEqual([call[0] for call in calls[1:]], ci_benchmarks.QUICK_BENCH_COMMANDS)
-        self.assertEqual(len(run.throughput), 28)
+        self.assertEqual(len(run.throughput), 29)
         for _, env in calls[1:]:
             self.assertEqual(env["CARGO_TARGET_DIR"], str(target_dir))
 

@@ -1,6 +1,7 @@
 mod ci_symbol_counts;
 
-use ci_symbol_counts::{CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS, CI_DECODE_SYMBOL_COUNTS};
+use ci_symbol_counts::CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS;
+use ci_symbol_counts::CI_DECODE_SYMBOL_COUNTS;
 use rand::RngExt;
 use raptorq::{
     EncodingPacket, ObjectTransmissionInformation, SourceBlockDecoder, SourceBlockEncoder,
