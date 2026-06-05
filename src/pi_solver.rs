@@ -16,7 +16,7 @@ use crate::gf2::PackedBinaryRows;
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
-use crate::octets::{add_assign, fused_addassign_mul_scalar, mulassign_scalar};
+use crate::octets::{add_assign, bytes_are_zero, fused_addassign_mul_scalar, mulassign_scalar};
 use crate::operation_vector::SymbolOps;
 #[cfg(feature = "std")]
 use crate::operation_vector::fused_addassign_symbol_batch;
@@ -1904,7 +1904,7 @@ fn pop_lightest_binary_row_bucket(
 }
 
 fn symbol_is_zero(symbol: &[u8]) -> bool {
-    symbol.iter().all(|&byte| byte == 0)
+    bytes_are_zero(symbol)
 }
 
 fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {

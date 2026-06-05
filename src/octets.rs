@@ -269,43 +269,35 @@ unsafe fn add_assign_avx2(dest: &mut [u8], src: &[u8]) {
 #[target_feature(enable = "avx2")]
 unsafe fn bytes_are_zero_avx2(bytes: &[u8]) -> bool {
     let zero = _mm256_setzero_si256();
-    let mut combined = zero;
     let mut offset = 0usize;
 
     while offset + 128 <= bytes.len() {
-        unsafe {
-            combined = _mm256_or_si256(
-                combined,
+        let combined = unsafe {
+            let first = _mm256_or_si256(
                 _mm256_loadu_si256(bytes.as_ptr().add(offset).cast::<__m256i>()),
-            );
-            combined = _mm256_or_si256(
-                combined,
                 _mm256_loadu_si256(bytes.as_ptr().add(offset + 32).cast::<__m256i>()),
             );
-            combined = _mm256_or_si256(
-                combined,
+            let second = _mm256_or_si256(
                 _mm256_loadu_si256(bytes.as_ptr().add(offset + 64).cast::<__m256i>()),
-            );
-            combined = _mm256_or_si256(
-                combined,
                 _mm256_loadu_si256(bytes.as_ptr().add(offset + 96).cast::<__m256i>()),
             );
+            _mm256_or_si256(first, second)
+        };
+        if _mm256_movemask_epi8(_mm256_cmpeq_epi8(combined, zero)) != -1 {
+            return false;
         }
         offset += 128;
     }
 
     while offset + 32 <= bytes.len() {
-        unsafe {
-            combined = _mm256_or_si256(
-                combined,
-                _mm256_loadu_si256(bytes.as_ptr().add(offset).cast::<__m256i>()),
-            );
+        let chunk = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(offset).cast::<__m256i>()) };
+        if _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, zero)) != -1 {
+            return false;
         }
         offset += 32;
     }
 
-    _mm256_movemask_epi8(_mm256_cmpeq_epi8(combined, zero)) == -1
-        && bytes_are_zero_scalar(&bytes[offset..])
+    bytes_are_zero_scalar(&bytes[offset..])
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
