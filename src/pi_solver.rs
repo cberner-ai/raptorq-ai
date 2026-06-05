@@ -25,7 +25,7 @@ use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::num_ldpc_symbols;
 use crate::systematic_constants::{
     MAX_SUPPORTED_INTERMEDIATE_SYMBOLS, calculate_p1, extended_source_block_symbols,
-    num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
+    num_hdpc_symbols, num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
 };
 
 type CoefficientRow = Vec<(usize, Octet)>;
@@ -45,6 +45,8 @@ const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
+#[cfg(feature = "std")]
+const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 
 // Systematic planning matrices feed SourceBlockEncodingPlan, which replays concrete row
 // operations. Recording must therefore stay independent of matrix width and feature set.
@@ -206,6 +208,35 @@ fn systematic_plan_cache() -> &'static SystematicPlanCacheLock {
 }
 
 #[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct SingleRepairBasisKey {
+    source_block_symbols: u32,
+    missing_isi: usize,
+}
+
+#[cfg(feature = "std")]
+struct CachedSingleRepairBasis {
+    coefficients: Vec<u8>,
+    nonzero_cols: Box<[usize]>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct SingleRepairBasisCache {
+    bases: HashMap<SingleRepairBasisKey, Arc<CachedSingleRepairBasis>>,
+    insertion_order: VecDeque<SingleRepairBasisKey>,
+}
+
+#[cfg(feature = "std")]
+type SingleRepairBasisCacheLock = Mutex<SingleRepairBasisCache>;
+
+#[cfg(feature = "std")]
+fn single_repair_basis_cache() -> &'static SingleRepairBasisCacheLock {
+    static CACHE: OnceLock<SingleRepairBasisCacheLock> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(SingleRepairBasisCache::default()))
+}
+
+#[cfg(feature = "std")]
 fn cached_systematic_plan(source_block_symbols: u32) -> Arc<CachedSystematicPlan> {
     let source_block_symbols = extended_source_block_symbols(source_block_symbols);
     {
@@ -247,6 +278,160 @@ fn insert_systematic_plan(
         .plans
         .insert(source_block_symbols, Arc::clone(&generated));
     generated
+}
+
+#[cfg(feature = "std")]
+fn cached_single_repair_basis(
+    source_block_symbols: u32,
+    missing_isi: usize,
+) -> Arc<CachedSingleRepairBasis> {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    let key = SingleRepairBasisKey {
+        source_block_symbols,
+        missing_isi,
+    };
+    {
+        let cache = single_repair_basis_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(basis) = guard.bases.get(&key) {
+            return Arc::clone(basis);
+        }
+    }
+
+    let generated = Arc::new(generate_single_repair_basis(
+        source_block_symbols,
+        missing_isi,
+    ));
+    let cache = single_repair_basis_cache();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    insert_single_repair_basis(&mut guard, key, generated)
+}
+
+#[cfg(feature = "std")]
+fn insert_single_repair_basis(
+    cache: &mut SingleRepairBasisCache,
+    key: SingleRepairBasisKey,
+    generated: Arc<CachedSingleRepairBasis>,
+) -> Arc<CachedSingleRepairBasis> {
+    if let Some(basis) = cache.bases.get(&key) {
+        return Arc::clone(basis);
+    }
+
+    if cache.bases.len() >= SINGLE_REPAIR_BASIS_CACHE_CAPACITY
+        && let Some(evicted_key) = cache.insertion_order.pop_front()
+    {
+        cache.bases.remove(&evicted_key);
+    }
+
+    cache.insertion_order.push_back(key);
+    cache.bases.insert(key, Arc::clone(&generated));
+    generated
+}
+
+#[cfg(feature = "std")]
+fn generate_single_repair_basis(
+    source_block_symbols: u32,
+    missing_isi: usize,
+) -> CachedSingleRepairBasis {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    let width = num_intermediate_symbols(source_block_symbols) as usize;
+    let s = num_ldpc_symbols(source_block_symbols) as usize;
+    let h = num_hdpc_symbols(source_block_symbols) as usize;
+    assert!(missing_isi < source_block_symbols as usize);
+
+    let plan = cached_systematic_plan(source_block_symbols);
+    let coefficients =
+        apply_prepared_systematic_plan_to_basis_coefficients(&plan, s + h + missing_isi);
+    assert_eq!(coefficients.len(), width);
+
+    let nonzero_cols = coefficients
+        .iter()
+        .enumerate()
+        .filter_map(|(col, &coefficient)| (coefficient != 0).then_some(col))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+
+    CachedSingleRepairBasis {
+        coefficients,
+        nonzero_cols,
+    }
+}
+
+#[cfg(feature = "std")]
+fn apply_prepared_systematic_plan_to_basis_coefficients(
+    plan: &CachedSystematicPlan,
+    source_col: usize,
+) -> Vec<u8> {
+    assert!(source_col < plan.width);
+
+    let mut coefficients = vec![0u8; plan.width];
+    coefficients[source_col] = 1;
+
+    for step in &plan.forward_steps {
+        if let Some(scale) = step.scale {
+            coefficients[step.pivot] = (Octet::new(coefficients[step.pivot]) * scale).value();
+        }
+
+        let src_value = coefficients[step.pivot];
+        if src_value == 0 {
+            continue;
+        }
+        for &(dest, scalar) in step.dests.iter() {
+            add_scaled_coefficient(&mut coefficients[dest], src_value, scalar);
+        }
+    }
+
+    move_pivot_coefficients_to_columns(&mut coefficients, &plan.pivot_symbol_cycles);
+    match &plan.back_substitution {
+        CachedSystematicBackSubstitution::Rows(rows) => {
+            for col in (0..plan.width).rev() {
+                for &(dependent_col, coefficient) in rows[col].iter() {
+                    let dependent_value = coefficients[dependent_col];
+                    add_scaled_coefficient(&mut coefficients[col], dependent_value, coefficient);
+                }
+            }
+        }
+        CachedSystematicBackSubstitution::Batches(batches) => {
+            for src in (0..plan.width).rev() {
+                let src_value = coefficients[src];
+                if src_value == 0 {
+                    continue;
+                }
+                for &(dest, scalar) in batches[src].iter() {
+                    add_scaled_coefficient(&mut coefficients[dest], src_value, scalar);
+                }
+            }
+        }
+    }
+
+    coefficients
+}
+
+#[cfg(feature = "std")]
+fn add_scaled_coefficient(dest: &mut u8, src: u8, scalar: Octet) {
+    if src == 0 {
+        return;
+    }
+    if scalar == Octet::one() {
+        *dest ^= src;
+    } else {
+        *dest ^= (Octet::new(src) * scalar).value();
+    }
+}
+
+#[cfg(feature = "std")]
+fn move_pivot_coefficients_to_columns(coefficients: &mut [u8], cycles: &[Box<[usize]>]) {
+    for cycle in cycles {
+        let mut scratch = coefficients[cycle[0]];
+        for &next in &cycle[1..] {
+            core::mem::swap(&mut scratch, &mut coefficients[next]);
+        }
+        coefficients[cycle[0]] = scratch;
+    }
 }
 
 #[cfg(feature = "std")]
@@ -910,18 +1095,12 @@ fn try_single_repair_systematic_decode<M: BinaryMatrix>(
 
     let symbol_size = symbols.symbol_size();
     let mut systematic_symbols = SymbolSlab::with_zeros(width, symbol_size);
-    for (isi, matrix_row) in rows.systematic_rows {
-        systematic_symbols
-            .get_mut(s + h + isi)
-            .copy_from_slice(symbols.get(matrix_row + h));
-    }
+    copy_single_repair_systematic_symbols(&mut systematic_symbols, symbols, &rows, s, h, k_prime);
 
     let plan = cached_systematic_plan(k_prime as u32);
     apply_prepared_systematic_plan(&plan, &mut systematic_symbols);
 
-    let mut missing_basis = SymbolSlab::with_zeros(width, 1);
-    missing_basis.get_mut(s + h + rows.missing_isi)[0] = 1;
-    apply_prepared_systematic_plan(&plan, &mut missing_basis);
+    let missing_basis = cached_single_repair_basis(source_block_symbols, rows.missing_isi);
 
     let repair_entries = matrix.row_entries(rows.repair_matrix_row);
     if repair_entries.is_empty() {
@@ -932,7 +1111,7 @@ fn try_single_repair_systematic_decode<M: BinaryMatrix>(
     let mut repair_coefficient = Octet::zero();
     for col in repair_entries {
         add_assign(&mut predicted_repair, systematic_symbols.get(col));
-        repair_coefficient += Octet::new(missing_basis.get(col)[0]);
+        repair_coefficient += Octet::new(missing_basis.coefficients[col]);
     }
     if repair_coefficient.is_zero() {
         return None;
@@ -942,18 +1121,66 @@ fn try_single_repair_systematic_decode<M: BinaryMatrix>(
     add_assign(&mut missing_symbol, &predicted_repair);
     mulassign_scalar(&mut missing_symbol, &repair_coefficient.inverse());
 
-    for col in 0..width {
-        let coefficient = Octet::new(missing_basis.get(col)[0]);
-        if !coefficient.is_zero() {
-            fused_addassign_mul_scalar(
-                systematic_symbols.get_mut(col),
-                &missing_symbol,
-                &coefficient,
-            );
-        }
+    for &col in missing_basis.nonzero_cols.iter() {
+        let coefficient = Octet::new(missing_basis.coefficients[col]);
+        fused_addassign_mul_scalar(
+            systematic_symbols.get_mut(col),
+            &missing_symbol,
+            &coefficient,
+        );
     }
 
     Some(systematic_symbols)
+}
+
+#[cfg(feature = "std")]
+fn copy_single_repair_systematic_symbols(
+    dest: &mut SymbolSlab,
+    symbols: &SymbolSlab,
+    rows: &SingleRepairSystematicRows,
+    s: usize,
+    h: usize,
+    k_prime: usize,
+) {
+    if single_repair_rows_are_contiguous(rows, s, k_prime) {
+        let symbol_size = symbols.symbol_size();
+        let encoded_start = s + h;
+
+        let before_missing_bytes = rows.missing_isi * symbol_size;
+        if before_missing_bytes != 0 {
+            let source_start = encoded_start * symbol_size;
+            dest.copy_block_from(
+                encoded_start,
+                &symbols.as_bytes()[source_start..source_start + before_missing_bytes],
+            );
+        }
+
+        let after_missing_symbols = k_prime - rows.missing_isi - 1;
+        if after_missing_symbols != 0 {
+            let source_symbol = encoded_start + rows.missing_isi;
+            let source_start = source_symbol * symbol_size;
+            let byte_len = after_missing_symbols * symbol_size;
+            dest.copy_block_from(
+                encoded_start + rows.missing_isi + 1,
+                &symbols.as_bytes()[source_start..source_start + byte_len],
+            );
+        }
+        return;
+    }
+
+    for &(isi, matrix_row) in &rows.systematic_rows {
+        dest.get_mut(s + h + isi)
+            .copy_from_slice(symbols.get(matrix_row + h));
+    }
+}
+
+#[cfg(feature = "std")]
+fn single_repair_rows_are_contiguous(
+    rows: &SingleRepairSystematicRows,
+    s: usize,
+    k_prime: usize,
+) -> bool {
+    rows.repair_matrix_row == s + k_prime - 1 && rows.systematic_rows.len() + 1 == k_prime
 }
 
 #[cfg(feature = "std")]
@@ -2443,6 +2670,45 @@ mod tests {
             &decode_matrix,
             source_symbols
         ));
+    }
+
+    #[test]
+    fn cached_single_repair_basis_matches_direct_plan_replay() {
+        let source_symbols = 10;
+        let missing_isi = 3;
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        let s = num_ldpc_symbols(source_symbols) as usize;
+        let h = num_hdpc_symbols(source_symbols) as usize;
+
+        let mut direct = SymbolSlab::with_zeros(width, 1);
+        direct.get_mut(s + h + missing_isi)[0] = 1;
+        apply_cached_systematic_plan(source_symbols, &mut direct);
+
+        let cached = cached_single_repair_basis(source_symbols, missing_isi);
+        let expected_nonzero_cols = direct
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .filter_map(|(col, &coefficient)| (coefficient != 0).then_some(col))
+            .collect::<Vec<_>>();
+
+        assert_eq!(cached.coefficients.as_slice(), direct.as_bytes());
+        assert_eq!(
+            cached.nonzero_cols.as_ref(),
+            expected_nonzero_cols.as_slice()
+        );
+
+        let cached_again = cached_single_repair_basis(source_symbols, missing_isi);
+        assert!(std::sync::Arc::ptr_eq(&cached, &cached_again));
+    }
+
+    #[test]
+    fn scaled_coefficient_add_ignores_zero_source() {
+        let mut dest = 0x5a;
+
+        add_scaled_coefficient(&mut dest, 0, Octet::new(7));
+
+        assert_eq!(dest, 0x5a);
     }
 
     #[test]
