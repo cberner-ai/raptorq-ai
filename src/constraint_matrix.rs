@@ -36,8 +36,19 @@ pub fn generate_constraint_matrix_no_hdpc<M: BinaryMatrix>(
     fill_ldpc_rows(&mut matrix, k_prime);
     fill_encoded_rows(&mut matrix, s as usize, k_prime, encoded_isis);
     matrix.normalize_rows();
+    if encoded_isis_are_systematic(k_prime, encoded_isis) {
+        matrix.mark_systematic_source_block_symbols(k_prime);
+    }
 
     matrix
+}
+
+fn encoded_isis_are_systematic(k_prime: u32, encoded_isis: &[u32]) -> bool {
+    encoded_isis.len() == k_prime as usize
+        && encoded_isis
+            .iter()
+            .enumerate()
+            .all(|(expected, &isi)| isi == expected as u32)
 }
 
 fn fill_ldpc_rows<M: BinaryMatrix>(matrix: &mut M, k_prime: u32) {
@@ -322,6 +333,7 @@ mod tests {
 
     use super::*;
     use crate::base::intermediate_tuple;
+    use crate::sparse_matrix::SparseBinaryMatrix;
 
     fn octet_row_entries(matrix: &DenseOctetMatrix, row: usize) -> Vec<(usize, u8)> {
         (0..matrix.width())
@@ -415,5 +427,31 @@ mod tests {
         for row in 0..rows.height() {
             assert_eq!(rows.get(row, 17 + row), Octet::one());
         }
+    }
+
+    #[test]
+    fn systematic_constraint_matrix_is_tagged() {
+        let source_symbols = 10;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let indices = (0..k_prime).collect::<Vec<_>>();
+
+        let matrix =
+            generate_constraint_matrix_no_hdpc::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        assert_eq!(matrix.systematic_source_block_symbols(), Some(k_prime));
+    }
+
+    #[test]
+    fn non_systematic_constraint_matrix_is_not_tagged() {
+        let source_symbols = 10;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let indices = (1..k_prime)
+            .chain(core::iter::once(k_prime))
+            .collect::<Vec<_>>();
+
+        let matrix =
+            generate_constraint_matrix_no_hdpc::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        assert_eq!(matrix.systematic_source_block_symbols(), None);
     }
 }

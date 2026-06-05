@@ -18,6 +18,8 @@ pub struct SparseBinaryMatrix {
     width: usize,
     rows: Vec<Vec<usize>>,
     #[cfg_attr(feature = "serde_support", serde(skip, default))]
+    systematic_source_block_symbols: Option<u32>,
+    #[cfg_attr(feature = "serde_support", serde(skip, default))]
     rows_normalized: bool,
 }
 
@@ -47,6 +49,7 @@ impl BinaryMatrix for SparseBinaryMatrix {
         SparseBinaryMatrix {
             width,
             rows: vec![Vec::new(); height],
+            systematic_source_block_symbols: None,
             rows_normalized: true,
         }
     }
@@ -57,6 +60,14 @@ impl BinaryMatrix for SparseBinaryMatrix {
 
     fn width(&self) -> usize {
         self.width
+    }
+
+    fn systematic_source_block_symbols(&self) -> Option<u32> {
+        self.systematic_source_block_symbols
+    }
+
+    fn mark_systematic_source_block_symbols(&mut self, source_block_symbols: u32) {
+        self.systematic_source_block_symbols = Some(source_block_symbols);
     }
 
     fn get(&self, row: usize, col: usize) -> Octet {

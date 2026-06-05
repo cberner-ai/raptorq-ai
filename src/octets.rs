@@ -185,11 +185,18 @@ unsafe fn mulassign_scalar_avx2(dest: &mut [u8], scalar: u8) {
     let mut offset = 0usize;
     let vector_len = dest.len() / 32 * 32;
 
+    while offset + 128 <= vector_len {
+        unsafe {
+            mulassign_32(dest, offset, low_table, high_table, mask);
+            mulassign_32(dest, offset + 32, low_table, high_table, mask);
+            mulassign_32(dest, offset + 64, low_table, high_table, mask);
+            mulassign_32(dest, offset + 96, low_table, high_table, mask);
+        }
+        offset += 128;
+    }
     while offset < vector_len {
         unsafe {
-            let value = _mm256_loadu_si256(dest.as_ptr().add(offset).cast::<__m256i>());
-            let product = gf256_mul_vector(value, low_table, high_table, mask);
-            _mm256_storeu_si256(dest.as_mut_ptr().add(offset).cast::<__m256i>(), product);
+            mulassign_32(dest, offset, low_table, high_table, mask);
         }
         offset += 32;
     }
@@ -211,13 +218,18 @@ unsafe fn fused_addassign_mul_scalar_avx2(dest: &mut [u8], src: &[u8], scalar: u
     let mut offset = 0usize;
     let vector_len = src.len() / 32 * 32;
 
+    while offset + 128 <= vector_len {
+        unsafe {
+            fused_addassign_mul_32(dest, src, offset, low_table, high_table, mask);
+            fused_addassign_mul_32(dest, src, offset + 32, low_table, high_table, mask);
+            fused_addassign_mul_32(dest, src, offset + 64, low_table, high_table, mask);
+            fused_addassign_mul_32(dest, src, offset + 96, low_table, high_table, mask);
+        }
+        offset += 128;
+    }
     while offset < vector_len {
         unsafe {
-            let source = _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>());
-            let product = gf256_mul_vector(source, low_table, high_table, mask);
-            let current = _mm256_loadu_si256(dest.as_ptr().add(offset).cast::<__m256i>());
-            let next = _mm256_xor_si256(current, product);
-            _mm256_storeu_si256(dest.as_mut_ptr().add(offset).cast::<__m256i>(), next);
+            fused_addassign_mul_32(dest, src, offset, low_table, high_table, mask);
         }
         offset += 32;
     }
@@ -307,6 +319,43 @@ unsafe fn xor_32(dest: &mut [u8], src: &[u8], offset: usize) {
             _mm256_loadu_si256(src_ptr),
         );
         _mm256_storeu_si256(dest_ptr, updated);
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn mulassign_32(
+    dest: &mut [u8],
+    offset: usize,
+    low_table: __m256i,
+    high_table: __m256i,
+    mask: __m256i,
+) {
+    unsafe {
+        let dest_ptr = dest.as_mut_ptr().add(offset).cast::<__m256i>();
+        let value = _mm256_loadu_si256(dest_ptr.cast_const());
+        let product = gf256_mul_vector(value, low_table, high_table, mask);
+        _mm256_storeu_si256(dest_ptr, product);
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn fused_addassign_mul_32(
+    dest: &mut [u8],
+    src: &[u8],
+    offset: usize,
+    low_table: __m256i,
+    high_table: __m256i,
+    mask: __m256i,
+) {
+    unsafe {
+        let source = _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>());
+        let product = gf256_mul_vector(source, low_table, high_table, mask);
+        let dest_ptr = dest.as_mut_ptr().add(offset).cast::<__m256i>();
+        let current = _mm256_loadu_si256(dest_ptr.cast_const());
+        let next = _mm256_xor_si256(current, product);
+        _mm256_storeu_si256(dest_ptr, next);
     }
 }
 
