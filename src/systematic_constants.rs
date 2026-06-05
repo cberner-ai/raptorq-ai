@@ -1,3 +1,6 @@
+#[cfg(feature = "std")]
+use std::cell::Cell;
+
 type SystematicParameters = (u32, u32, u32, u32, u32);
 
 pub const MAX_SOURCE_SYMBOLS_PER_BLOCK: u32 = 56403;
@@ -497,6 +500,13 @@ const RFC_SYSTEMATIC_INDICES_AND_PARAMETERS: &[SystematicParameters] = &[
     (56403, 471, 907, 16, 56951),
 ];
 
+#[cfg(feature = "std")]
+thread_local! {
+    static LAST_SYSTEMATIC_PARAMETERS: Cell<Option<(u32, SystematicParameters)>> =
+        const { Cell::new(None) };
+    static LAST_P1: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+}
+
 const fn supported_systematic_parameter_count() -> usize {
     let mut len = 0usize;
     while len < RFC_SYSTEMATIC_INDICES_AND_PARAMETERS.len() {
@@ -511,6 +521,24 @@ const fn supported_systematic_parameter_count() -> usize {
 
 #[inline]
 fn parameters(source_symbols: u32) -> SystematicParameters {
+    #[cfg(feature = "std")]
+    if let Some(parameters) = LAST_SYSTEMATIC_PARAMETERS.with(|cached| match cached.get() {
+        Some((cached_source_symbols, parameters)) if cached_source_symbols == source_symbols => {
+            Some(parameters)
+        }
+        _ => None,
+    }) {
+        return parameters;
+    }
+
+    let parameters = parameters_uncached(source_symbols);
+    #[cfg(feature = "std")]
+    LAST_SYSTEMATIC_PARAMETERS.with(|cached| cached.set(Some((source_symbols, parameters))));
+    parameters
+}
+
+#[inline]
+fn parameters_uncached(source_symbols: u32) -> SystematicParameters {
     let index = RFC_SYSTEMATIC_INDICES_AND_PARAMETERS
         .partition_point(|&(k_prime, _, _, _, _)| k_prime < source_symbols);
     RFC_SYSTEMATIC_INDICES_AND_PARAMETERS
@@ -558,8 +586,19 @@ pub fn num_pi_symbols(source_symbols: u32) -> u32 {
 
 #[inline]
 pub fn calculate_p1(source_symbols: u32) -> u32 {
+    #[cfg(feature = "std")]
+    if let Some(p1) = LAST_P1.with(|cached| match cached.get() {
+        Some((cached_source_symbols, p1)) if cached_source_symbols == source_symbols => Some(p1),
+        _ => None,
+    }) {
+        return p1;
+    }
+
     let (k_prime, _, s, h, w) = parameters(source_symbols);
-    next_prime(k_prime + s + h - w)
+    let p1 = next_prime(k_prime + s + h - w);
+    #[cfg(feature = "std")]
+    LAST_P1.with(|cached| cached.set(Some((source_symbols, p1))));
+    p1
 }
 
 fn next_prime(mut value: u32) -> u32 {
