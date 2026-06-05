@@ -1050,6 +1050,10 @@ fn is_full_systematic_planning_matrix<M: BinaryMatrix>(
     source_block_symbols: u32,
 ) -> bool {
     let k_prime = extended_source_block_symbols(source_block_symbols);
+    if matrix.systematic_source_block_symbols() == Some(k_prime) {
+        return true;
+    }
+
     let s = num_ldpc_symbols(source_block_symbols);
     if matrix.height() != (s + k_prime) as usize {
         return false;

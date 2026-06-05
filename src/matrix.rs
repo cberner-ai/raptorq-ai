@@ -13,6 +13,10 @@ pub trait BinaryMatrix: Clone {
     fn new(height: usize, width: usize) -> Self;
     fn height(&self) -> usize;
     fn width(&self) -> usize;
+    fn systematic_source_block_symbols(&self) -> Option<u32> {
+        None
+    }
+    fn mark_systematic_source_block_symbols(&mut self, _source_block_symbols: u32) {}
     fn get(&self, row: usize, col: usize) -> Octet;
     fn set(&mut self, row: usize, col: usize, value: bool);
     fn reserve_row_entries(&mut self, _row: usize, _additional: usize) {}
