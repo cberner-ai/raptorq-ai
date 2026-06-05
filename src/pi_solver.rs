@@ -85,7 +85,7 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
         #[cfg(feature = "std")]
         {
             let source_block_symbols = extended_source_block_symbols(source_block_symbols);
-            cached_systematic_plan(source_block_symbols);
+            cached_systematic_plan_from_matrix(source_block_symbols, &matrix, &hdpc_rows);
             return (
                 None,
                 Some(vec![SymbolOps::ApplyCachedSystematicPlan {
@@ -250,6 +250,32 @@ fn cached_systematic_plan(source_block_symbols: u32) -> Arc<CachedSystematicPlan
     }
 
     let generated = Arc::new(generate_systematic_plan(source_block_symbols));
+    let cache = systematic_plan_cache();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    insert_systematic_plan(&mut guard, source_block_symbols, generated)
+}
+
+#[cfg(feature = "std")]
+fn cached_systematic_plan_from_matrix<M: BinaryMatrix>(
+    source_block_symbols: u32,
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+) -> Arc<CachedSystematicPlan> {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    {
+        let cache = systematic_plan_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(plan) = guard.plans.get(&source_block_symbols) {
+            return Arc::clone(plan);
+        }
+    }
+
+    let rows = coefficient_rows(matrix, hdpc_rows, source_block_symbols);
+    let generated = Arc::new(prepare_cached_systematic_plan(rows, matrix.width()));
     let cache = systematic_plan_cache();
     let mut guard = cache
         .lock()
@@ -2251,16 +2277,7 @@ mod tests {
 
     #[test]
     fn prepared_systematic_plan_matches_non_recording_solve() {
-        let rows = vec![
-            vec![(0, Octet::new(2)), (1, Octet::new(5)), (3, Octet::new(7))],
-            vec![(0, Octet::new(6)), (1, Octet::new(3)), (2, Octet::new(11))],
-            vec![(1, Octet::new(9)), (2, Octet::new(5)), (3, Octet::new(13))],
-            vec![(2, Octet::new(10)), (3, Octet::new(17))],
-        ];
-        let symbols = SymbolSlab::from_bytes(
-            vec![1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 7, 11, 19, 31],
-            4,
-        );
+        let (rows, symbols) = prepared_plan_test_system();
 
         let (expected, ops) = solve(rows.clone(), 4, symbols.clone(), OperationRecording::Skip);
         let plan = prepare_cached_systematic_plan(rows, 4);
@@ -2269,6 +2286,54 @@ mod tests {
 
         assert_eq!(replayed, expected.unwrap());
         assert!(ops.is_none());
+    }
+
+    fn prepared_plan_test_system() -> (Vec<CoefficientRow>, SymbolSlab) {
+        (
+            vec![
+                vec![(0, Octet::new(2)), (1, Octet::new(5)), (3, Octet::new(7))],
+                vec![(0, Octet::new(6)), (1, Octet::new(3)), (2, Octet::new(11))],
+                vec![(1, Octet::new(9)), (2, Octet::new(5)), (3, Octet::new(13))],
+                vec![(2, Octet::new(10)), (3, Octet::new(17))],
+            ],
+            SymbolSlab::from_bytes(
+                vec![1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 7, 11, 19, 31],
+                4,
+            ),
+        )
+    }
+
+    #[test]
+    fn large_plan_exercises_clone_free_elimination_and_batched_back_substitution() {
+        let width = CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH.max(BATCHED_BACK_SUBSTITUTION_MIN_WIDTH);
+        let mut rows = (0..width)
+            .map(|col| vec![(col, Octet::one())])
+            .collect::<Vec<_>>();
+        rows[0] = vec![(0, Octet::one()), (1, Octet::one())];
+        rows[1] = vec![(0, Octet::one()), (2, Octet::one())];
+
+        let mut symbol_bytes = (0..width)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect::<Vec<_>>();
+        symbol_bytes[0] = 0x11;
+        symbol_bytes[1] = 0x22;
+        symbol_bytes[2] = 0x44;
+        let symbols = SymbolSlab::from_bytes(symbol_bytes.clone(), 1);
+
+        let plan = prepare_cached_systematic_plan(rows, width);
+        assert!(matches!(
+            &plan.back_substitution,
+            CachedSystematicBackSubstitution::Batches(_)
+        ));
+
+        let mut replayed = symbols;
+        apply_prepared_systematic_plan(&plan, &mut replayed);
+
+        symbol_bytes[0] = 0x22 ^ 0x44;
+        symbol_bytes[1] = 0x11 ^ 0x22 ^ 0x44;
+        symbol_bytes[2] = 0x44;
+
+        assert_eq!(replayed.as_bytes(), symbol_bytes.as_slice());
     }
 
     #[test]
