@@ -22,6 +22,8 @@ pub struct SparseBinaryMatrix {
     #[cfg_attr(feature = "serde_support", serde(skip, default))]
     contiguous_single_repair_systematic_rows: Option<(u32, usize, usize, u32)>,
     #[cfg_attr(feature = "serde_support", serde(skip, default))]
+    systematic_row_isis: Option<Vec<Option<u32>>>,
+    #[cfg_attr(feature = "serde_support", serde(skip, default))]
     rows_normalized: bool,
 }
 
@@ -53,6 +55,7 @@ impl BinaryMatrix for SparseBinaryMatrix {
             rows: vec![Vec::new(); height],
             systematic_source_block_symbols: None,
             contiguous_single_repair_systematic_rows: None,
+            systematic_row_isis: None,
             rows_normalized: true,
         }
     }
@@ -90,6 +93,26 @@ impl BinaryMatrix for SparseBinaryMatrix {
             repair_matrix_row,
             repair_isi,
         ));
+    }
+
+    fn systematic_row_isis(&self) -> Option<&[Option<u32>]> {
+        self.systematic_row_isis.as_deref()
+    }
+
+    fn mark_encoded_systematic_isis(
+        &mut self,
+        row_offset: usize,
+        source_block_symbols: u32,
+        encoded_isis: &[u32],
+    ) {
+        assert!(row_offset + encoded_isis.len() <= self.rows.len());
+        let mut row_isis = vec![None; self.rows.len()];
+        for (offset, &isi) in encoded_isis.iter().enumerate() {
+            if isi < source_block_symbols {
+                row_isis[row_offset + offset] = Some(isi);
+            }
+        }
+        self.systematic_row_isis = Some(row_isis);
     }
 
     fn get(&self, row: usize, col: usize) -> Octet {

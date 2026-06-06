@@ -41,12 +41,15 @@ pub fn generate_constraint_matrix_no_hdpc<M: BinaryMatrix>(
     } else if let Some((missing_isi, repair_matrix_row, repair_isi)) =
         contiguous_single_repair_systematic_rows(k_prime, s as usize, encoded_isis)
     {
+        matrix.mark_encoded_systematic_isis(s as usize, k_prime, encoded_isis);
         matrix.mark_contiguous_single_repair_systematic_rows(
             k_prime,
             missing_isi,
             repair_matrix_row,
             repair_isi,
         );
+    } else {
+        matrix.mark_encoded_systematic_isis(s as usize, k_prime, encoded_isis);
     }
 
     matrix
