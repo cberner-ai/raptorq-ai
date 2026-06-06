@@ -44,6 +44,8 @@ const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 #[cfg(feature = "std")]
 const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = 8_192;
 #[cfg(feature = "std")]
+const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = 16_384;
+#[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
 const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
@@ -200,6 +202,24 @@ struct CachedSystematicForwardStep {
 enum CachedSystematicBackSubstitution {
     Rows(Vec<Box<[(usize, Octet)]>>),
     Batches(Vec<Box<[(usize, Octet)]>>),
+    FlatBatches(CachedSystematicSlices),
+}
+
+#[cfg(feature = "std")]
+struct CachedSystematicSlices {
+    ranges: Vec<(usize, usize)>,
+    entries: Vec<(usize, Octet)>,
+}
+
+#[cfg(feature = "std")]
+type CachedSystematicSliceParts = (Vec<(usize, usize)>, Vec<usize>, Vec<(usize, Octet)>, usize);
+
+#[cfg(feature = "std")]
+impl CachedSystematicSlices {
+    fn slice(&self, index: usize) -> &[(usize, Octet)] {
+        let (start, end) = self.ranges[index];
+        &self.entries[start..end]
+    }
 }
 
 #[cfg(feature = "std")]
@@ -537,6 +557,17 @@ fn apply_prepared_systematic_plan_to_basis_coefficients(
                 }
             }
         }
+        CachedSystematicBackSubstitution::FlatBatches(batches) => {
+            for src in (0..plan.width).rev() {
+                let src_value = coefficients[src];
+                if src_value == 0 {
+                    continue;
+                }
+                for &(dest, scalar) in batches.slice(src) {
+                    add_scaled_coefficient(&mut coefficients[dest], src_value, scalar);
+                }
+            }
+        }
     }
 
     coefficients
@@ -608,6 +639,14 @@ fn apply_back_substitution_to_final_coefficients(
         CachedSystematicBackSubstitution::Batches(batches) => {
             for src in 0..plan.width {
                 for &(dest, coefficient) in batches[src].iter().rev() {
+                    let dest_value = coefficients[dest];
+                    add_scaled_coefficient(&mut coefficients[src], dest_value, coefficient);
+                }
+            }
+        }
+        CachedSystematicBackSubstitution::FlatBatches(batches) => {
+            for src in 0..plan.width {
+                for &(dest, coefficient) in batches.slice(src).iter().rev() {
                     let dest_value = coefficients[dest];
                     add_scaled_coefficient(&mut coefficients[src], dest_value, coefficient);
                 }
@@ -724,7 +763,8 @@ fn prepare_cached_systematic_plan(
             None
         };
 
-        let mut dests = Vec::with_capacity(bucket_chain_len(&bucket_heads, &next_in_bucket, col));
+        let bucket_len = bucket_chain_len(&bucket_heads, &next_in_bucket, col);
+        let mut dests = Vec::with_capacity(bucket_len);
         if rows[pivot].len() == 1 {
             while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
                 debug_assert_ne!(row, pivot);
@@ -807,7 +847,13 @@ fn prepare_cached_systematic_plan(
         );
     }
 
-    let back_substitution = if width >= BATCHED_BACK_SUBSTITUTION_MIN_WIDTH {
+    let back_substitution = if width >= FLAT_BACK_SUBSTITUTION_MIN_WIDTH {
+        CachedSystematicBackSubstitution::FlatBatches(prepare_flat_back_substitution_batches(
+            &rows,
+            &pivot_for_col,
+            width,
+        ))
+    } else if width >= BATCHED_BACK_SUBSTITUTION_MIN_WIDTH {
         CachedSystematicBackSubstitution::Batches(prepare_back_substitution_batches(
             &rows,
             &pivot_for_col,
@@ -871,6 +917,66 @@ fn prepare_back_substitution_batches(
 }
 
 #[cfg(feature = "std")]
+fn prepare_flat_back_substitution_batches(
+    rows: &[CoefficientRow],
+    pivot_for_col: &[usize],
+    width: usize,
+) -> CachedSystematicSlices {
+    let mut counts = vec![0usize; width];
+    for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        for &(dependent_col, _) in rows[pivot].iter().rev() {
+            let dependent_col = coefficient_col_index(dependent_col);
+            if dependent_col <= col {
+                break;
+            }
+            counts[dependent_col] += 1;
+        }
+    }
+
+    let (ranges, mut offsets, mut entries, entries_len) = slices_from_counts(counts);
+    for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
+            let dependent_col = coefficient_col_index(dependent_col);
+            if dependent_col <= col {
+                break;
+            }
+            let offset = offsets[dependent_col];
+            debug_assert!(offset < entries_len);
+            // The first pass counted this slot, and each dependent column advances
+            // monotonically inside its assigned range.
+            unsafe {
+                entries.as_mut_ptr().add(offset).write((col, coefficient));
+            }
+            offsets[dependent_col] += 1;
+        }
+    }
+
+    for (offset, &(_, end)) in offsets.iter().zip(ranges.iter()) {
+        debug_assert_eq!(*offset, end);
+    }
+    // All counted slots were initialized by the second pass above.
+    unsafe {
+        entries.set_len(entries_len);
+    }
+
+    CachedSystematicSlices { ranges, entries }
+}
+
+#[cfg(feature = "std")]
+fn slices_from_counts(counts: Vec<usize>) -> CachedSystematicSliceParts {
+    let mut ranges = Vec::with_capacity(counts.len());
+    let mut next_start = 0usize;
+    for count in counts {
+        let start = next_start;
+        next_start += count;
+        ranges.push((start, next_start));
+    }
+    let offsets = ranges.iter().map(|&(start, _)| start).collect::<Vec<_>>();
+    let entries = Vec::with_capacity(next_start);
+    (ranges, offsets, entries, next_start)
+}
+
+#[cfg(feature = "std")]
 fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut SymbolSlab) {
     assert_eq!(symbols.len(), plan.width);
 
@@ -895,6 +1001,11 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
         CachedSystematicBackSubstitution::Batches(batches) => {
             for src in (0..plan.width).rev() {
                 fused_addassign_symbol_batch(symbols, src, &batches[src]);
+            }
+        }
+        CachedSystematicBackSubstitution::FlatBatches(batches) => {
+            for src in (0..plan.width).rev() {
+                fused_addassign_symbol_batch(symbols, src, batches.slice(src));
             }
         }
     }
@@ -1575,7 +1686,11 @@ fn classify_single_repair_systematic_rows<M: BinaryMatrix>(
             missing_isi,
             repair_matrix_row,
             repair_isi: None,
-            systematic_rows: SingleRepairSystematicRowLayout::Explicit(systematic_rows),
+            systematic_rows: if source_rows_contiguous {
+                SingleRepairSystematicRowLayout::Contiguous
+            } else {
+                SingleRepairSystematicRowLayout::Explicit(systematic_rows)
+            },
         },
     )
 }
@@ -1637,8 +1752,12 @@ fn classify_single_repair_systematic_rows_from_metadata<M: BinaryMatrix>(
         SingleRepairSystematicRows {
             missing_isi,
             repair_matrix_row,
-            systematic_rows,
-            source_rows_contiguous,
+            repair_isi: None,
+            systematic_rows: if source_rows_contiguous {
+                SingleRepairSystematicRowLayout::Contiguous
+            } else {
+                SingleRepairSystematicRowLayout::Explicit(systematic_rows)
+            },
         },
     )
 }
@@ -1669,8 +1788,8 @@ fn classify_contiguous_single_repair_from_metadata(
     Some(SingleRepairSystematicRows {
         missing_isi: missing_isi.unwrap_or(k_prime - 1),
         repair_matrix_row: s + k_prime - 1,
-        systematic_rows: Vec::new(),
-        source_rows_contiguous: true,
+        repair_isi: None,
+        systematic_rows: SingleRepairSystematicRowLayout::Contiguous,
     })
 }
 
@@ -2773,6 +2892,7 @@ mod tests {
         assert!(matches!(
             &plan.back_substitution,
             CachedSystematicBackSubstitution::Batches(_)
+                | CachedSystematicBackSubstitution::FlatBatches(_)
         ));
 
         let mut replayed = symbols;
@@ -3120,8 +3240,10 @@ mod tests {
 
         assert_eq!(rows.missing_isi, 2);
         assert_eq!(rows.repair_matrix_row, s + k_prime - 1);
-        assert!(rows.systematic_rows.is_empty());
-        assert!(rows.source_rows_contiguous);
+        assert!(matches!(
+            rows.systematic_rows,
+            SingleRepairSystematicRowLayout::Contiguous
+        ));
     }
 
     #[test]
