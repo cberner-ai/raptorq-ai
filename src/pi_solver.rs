@@ -987,8 +987,7 @@ fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bo
     let mut check = vec![0u8; decoded.symbol_size()];
     for row in 0..hdpc_rows.height() {
         check.fill(0);
-        for col in 0..hdpc_rows.width() {
-            let coefficient = hdpc_rows.get(row, col);
+        for (col, &coefficient) in hdpc_rows.row(row).iter().enumerate() {
             if !coefficient.is_zero() {
                 fused_addassign_mul_scalar(&mut check, decoded.get(col), &coefficient);
             }
@@ -1160,14 +1159,7 @@ fn binary_decoded_solution(
 }
 
 fn dense_hdpc_coefficients(matrix: &DenseOctetMatrix) -> Vec<Octet> {
-    let mut coefficients = vec![Octet::zero(); matrix.height() * matrix.width()];
-    for row in 0..matrix.height() {
-        let row_start = row * matrix.width();
-        for col in 0..matrix.width() {
-            coefficients[row_start + col] = matrix.get(row, col);
-        }
-    }
-    coefficients
+    matrix.as_slice().to_vec()
 }
 
 fn solve_hdpc_free_variables_dense(

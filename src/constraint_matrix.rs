@@ -351,10 +351,11 @@ fn generate_hdpc_rows_uncached(k_prime: u32) -> DenseOctetMatrix {
 
     for row in 0..h {
         let mut acc = Octet::zero();
+        let output_row = rows.row_mut(row as usize);
         for col in (0..gamma_width).rev() {
             acc = acc * Octet::new(2) + mt[row as usize * gamma_width as usize + col as usize];
             if !acc.is_zero() {
-                rows.set(row as usize, col as usize, acc);
+                output_row[col as usize] = acc;
             }
         }
     }
