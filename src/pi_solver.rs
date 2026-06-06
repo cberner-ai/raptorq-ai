@@ -45,6 +45,8 @@ const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
+#[cfg(feature = "std")]
+const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 
@@ -207,6 +209,35 @@ fn systematic_plan_cache() -> &'static SystematicPlanCacheLock {
     CACHE.get_or_init(|| Mutex::new(SystematicPlanCache::default()))
 }
 
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct RepairSourceCoefficientsKey {
+    source_block_symbols: u32,
+    repair_isi: u32,
+}
+
+#[cfg(feature = "std")]
+struct CachedRepairSourceCoefficients {
+    source_coefficients: Box<[u8]>,
+    nonzero_sources: Box<[(usize, Octet)]>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct RepairSourceCoefficientsCache {
+    coefficients: HashMap<RepairSourceCoefficientsKey, Arc<CachedRepairSourceCoefficients>>,
+    insertion_order: VecDeque<RepairSourceCoefficientsKey>,
+}
+
+#[cfg(feature = "std")]
+type RepairSourceCoefficientsCacheLock = Mutex<RepairSourceCoefficientsCache>;
+
+#[cfg(feature = "std")]
+fn repair_source_coefficients_cache() -> &'static RepairSourceCoefficientsCacheLock {
+    static CACHE: OnceLock<RepairSourceCoefficientsCacheLock> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(RepairSourceCoefficientsCache::default()))
+}
+
 #[cfg(all(test, feature = "std"))]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct SingleRepairBasisKey {
@@ -303,6 +334,64 @@ fn insert_systematic_plan(
     cache
         .plans
         .insert(source_block_symbols, Arc::clone(&generated));
+    generated
+}
+
+#[cfg(feature = "std")]
+fn cached_repair_source_coefficients(
+    source_block_symbols: u32,
+    repair_isi: u32,
+    plan: &CachedSystematicPlan,
+    s: usize,
+    h: usize,
+) -> Arc<CachedRepairSourceCoefficients> {
+    let key = RepairSourceCoefficientsKey {
+        source_block_symbols,
+        repair_isi,
+    };
+    {
+        let cache = repair_source_coefficients_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(coefficients) = guard.coefficients.get(&key) {
+            return Arc::clone(coefficients);
+        }
+    }
+
+    let repair_entries = systematic_constraint_row_entries(source_block_symbols, repair_isi);
+    let generated = Arc::new(generate_repair_source_coefficients(
+        plan,
+        &repair_entries,
+        s,
+        h,
+        source_block_symbols as usize,
+    ));
+    let cache = repair_source_coefficients_cache();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    insert_repair_source_coefficients(&mut guard, key, generated)
+}
+
+#[cfg(feature = "std")]
+fn insert_repair_source_coefficients(
+    cache: &mut RepairSourceCoefficientsCache,
+    key: RepairSourceCoefficientsKey,
+    generated: Arc<CachedRepairSourceCoefficients>,
+) -> Arc<CachedRepairSourceCoefficients> {
+    if let Some(coefficients) = cache.coefficients.get(&key) {
+        return Arc::clone(coefficients);
+    }
+
+    if cache.coefficients.len() >= REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY
+        && let Some(evicted_key) = cache.insertion_order.pop_front()
+    {
+        cache.coefficients.remove(&evicted_key);
+    }
+
+    cache.insertion_order.push_back(key);
+    cache.coefficients.insert(key, Arc::clone(&generated));
     generated
 }
 
@@ -451,6 +540,32 @@ fn repair_source_coefficients_for_entries(
     move_final_coefficients_to_pivot_rows(&mut coefficients, &plan.pivot_symbol_cycles);
     apply_forward_steps_to_final_coefficients(plan, &mut coefficients);
     coefficients
+}
+
+#[cfg(feature = "std")]
+fn generate_repair_source_coefficients(
+    plan: &CachedSystematicPlan,
+    repair_entries: &[usize],
+    s: usize,
+    h: usize,
+    source_block_symbols: usize,
+) -> CachedRepairSourceCoefficients {
+    let coefficients = repair_source_coefficients_for_entries(plan, repair_entries);
+    let source_coefficients = (0..source_block_symbols)
+        .map(|isi| coefficients[s + h + isi])
+        .collect::<Vec<_>>();
+    let nonzero_sources = source_coefficients
+        .iter()
+        .enumerate()
+        .filter_map(|(isi, &coefficient)| {
+            (coefficient != 0).then_some((isi, Octet::new(coefficient)))
+        })
+        .collect::<Vec<_>>();
+
+    CachedRepairSourceCoefficients {
+        source_coefficients: source_coefficients.into_boxed_slice(),
+        nonzero_sources: nonzero_sources.into_boxed_slice(),
+    }
 }
 
 #[cfg(feature = "std")]
@@ -1168,10 +1283,17 @@ fn matrix_row_matches_systematic<M: BinaryMatrix>(
 }
 
 #[cfg(feature = "std")]
+enum SingleRepairSystematicRowLayout {
+    Contiguous,
+    Explicit(Vec<(usize, usize)>),
+}
+
+#[cfg(feature = "std")]
 struct SingleRepairSystematicRows {
     missing_isi: usize,
     repair_matrix_row: usize,
-    systematic_rows: Vec<(usize, usize)>,
+    repair_isi: Option<u32>,
+    systematic_rows: SingleRepairSystematicRowLayout,
 }
 
 #[cfg(feature = "std")]
@@ -1193,37 +1315,66 @@ fn try_single_repair_systematic_decode<M: BinaryMatrix>(
         return None;
     }
 
-    let rows = classify_single_repair_systematic_rows(matrix, source_block_symbols, s, k_prime)?;
+    let rows = tagged_single_repair_systematic_rows(matrix, k_prime).or_else(|| {
+        classify_single_repair_systematic_rows(matrix, source_block_symbols, s, k_prime)
+    })?;
     if rows.missing_isi >= source_block_symbols as usize {
         return None;
     }
 
     let symbol_size = symbols.symbol_size();
     let plan = cached_systematic_plan(k_prime as u32);
-    let repair_entries = matrix.row_entries(rows.repair_matrix_row);
-    if repair_entries.is_empty() {
-        return None;
-    }
-    let repair_coefficients = repair_source_coefficients_for_entries(&plan, &repair_entries);
-    let missing_coefficient = Octet::new(repair_coefficients[s + h + rows.missing_isi]);
+    let repair_coefficients = if let Some(repair_isi) = rows.repair_isi {
+        cached_repair_source_coefficients(source_block_symbols, repair_isi, &plan, s, h)
+    } else {
+        let repair_entries = matrix.row_entries(rows.repair_matrix_row);
+        if repair_entries.is_empty() {
+            return None;
+        }
+        Arc::new(generate_repair_source_coefficients(
+            &plan,
+            &repair_entries,
+            s,
+            h,
+            source_block_symbols as usize,
+        ))
+    };
+    let missing_coefficient = Octet::new(repair_coefficients.source_coefficients[rows.missing_isi]);
     if missing_coefficient.is_zero() {
         return None;
     }
 
     let mut missing_symbol = symbols.get(rows.repair_matrix_row + h).to_vec();
-    for &(isi, matrix_row) in &rows.systematic_rows {
-        if isi >= source_block_symbols as usize {
-            continue;
+    match &rows.systematic_rows {
+        SingleRepairSystematicRowLayout::Contiguous => {
+            for &(isi, coefficient) in repair_coefficients.nonzero_sources.iter() {
+                if isi == rows.missing_isi {
+                    continue;
+                }
+                let matrix_row = s + if isi < rows.missing_isi { isi } else { isi - 1 };
+                fused_addassign_mul_scalar(
+                    &mut missing_symbol,
+                    symbols.get(matrix_row + h),
+                    &coefficient,
+                );
+            }
         }
-        let coefficient = Octet::new(repair_coefficients[s + h + isi]);
-        if coefficient.is_zero() {
-            continue;
+        SingleRepairSystematicRowLayout::Explicit(systematic_rows) => {
+            for &(isi, matrix_row) in systematic_rows {
+                if isi >= source_block_symbols as usize {
+                    continue;
+                }
+                let coefficient = Octet::new(repair_coefficients.source_coefficients[isi]);
+                if coefficient.is_zero() {
+                    continue;
+                }
+                fused_addassign_mul_scalar(
+                    &mut missing_symbol,
+                    symbols.get(matrix_row + h),
+                    &coefficient,
+                );
+            }
         }
-        fused_addassign_mul_scalar(
-            &mut missing_symbol,
-            symbols.get(matrix_row + h),
-            &coefficient,
-        );
     }
 
     mulassign_scalar(&mut missing_symbol, &missing_coefficient.inverse());
@@ -1239,6 +1390,28 @@ fn try_single_repair_systematic_decode<M: BinaryMatrix>(
         .copy_from_slice(&missing_symbol);
 
     Some(decoded)
+}
+
+#[cfg(feature = "std")]
+fn tagged_single_repair_systematic_rows<M: BinaryMatrix>(
+    matrix: &M,
+    k_prime: usize,
+) -> Option<SingleRepairSystematicRows> {
+    let (tagged_k_prime, missing_isi, repair_matrix_row, repair_isi) =
+        matrix.contiguous_single_repair_systematic_rows()?;
+    if tagged_k_prime != k_prime as u32
+        || missing_isi >= k_prime
+        || repair_matrix_row >= matrix.height()
+    {
+        return None;
+    }
+
+    Some(SingleRepairSystematicRows {
+        missing_isi,
+        repair_matrix_row,
+        repair_isi: Some(repair_isi),
+        systematic_rows: SingleRepairSystematicRowLayout::Contiguous,
+    })
 }
 
 #[cfg(feature = "std")]
@@ -1289,7 +1462,8 @@ fn classify_single_repair_systematic_rows<M: BinaryMatrix>(
         SingleRepairSystematicRows {
             missing_isi,
             repair_matrix_row,
-            systematic_rows,
+            repair_isi: None,
+            systematic_rows: SingleRepairSystematicRowLayout::Explicit(systematic_rows),
         },
     )
 }

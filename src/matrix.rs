@@ -17,6 +17,17 @@ pub trait BinaryMatrix: Clone {
         None
     }
     fn mark_systematic_source_block_symbols(&mut self, _source_block_symbols: u32) {}
+    fn contiguous_single_repair_systematic_rows(&self) -> Option<(u32, usize, usize, u32)> {
+        None
+    }
+    fn mark_contiguous_single_repair_systematic_rows(
+        &mut self,
+        _source_block_symbols: u32,
+        _missing_isi: usize,
+        _repair_matrix_row: usize,
+        _repair_isi: u32,
+    ) {
+    }
     fn get(&self, row: usize, col: usize) -> Octet;
     fn set(&mut self, row: usize, col: usize, value: bool);
     fn reserve_row_entries(&mut self, _row: usize, _additional: usize) {}

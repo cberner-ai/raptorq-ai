@@ -38,6 +38,15 @@ pub fn generate_constraint_matrix_no_hdpc<M: BinaryMatrix>(
     matrix.normalize_rows();
     if encoded_isis_are_systematic(k_prime, encoded_isis) {
         matrix.mark_systematic_source_block_symbols(k_prime);
+    } else if let Some((missing_isi, repair_matrix_row, repair_isi)) =
+        contiguous_single_repair_systematic_rows(k_prime, s as usize, encoded_isis)
+    {
+        matrix.mark_contiguous_single_repair_systematic_rows(
+            k_prime,
+            missing_isi,
+            repair_matrix_row,
+            repair_isi,
+        );
     }
 
     matrix
@@ -49,6 +58,43 @@ fn encoded_isis_are_systematic(k_prime: u32, encoded_isis: &[u32]) -> bool {
             .iter()
             .enumerate()
             .all(|(expected, &isi)| isi == expected as u32)
+}
+
+fn contiguous_single_repair_systematic_rows(
+    k_prime: u32,
+    row_offset: usize,
+    encoded_isis: &[u32],
+) -> Option<(usize, usize, u32)> {
+    let k_prime = k_prime as usize;
+    if encoded_isis.len() != k_prime {
+        return None;
+    }
+
+    let (&repair_isi, systematic_isis) = encoded_isis.split_last()?;
+    if repair_isi < k_prime as u32 {
+        return None;
+    }
+
+    let mut expected_isi = 0usize;
+    let mut missing_isi = None;
+    for &isi in systematic_isis {
+        let isi = isi as usize;
+        if isi == expected_isi {
+            expected_isi += 1;
+        } else if missing_isi.is_none() && isi == expected_isi + 1 && isi < k_prime {
+            missing_isi = Some(expected_isi);
+            expected_isi += 2;
+        } else {
+            return None;
+        }
+    }
+
+    if missing_isi.is_none() {
+        missing_isi = Some(expected_isi);
+        expected_isi += 1;
+    }
+
+    (expected_isi == k_prime).then_some((missing_isi?, row_offset + k_prime - 1, repair_isi))
 }
 
 fn fill_ldpc_rows<M: BinaryMatrix>(matrix: &mut M, k_prime: u32) {
@@ -439,6 +485,31 @@ mod tests {
             generate_constraint_matrix_no_hdpc::<SparseBinaryMatrix>(source_symbols, &indices);
 
         assert_eq!(matrix.systematic_source_block_symbols(), Some(k_prime));
+    }
+
+    #[test]
+    fn contiguous_single_repair_systematic_matrix_is_tagged() {
+        let source_symbols = 10;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let missing_isi = 3;
+        let repair_isi = k_prime + 2;
+        let indices = (0..k_prime)
+            .filter(|&isi| isi != missing_isi)
+            .chain(core::iter::once(repair_isi))
+            .collect::<Vec<_>>();
+
+        let matrix =
+            generate_constraint_matrix_no_hdpc::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        assert_eq!(
+            matrix.contiguous_single_repair_systematic_rows(),
+            Some((
+                k_prime,
+                missing_isi as usize,
+                num_ldpc_symbols(source_symbols) as usize + k_prime as usize - 1,
+                repair_isi,
+            ))
+        );
     }
 
     #[test]
