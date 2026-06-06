@@ -28,6 +28,16 @@ pub trait BinaryMatrix: Clone {
         _repair_isi: u32,
     ) {
     }
+    fn systematic_row_isis(&self) -> Option<&[Option<u32>]> {
+        None
+    }
+    fn mark_encoded_systematic_isis(
+        &mut self,
+        _row_offset: usize,
+        _source_block_symbols: u32,
+        _encoded_isis: &[u32],
+    ) {
+    }
     fn get(&self, row: usize, col: usize) -> Octet;
     fn set(&mut self, row: usize, col: usize, value: bool);
     fn reserve_row_entries(&mut self, _row: usize, _additional: usize) {}

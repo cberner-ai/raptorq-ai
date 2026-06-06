@@ -1527,6 +1527,10 @@ fn classify_single_repair_systematic_rows<M: BinaryMatrix>(
     s: usize,
     k_prime: usize,
 ) -> Option<SingleRepairSystematicRows> {
+    if let Some(rows) = classify_single_repair_systematic_rows_from_metadata(matrix, s, k_prime) {
+        return Some(rows);
+    }
+
     let mut systematic_rows = Vec::with_capacity(k_prime.saturating_sub(1));
     let mut expected_isi = 0usize;
     let mut missing_isi = None;
@@ -1574,6 +1578,100 @@ fn classify_single_repair_systematic_rows<M: BinaryMatrix>(
             systematic_rows: SingleRepairSystematicRowLayout::Explicit(systematic_rows),
         },
     )
+}
+
+#[cfg(feature = "std")]
+fn classify_single_repair_systematic_rows_from_metadata<M: BinaryMatrix>(
+    matrix: &M,
+    s: usize,
+    k_prime: usize,
+) -> Option<SingleRepairSystematicRows> {
+    let row_isis = matrix.systematic_row_isis()?;
+    if row_isis.len() != matrix.height() || matrix.height() < s + k_prime {
+        return None;
+    }
+    if let Some(rows) = classify_contiguous_single_repair_from_metadata(row_isis, s, k_prime) {
+        return Some(rows);
+    }
+
+    let mut systematic_rows = Vec::with_capacity(k_prime.saturating_sub(1));
+    let mut expected_isi = 0usize;
+    let mut missing_isi = None;
+    let mut repair_matrix_row = None;
+
+    for offset in 0..k_prime {
+        let row = s + offset;
+        match row_isis[row].map(|isi| isi as usize) {
+            Some(isi) if isi == expected_isi => {
+                systematic_rows.push((isi, row));
+                expected_isi += 1;
+            }
+            Some(isi)
+                if missing_isi.is_none()
+                    && expected_isi + 1 < k_prime
+                    && isi == expected_isi + 1 =>
+            {
+                missing_isi = Some(expected_isi);
+                systematic_rows.push((isi, row));
+                expected_isi += 2;
+            }
+            None => {
+                if repair_matrix_row.is_some() {
+                    return None;
+                }
+                if missing_isi.is_none() {
+                    missing_isi = Some(expected_isi);
+                    expected_isi += 1;
+                }
+                repair_matrix_row = Some(row);
+            }
+            Some(_) => return None,
+        }
+    }
+
+    let missing_isi = missing_isi?;
+    let repair_matrix_row = repair_matrix_row?;
+    let source_rows_contiguous =
+        repair_matrix_row == s + k_prime - 1 && systematic_rows.len() + 1 == k_prime;
+    (expected_isi == k_prime && systematic_rows.len() + 1 == k_prime).then_some(
+        SingleRepairSystematicRows {
+            missing_isi,
+            repair_matrix_row,
+            systematic_rows,
+            source_rows_contiguous,
+        },
+    )
+}
+
+#[cfg(feature = "std")]
+fn classify_contiguous_single_repair_from_metadata(
+    row_isis: &[Option<u32>],
+    s: usize,
+    k_prime: usize,
+) -> Option<SingleRepairSystematicRows> {
+    if k_prime == 0 || row_isis[s + k_prime - 1].is_some() {
+        return None;
+    }
+
+    let mut missing_isi = None;
+    for offset in 0..k_prime.saturating_sub(1) {
+        let isi = row_isis[s + offset]? as usize;
+        match missing_isi {
+            None if isi == offset => {}
+            None if isi == offset + 1 && offset + 1 < k_prime => {
+                missing_isi = Some(offset);
+            }
+            Some(_) if isi == offset + 1 => {}
+            _ => return None,
+        }
+    }
+
+    Some(SingleRepairSystematicRows {
+        missing_isi: missing_isi.unwrap_or(k_prime - 1),
+        repair_matrix_row: s + k_prime - 1,
+        systematic_rows: Vec::new(),
+        source_rows_contiguous: true,
+    })
 }
 
 fn solve(
@@ -2971,6 +3069,59 @@ mod tests {
             rows.set(col, col);
         }
         rows
+    }
+
+    #[derive(Clone)]
+    struct SystematicMetadataOnlyMatrix {
+        height: usize,
+        width: usize,
+        row_isis: Vec<Option<u32>>,
+    }
+
+    impl BinaryMatrix for SystematicMetadataOnlyMatrix {
+        fn new(_height: usize, _width: usize) -> SystematicMetadataOnlyMatrix {
+            unimplemented!("test fixture supplies systematic row metadata directly")
+        }
+
+        fn height(&self) -> usize {
+            self.height
+        }
+
+        fn width(&self) -> usize {
+            self.width
+        }
+
+        fn systematic_row_isis(&self) -> Option<&[Option<u32>]> {
+            Some(&self.row_isis)
+        }
+
+        fn get(&self, _row: usize, _col: usize) -> Octet {
+            Octet::zero()
+        }
+
+        fn set(&mut self, _row: usize, _col: usize, _value: bool) {
+            unimplemented!("test fixture is read-only")
+        }
+    }
+
+    #[test]
+    fn single_repair_classifier_uses_systematic_row_metadata() {
+        let s = 3;
+        let k_prime = 5;
+        let row_isis = vec![None, None, None, Some(0), Some(1), Some(3), Some(4), None];
+        let matrix = SystematicMetadataOnlyMatrix {
+            height: s + k_prime,
+            width: 12,
+            row_isis,
+        };
+
+        let rows = classify_single_repair_systematic_rows(&matrix, k_prime as u32, s, k_prime)
+            .expect("metadata should classify one missing systematic row");
+
+        assert_eq!(rows.missing_isi, 2);
+        assert_eq!(rows.repair_matrix_row, s + k_prime - 1);
+        assert!(rows.systematic_rows.is_empty());
+        assert!(rows.source_rows_contiguous);
     }
 
     #[test]
