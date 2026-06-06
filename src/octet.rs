@@ -27,12 +27,7 @@ impl Octet {
     }
 
     pub fn alpha_pow(power: usize) -> Octet {
-        let mut result = Octet::one();
-        let alpha = Octet::new(2);
-        for _ in 0..(power % 255) {
-            result *= alpha;
-        }
-        result
+        GF_ALPHA_POW_TABLE[power % GF_ALPHA_POW_TABLE.len()]
     }
 
     pub fn inverse(self) -> Octet {
@@ -64,6 +59,7 @@ impl Octet {
 
 static GF_MUL_TABLE: [[u8; 256]; 256] = generate_gf_mul_table();
 static GF_INV_TABLE: [u8; 256] = generate_gf_inv_table();
+static GF_ALPHA_POW_TABLE: [Octet; 255] = generate_gf_alpha_pow_table();
 
 const fn generate_gf_mul_table() -> [[u8; 256]; 256] {
     let mut table = [[0u8; 256]; 256];
@@ -85,6 +81,16 @@ const fn generate_gf_inv_table() -> [u8; 256] {
     while value < 256 {
         table[value] = gf_pow_slow(value as u8, 254);
         value += 1;
+    }
+    table
+}
+
+const fn generate_gf_alpha_pow_table() -> [Octet; 255] {
+    let mut table = [Octet::one(); 255];
+    let mut power = 1usize;
+    while power < 255 {
+        table[power] = Octet::new(gf_mul_slow(table[power - 1].value, 2));
+        power += 1;
     }
     table
 }
@@ -226,5 +232,18 @@ mod tests {
             let octet = Octet::new(value);
             assert_eq!(octet * octet.inverse(), Octet::one());
         }
+    }
+
+    #[test]
+    fn alpha_pow_table_matches_repeated_multiply_and_wraps() {
+        let alpha = Octet::new(2);
+        let mut expected = Octet::one();
+        for power in 0..255 {
+            assert_eq!(Octet::alpha_pow(power), expected);
+            expected *= alpha;
+        }
+
+        assert_eq!(Octet::alpha_pow(255), Octet::one());
+        assert_eq!(Octet::alpha_pow(256), alpha);
     }
 }
