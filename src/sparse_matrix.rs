@@ -218,6 +218,15 @@ impl BinaryMatrix for SparseBinaryMatrix {
         }
         entries
     }
+
+    fn into_row_entries(mut self) -> Vec<Vec<usize>> {
+        if !self.rows_normalized {
+            for row in &mut self.rows {
+                row.sort_unstable();
+            }
+        }
+        self.rows
+    }
 }
 
 #[cfg(test)]
