@@ -56,6 +56,17 @@ pub trait BinaryMatrix: Clone {
         self.visit_row_entries(row, |col| entries.push(col));
         entries
     }
+
+    fn into_row_entries(self) -> Vec<Vec<usize>>
+    where
+        Self: Sized,
+    {
+        let mut rows = Vec::with_capacity(self.height());
+        for row in 0..self.height() {
+            rows.push(self.row_entries(row));
+        }
+        rows
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

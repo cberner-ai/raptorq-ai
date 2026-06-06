@@ -28,7 +28,7 @@ use crate::systematic_constants::{
     num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
 };
 
-type CoefficientRow = Vec<(usize, Octet)>;
+type CoefficientRow = Vec<(u32, Octet)>;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
@@ -49,6 +49,15 @@ const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
+
+fn coefficient_col(col: usize) -> u32 {
+    debug_assert!(u32::try_from(col).is_ok());
+    col as u32
+}
+
+fn coefficient_col_index(col: u32) -> usize {
+    col as usize
+}
 
 // Systematic planning matrices feed SourceBlockEncodingPlan, which replays concrete row
 // operations. Recording must therefore stay independent of matrix width and feature set.
@@ -87,7 +96,7 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
         #[cfg(feature = "std")]
         {
             let source_block_symbols = extended_source_block_symbols(source_block_symbols);
-            cached_systematic_plan_from_matrix(source_block_symbols, &matrix, &hdpc_rows);
+            cached_systematic_plan_from_matrix(source_block_symbols, matrix, &hdpc_rows);
             return (
                 None,
                 Some(vec![SymbolOps::ApplyCachedSystematicPlan {
@@ -291,7 +300,7 @@ fn cached_systematic_plan(source_block_symbols: u32) -> Arc<CachedSystematicPlan
 #[cfg(feature = "std")]
 fn cached_systematic_plan_from_matrix<M: BinaryMatrix>(
     source_block_symbols: u32,
-    matrix: &M,
+    matrix: M,
     hdpc_rows: &DenseOctetMatrix,
 ) -> Arc<CachedSystematicPlan> {
     let source_block_symbols = extended_source_block_symbols(source_block_symbols);
@@ -305,8 +314,15 @@ fn cached_systematic_plan_from_matrix<M: BinaryMatrix>(
         }
     }
 
-    let rows = coefficient_rows(matrix, hdpc_rows, source_block_symbols);
-    let generated = Arc::new(prepare_cached_systematic_plan(rows, matrix.width()));
+    let width = matrix.width();
+    let matrix_height = matrix.height();
+    let rows = coefficient_rows_from_binary_entries(
+        matrix.into_row_entries(),
+        matrix_height,
+        hdpc_rows,
+        source_block_symbols,
+    );
+    let generated = Arc::new(prepare_cached_systematic_plan(rows, width));
     let cache = systematic_plan_cache();
     let mut guard = cache
         .lock()
@@ -680,7 +696,12 @@ fn prepare_cached_systematic_plan(
     let mut next_in_bucket = vec![None; height];
     for (row, coefficients) in rows.iter().enumerate() {
         if let Some(&(col, _)) = coefficients.first() {
-            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            push_row_bucket(
+                &mut bucket_heads,
+                &mut next_in_bucket,
+                coefficient_col_index(col),
+                row,
+            );
         }
     }
 
@@ -703,8 +724,25 @@ fn prepare_cached_systematic_plan(
             None
         };
 
-        let mut dests = Vec::new();
-        if width >= CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH {
+        let mut dests = Vec::with_capacity(bucket_chain_len(&bucket_heads, &next_in_bucket, col));
+        if rows[pivot].len() == 1 {
+            while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+                debug_assert_ne!(row, pivot);
+                let factor = rows[row][0].1;
+                rows[row].remove(0);
+                dests.push((row, factor));
+
+                if let Some(&(next_col, _)) = rows[row].first() {
+                    debug_assert!(coefficient_col_index(next_col) > col);
+                    push_row_bucket(
+                        &mut bucket_heads,
+                        &mut next_in_bucket,
+                        coefficient_col_index(next_col),
+                        row,
+                    );
+                }
+            }
+        } else if width >= CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH {
             while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
                 debug_assert_ne!(row, pivot);
                 let factor = rows[row][0].1;
@@ -720,8 +758,13 @@ fn prepare_cached_systematic_plan(
                 dests.push((row, factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
-                    debug_assert!(next_col > col);
-                    push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                    debug_assert!(coefficient_col_index(next_col) > col);
+                    push_row_bucket(
+                        &mut bucket_heads,
+                        &mut next_in_bucket,
+                        coefficient_col_index(next_col),
+                        row,
+                    );
                 }
             }
         } else {
@@ -739,8 +782,13 @@ fn prepare_cached_systematic_plan(
                 dests.push((row, factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
-                    debug_assert!(next_col > col);
-                    push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                    debug_assert!(coefficient_col_index(next_col) > col);
+                    push_row_bucket(
+                        &mut bucket_heads,
+                        &mut next_in_bucket,
+                        coefficient_col_index(next_col),
+                        row,
+                    );
                 }
             }
         }
@@ -770,10 +818,10 @@ fn prepare_cached_systematic_plan(
         for (col, &pivot) in pivot_for_col.iter().enumerate() {
             let mut dependencies = Vec::new();
             for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
-                if dependent_col <= col {
+                if coefficient_col_index(dependent_col) <= col {
                     break;
                 }
-                dependencies.push((dependent_col, coefficient));
+                dependencies.push((coefficient_col_index(dependent_col), coefficient));
             }
             rows_by_dest.push(dependencies.into_boxed_slice());
         }
@@ -797,6 +845,7 @@ fn prepare_back_substitution_batches(
     let mut counts = vec![0usize; width];
     for (col, &pivot) in pivot_for_col.iter().enumerate() {
         for &(dependent_col, _) in rows[pivot].iter().rev() {
+            let dependent_col = coefficient_col_index(dependent_col);
             if dependent_col <= col {
                 break;
             }
@@ -810,6 +859,7 @@ fn prepare_back_substitution_batches(
         .collect::<Vec<_>>();
     for (col, &pivot) in pivot_for_col.iter().enumerate() {
         for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
+            let dependent_col = coefficient_col_index(dependent_col);
             if dependent_col <= col {
                 break;
             }
@@ -944,6 +994,45 @@ fn coefficient_rows<M: BinaryMatrix>(
     }
 
     rows
+}
+
+fn coefficient_rows_from_binary_entries(
+    binary_entries: Vec<Vec<usize>>,
+    matrix_height: usize,
+    hdpc_rows: &DenseOctetMatrix,
+    source_block_symbols: u32,
+) -> Vec<CoefficientRow> {
+    let s = num_ldpc_symbols(source_block_symbols) as usize;
+    assert_eq!(binary_entries.len(), matrix_height);
+    assert!(matrix_height >= s);
+
+    let total_rows = matrix_height + hdpc_rows.height();
+    let mut rows = vec![Vec::new(); total_rows];
+    let mut binary_entries = binary_entries.into_iter();
+    for row in 0..s {
+        let entries = binary_entries
+            .next()
+            .expect("LDPC row entries must be present");
+        rows[row] = coefficient_row_from_binary_entries(entries);
+    }
+    for row in 0..hdpc_rows.height() {
+        let dest = s + row;
+        rows[dest] = copy_octet_row(hdpc_rows, row);
+    }
+    for (offset, entries) in binary_entries.enumerate() {
+        let row = s + offset;
+        let dest = row + hdpc_rows.height();
+        rows[dest] = coefficient_row_from_binary_entries(entries);
+    }
+
+    rows
+}
+
+fn coefficient_row_from_binary_entries(entries: Vec<usize>) -> CoefficientRow {
+    entries
+        .into_iter()
+        .map(|col| (coefficient_col(col), Octet::one()))
+        .collect()
 }
 
 fn coefficient_rows_with_hdpc_last<M: BinaryMatrix>(
@@ -1227,7 +1316,7 @@ fn solve_hdpc_free_variables_dense(
             if free_index == usize::MAX {
                 return None;
             }
-            free_row.push((free_index, value));
+            free_row.push((coefficient_col(free_index), value));
         }
         free_rows.push(free_row);
     }
@@ -1237,7 +1326,7 @@ fn solve_hdpc_free_variables_dense(
 
 fn copy_binary_row<M: BinaryMatrix>(matrix: &M, row: usize) -> CoefficientRow {
     let mut result = Vec::new();
-    matrix.visit_row_entries(row, |col| result.push((col, Octet::one())));
+    matrix.visit_row_entries(row, |col| result.push((coefficient_col(col), Octet::one())));
     result
 }
 
@@ -1246,7 +1335,7 @@ fn copy_octet_row(matrix: &DenseOctetMatrix, row: usize) -> CoefficientRow {
     for col in 0..matrix.width() {
         let value = matrix.get(row, col);
         if !value.is_zero() {
-            result.push((col, value));
+            result.push((coefficient_col(col), value));
         }
     }
     result
@@ -1475,6 +1564,8 @@ fn classify_single_repair_systematic_rows<M: BinaryMatrix>(
 
     let missing_isi = missing_isi?;
     let repair_matrix_row = repair_matrix_row?;
+    let source_rows_contiguous =
+        repair_matrix_row == s + k_prime - 1 && systematic_rows.len() + 1 == k_prime;
     (expected_isi == k_prime && systematic_rows.len() + 1 == k_prime).then_some(
         SingleRepairSystematicRows {
             missing_isi,
@@ -1665,6 +1756,7 @@ fn solve_recording_triangular(
     let mut back_substitution_batches = vec![Vec::new(); width];
     for dest in 0..width {
         for &(dependent_col, coefficient) in rows[dest].iter().rev() {
+            let dependent_col = coefficient_col_index(dependent_col);
             if dependent_col <= dest {
                 break;
             }
@@ -1747,7 +1839,12 @@ fn solve_without_recording_bucketed(
     let mut next_in_bucket = vec![None; height];
     for (row, coefficients) in rows.iter().enumerate() {
         if let Some(&(col, _)) = coefficients.first() {
-            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            push_row_bucket(
+                &mut bucket_heads,
+                &mut next_in_bucket,
+                coefficient_col_index(col),
+                row,
+            );
         }
     }
     let mut pivot_for_col = vec![None; width];
@@ -1774,7 +1871,7 @@ fn solve_without_recording_bucketed(
             debug_assert_ne!(row, pivot);
             debug_assert_eq!(
                 rows[row].first().map(|&(entry_col, _)| entry_col),
-                Some(col)
+                Some(coefficient_col(col))
             );
             let factor = rows[row][0].1;
             add_scaled_matrix_row(
@@ -1788,8 +1885,13 @@ fn solve_without_recording_bucketed(
             fused_addassign_mul_scalar(dest_symbol, pivot_symbol, &factor);
 
             if let Some(&(next_col, _)) = rows[row].first() {
-                debug_assert!(next_col > col);
-                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                debug_assert!(coefficient_col_index(next_col) > col);
+                push_row_bucket(
+                    &mut bucket_heads,
+                    &mut next_in_bucket,
+                    coefficient_col_index(next_col),
+                    row,
+                );
             }
         }
     }
@@ -1807,6 +1909,7 @@ fn solve_without_recording_bucketed(
         let pivot = pivot_for_col[col].expect("pivot was recorded for every decoded column");
         decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
         for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
+            let dependent_col = coefficient_col_index(dependent_col);
             if dependent_col <= col {
                 break;
             }
@@ -1875,6 +1978,7 @@ fn solve_without_recording_scan(
     for row in (0..width).rev() {
         decoded.get_mut(row).copy_from_slice(symbols.get(row));
         for &(col, coefficient) in rows[row].iter().rev() {
+            let col = coefficient_col_index(col);
             if col <= row {
                 break;
             }
@@ -1925,6 +2029,7 @@ fn select_pivot_row(
 }
 
 fn pivot_value_and_suffix_len(row: &CoefficientRow, col: usize) -> Option<(Octet, usize)> {
+    let col = coefficient_col(col);
     if let Some(&(entry_col, value)) = row.first() {
         if entry_col == col {
             return Some((value, row.len()));
@@ -2025,6 +2130,20 @@ fn pop_row_bucket(
     Some(row)
 }
 
+fn bucket_chain_len(
+    bucket_heads: &[Option<usize>],
+    next_in_bucket: &[Option<usize>],
+    col: usize,
+) -> usize {
+    let mut len = 0usize;
+    let mut current = bucket_heads[col];
+    while let Some(row) = current {
+        len += 1;
+        current = next_in_bucket[row];
+    }
+    len
+}
+
 fn pop_lightest_coefficient_row_bucket(
     rows: &[CoefficientRow],
     bucket_heads: &mut [Option<usize>],
@@ -2034,7 +2153,7 @@ fn pop_lightest_coefficient_row_bucket(
     let head = bucket_heads[col]?;
     debug_assert_eq!(
         rows[head].first().map(|&(entry_col, _)| entry_col),
-        Some(col)
+        Some(coefficient_col(col))
     );
     if next_in_bucket[head].is_none() {
         bucket_heads[col] = None;
@@ -2051,7 +2170,7 @@ fn pop_lightest_coefficient_row_bucket(
     while let Some(row) = current {
         debug_assert_eq!(
             rows[row].first().map(|&(entry_col, _)| entry_col),
-            Some(col)
+            Some(coefficient_col(col))
         );
         let value = rows[row][0].1;
         let suffix_len = rows[row].len();
@@ -2127,6 +2246,7 @@ fn symbol_is_zero(symbol: &[u8]) -> bool {
 }
 
 fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {
+    let col = coefficient_col(col);
     let Some(&(first_col, first_value)) = row.first() else {
         return Octet::zero();
     };
@@ -2143,6 +2263,7 @@ fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {
 }
 
 fn scale_matrix_row(row: &mut CoefficientRow, start_col: usize, scalar: Octet) {
+    let start_col = coefficient_col(start_col);
     for (col, value) in row.iter_mut() {
         if *col >= start_col {
             *value *= scalar;
@@ -2165,6 +2286,7 @@ fn add_scaled_binary_matrix_row(
     while dest_index < dest.len() || src_index < src_cols.len() {
         match (dest.get(dest_index), src_cols.get(src_index)) {
             (Some(&(dest_col, dest_value)), Some(&src_col)) => {
+                let src_col = coefficient_col(src_col);
                 if dest_col < src_col {
                     scratch.push((dest_col, dest_value));
                     dest_index += 1;
@@ -2185,7 +2307,7 @@ fn add_scaled_binary_matrix_row(
                 dest_index += 1;
             }
             (None, Some(&src_col)) => {
-                scratch.push((src_col, scalar));
+                scratch.push((coefficient_col(src_col), scalar));
                 src_index += 1;
             }
             (None, None) => break,
@@ -2208,6 +2330,7 @@ fn add_scaled_matrix_row(
     }
 
     let mut dest_index = 0usize;
+    let start_col = coefficient_col(start_col);
     let mut src_index = if src.first().is_some_and(|&(col, _)| col >= start_col) {
         0
     } else {
@@ -2271,6 +2394,7 @@ fn add_unscaled_matrix_row(
     scratch: &mut CoefficientRow,
 ) {
     let mut dest_index = 0usize;
+    let start_col = coefficient_col(start_col);
     let mut src_index = if src.first().is_some_and(|&(col, _)| col >= start_col) {
         0
     } else {
@@ -2398,8 +2522,10 @@ mod recording_tests {
 
     #[test]
     fn operation_recording_solver_records_for_supported_width() {
-        let width = 64;
-        let rows: Vec<CoefficientRow> = (0..width).map(|col| vec![(col, Octet::one())]).collect();
+        let width = 64usize;
+        let rows: Vec<CoefficientRow> = (0..width)
+            .map(|col| vec![(coefficient_col(col), Octet::one())])
+            .collect();
         let symbols = SymbolSlab::with_zeros(width, 1);
 
         let (decoded, ops) = solve(rows, width, symbols, OperationRecording::Record);
@@ -2411,8 +2537,9 @@ mod recording_tests {
     #[test]
     fn triangular_recording_solves_and_replays_wide_system() {
         let width = TRIANGULAR_RECORDING_MIN_WIDTH;
-        let mut rows: Vec<CoefficientRow> =
-            (0..width).map(|col| vec![(col, Octet::one())]).collect();
+        let mut rows: Vec<CoefficientRow> = (0..width)
+            .map(|col| vec![(coefficient_col(col), Octet::one())])
+            .collect();
         rows[0] = vec![(0, Octet::one()), (1, Octet::new(3)), (7, Octet::new(11))];
         rows[1] = vec![(0, Octet::one()), (1, Octet::new(2)), (2, Octet::new(5))];
 
@@ -2424,7 +2551,7 @@ mod recording_tests {
             .map(|row| {
                 row.iter()
                     .fold(Octet::zero(), |acc, &(col, value)| {
-                        acc + value * expected[col]
+                        acc + value * expected[coefficient_col_index(col)]
                     })
                     .value()
             })
@@ -2530,8 +2657,8 @@ mod tests {
     #[test]
     fn large_plan_exercises_clone_free_elimination_and_batched_back_substitution() {
         let width = CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH.max(BATCHED_BACK_SUBSTITUTION_MIN_WIDTH);
-        let mut rows = (0..width)
-            .map(|col| vec![(col, Octet::one())])
+        let mut rows: Vec<CoefficientRow> = (0..width)
+            .map(|col| vec![(coefficient_col(col), Octet::one())])
             .collect::<Vec<_>>();
         rows[0] = vec![(0, Octet::one()), (1, Octet::one())];
         rows[1] = vec![(0, Octet::one()), (2, Octet::one())];
@@ -2581,7 +2708,7 @@ mod tests {
         let src_cols = vec![0, 2, 5, 8];
         let src_row = src_cols
             .iter()
-            .map(|&col| (col, Octet::one()))
+            .map(|&col| (coefficient_col(col), Octet::one()))
             .collect::<Vec<_>>();
 
         for scalar in [Octet::one(), Octet::new(7)] {
@@ -2618,7 +2745,7 @@ mod tests {
         rows.push(vec![(0, one), (1, one), (2, one)]);
         rows.push(vec![(1, Octet::new(7))]);
         for col in 3..width {
-            rows.push(vec![(col, one)]);
+            rows.push(vec![(coefficient_col(col), one)]);
         }
         rows.push(vec![(0, one), (2, one)]);
 
