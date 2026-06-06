@@ -20,6 +20,8 @@ pub struct SparseBinaryMatrix {
     #[cfg_attr(feature = "serde_support", serde(skip, default))]
     systematic_source_block_symbols: Option<u32>,
     #[cfg_attr(feature = "serde_support", serde(skip, default))]
+    contiguous_single_repair_systematic_rows: Option<(u32, usize, usize, u32)>,
+    #[cfg_attr(feature = "serde_support", serde(skip, default))]
     rows_normalized: bool,
 }
 
@@ -50,6 +52,7 @@ impl BinaryMatrix for SparseBinaryMatrix {
             width,
             rows: vec![Vec::new(); height],
             systematic_source_block_symbols: None,
+            contiguous_single_repair_systematic_rows: None,
             rows_normalized: true,
         }
     }
@@ -68,6 +71,25 @@ impl BinaryMatrix for SparseBinaryMatrix {
 
     fn mark_systematic_source_block_symbols(&mut self, source_block_symbols: u32) {
         self.systematic_source_block_symbols = Some(source_block_symbols);
+    }
+
+    fn contiguous_single_repair_systematic_rows(&self) -> Option<(u32, usize, usize, u32)> {
+        self.contiguous_single_repair_systematic_rows
+    }
+
+    fn mark_contiguous_single_repair_systematic_rows(
+        &mut self,
+        source_block_symbols: u32,
+        missing_isi: usize,
+        repair_matrix_row: usize,
+        repair_isi: u32,
+    ) {
+        self.contiguous_single_repair_systematic_rows = Some((
+            source_block_symbols,
+            missing_isi,
+            repair_matrix_row,
+            repair_isi,
+        ));
     }
 
     fn get(&self, row: usize, col: usize) -> Octet {
