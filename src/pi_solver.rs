@@ -25,7 +25,7 @@ use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::num_ldpc_symbols;
 use crate::systematic_constants::{
     MAX_SUPPORTED_INTERMEDIATE_SYMBOLS, calculate_p1, extended_source_block_symbols,
-    num_hdpc_symbols, num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
+    num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
 };
 
 type CoefficientRow = Vec<(usize, Octet)>;
@@ -45,7 +45,7 @@ const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 
 // Systematic planning matrices feed SourceBlockEncodingPlan, which replays concrete row
@@ -207,30 +207,30 @@ fn systematic_plan_cache() -> &'static SystematicPlanCacheLock {
     CACHE.get_or_init(|| Mutex::new(SystematicPlanCache::default()))
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct SingleRepairBasisKey {
     source_block_symbols: u32,
     missing_isi: usize,
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 struct CachedSingleRepairBasis {
     coefficients: Vec<u8>,
     nonzero_cols: Box<[usize]>,
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 #[derive(Default)]
 struct SingleRepairBasisCache {
     bases: HashMap<SingleRepairBasisKey, Arc<CachedSingleRepairBasis>>,
     insertion_order: VecDeque<SingleRepairBasisKey>,
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 type SingleRepairBasisCacheLock = Mutex<SingleRepairBasisCache>;
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 fn single_repair_basis_cache() -> &'static SingleRepairBasisCacheLock {
     static CACHE: OnceLock<SingleRepairBasisCacheLock> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(SingleRepairBasisCache::default()))
@@ -306,7 +306,7 @@ fn insert_systematic_plan(
     generated
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 fn cached_single_repair_basis(
     source_block_symbols: u32,
     missing_isi: usize,
@@ -337,7 +337,7 @@ fn cached_single_repair_basis(
     insert_single_repair_basis(&mut guard, key, generated)
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 fn insert_single_repair_basis(
     cache: &mut SingleRepairBasisCache,
     key: SingleRepairBasisKey,
@@ -358,7 +358,7 @@ fn insert_single_repair_basis(
     generated
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 fn generate_single_repair_basis(
     source_block_symbols: u32,
     missing_isi: usize,
@@ -366,7 +366,7 @@ fn generate_single_repair_basis(
     let source_block_symbols = extended_source_block_symbols(source_block_symbols);
     let width = num_intermediate_symbols(source_block_symbols) as usize;
     let s = num_ldpc_symbols(source_block_symbols) as usize;
-    let h = num_hdpc_symbols(source_block_symbols) as usize;
+    let h = crate::systematic_constants::num_hdpc_symbols(source_block_symbols) as usize;
     assert!(missing_isi < source_block_symbols as usize);
 
     let plan = cached_systematic_plan(source_block_symbols);
@@ -387,7 +387,7 @@ fn generate_single_repair_basis(
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 fn apply_prepared_systematic_plan_to_basis_coefficients(
     plan: &CachedSystematicPlan,
     source_col: usize,
@@ -438,6 +438,81 @@ fn apply_prepared_systematic_plan_to_basis_coefficients(
 }
 
 #[cfg(feature = "std")]
+fn repair_source_coefficients_for_entries(
+    plan: &CachedSystematicPlan,
+    repair_entries: &[usize],
+) -> Vec<u8> {
+    let mut coefficients = vec![0u8; plan.width];
+    for &col in repair_entries {
+        coefficients[col] ^= 1;
+    }
+
+    apply_back_substitution_to_final_coefficients(plan, &mut coefficients);
+    move_final_coefficients_to_pivot_rows(&mut coefficients, &plan.pivot_symbol_cycles);
+    apply_forward_steps_to_final_coefficients(plan, &mut coefficients);
+    coefficients
+}
+
+#[cfg(feature = "std")]
+fn apply_back_substitution_to_final_coefficients(
+    plan: &CachedSystematicPlan,
+    coefficients: &mut [u8],
+) {
+    match &plan.back_substitution {
+        CachedSystematicBackSubstitution::Rows(rows) => {
+            for col in 0..plan.width {
+                let dest_value = coefficients[col];
+                if dest_value == 0 {
+                    continue;
+                }
+                for &(dependent_col, coefficient) in rows[col].iter().rev() {
+                    add_scaled_coefficient(
+                        &mut coefficients[dependent_col],
+                        dest_value,
+                        coefficient,
+                    );
+                }
+            }
+        }
+        CachedSystematicBackSubstitution::Batches(batches) => {
+            for src in 0..plan.width {
+                for &(dest, coefficient) in batches[src].iter().rev() {
+                    let dest_value = coefficients[dest];
+                    add_scaled_coefficient(&mut coefficients[src], dest_value, coefficient);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+fn move_final_coefficients_to_pivot_rows(coefficients: &mut [u8], cycles: &[Box<[usize]>]) {
+    for cycle in cycles {
+        let first = coefficients[cycle[0]];
+        for index in 0..cycle.len() - 1 {
+            coefficients[cycle[index]] = coefficients[cycle[index + 1]];
+        }
+        coefficients[*cycle.last().expect("cycle is non-empty")] = first;
+    }
+}
+
+#[cfg(feature = "std")]
+fn apply_forward_steps_to_final_coefficients(plan: &CachedSystematicPlan, coefficients: &mut [u8]) {
+    for step in plan.forward_steps.iter().rev() {
+        for &(dest, scalar) in step.dests.iter().rev() {
+            let dest_value = coefficients[dest];
+            add_scaled_coefficient(&mut coefficients[step.pivot], dest_value, scalar);
+        }
+        if let Some(scale) = step.scale {
+            let pivot_value = coefficients[step.pivot];
+            if pivot_value != 0 {
+                coefficients[step.pivot] = (Octet::new(pivot_value) * scale).value();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
 fn add_scaled_coefficient(dest: &mut u8, src: u8, scalar: Octet) {
     if src == 0 {
         return;
@@ -449,7 +524,7 @@ fn add_scaled_coefficient(dest: &mut u8, src: u8, scalar: Octet) {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 fn move_pivot_coefficients_to_columns(coefficients: &mut [u8], cycles: &[Box<[usize]>]) {
     for cycle in cycles {
         let mut scratch = coefficients[cycle[0]];
@@ -1124,93 +1199,46 @@ fn try_single_repair_systematic_decode<M: BinaryMatrix>(
     }
 
     let symbol_size = symbols.symbol_size();
-    let mut systematic_symbols = SymbolSlab::with_zeros(width, symbol_size);
-    copy_single_repair_systematic_symbols(&mut systematic_symbols, symbols, &rows, s, h, k_prime);
-
     let plan = cached_systematic_plan(k_prime as u32);
-    apply_prepared_systematic_plan(&plan, &mut systematic_symbols);
-
-    let missing_basis = cached_single_repair_basis(source_block_symbols, rows.missing_isi);
-
     let repair_entries = matrix.row_entries(rows.repair_matrix_row);
     if repair_entries.is_empty() {
         return None;
     }
-
-    let mut predicted_repair = vec![0u8; symbol_size];
-    let mut repair_coefficient = Octet::zero();
-    for col in repair_entries {
-        add_assign(&mut predicted_repair, systematic_symbols.get(col));
-        repair_coefficient += Octet::new(missing_basis.coefficients[col]);
-    }
-    if repair_coefficient.is_zero() {
+    let repair_coefficients = repair_source_coefficients_for_entries(&plan, &repair_entries);
+    let missing_coefficient = Octet::new(repair_coefficients[s + h + rows.missing_isi]);
+    if missing_coefficient.is_zero() {
         return None;
     }
 
     let mut missing_symbol = symbols.get(rows.repair_matrix_row + h).to_vec();
-    add_assign(&mut missing_symbol, &predicted_repair);
-    mulassign_scalar(&mut missing_symbol, &repair_coefficient.inverse());
-
-    for &col in missing_basis.nonzero_cols.iter() {
-        let coefficient = Octet::new(missing_basis.coefficients[col]);
+    for &(isi, matrix_row) in &rows.systematic_rows {
+        if isi >= source_block_symbols as usize {
+            continue;
+        }
+        let coefficient = Octet::new(repair_coefficients[s + h + isi]);
+        if coefficient.is_zero() {
+            continue;
+        }
         fused_addassign_mul_scalar(
-            systematic_symbols.get_mut(col),
-            &missing_symbol,
+            &mut missing_symbol,
+            symbols.get(matrix_row + h),
             &coefficient,
         );
     }
 
-    Some(systematic_symbols)
-}
+    mulassign_scalar(&mut missing_symbol, &missing_coefficient.inverse());
 
-#[cfg(feature = "std")]
-fn copy_single_repair_systematic_symbols(
-    dest: &mut SymbolSlab,
-    symbols: &SymbolSlab,
-    rows: &SingleRepairSystematicRows,
-    s: usize,
-    h: usize,
-    k_prime: usize,
-) {
-    if single_repair_rows_are_contiguous(rows, s, k_prime) {
-        let symbol_size = symbols.symbol_size();
-        let encoded_start = s + h;
+    let missing_entries =
+        systematic_constraint_row_entries(source_block_symbols, rows.missing_isi as u32);
+    let &missing_entry = missing_entries.first()?;
+    let mut decoded = SymbolSlab::with_zeros(width, symbol_size);
+    // SourceBlockDecoder copies received source rows directly, so the one-erasure
+    // fast path only has to provide the entry that rebuilds the missing source.
+    decoded
+        .get_mut(missing_entry)
+        .copy_from_slice(&missing_symbol);
 
-        let before_missing_bytes = rows.missing_isi * symbol_size;
-        if before_missing_bytes != 0 {
-            let source_start = encoded_start * symbol_size;
-            dest.copy_block_from(
-                encoded_start,
-                &symbols.as_bytes()[source_start..source_start + before_missing_bytes],
-            );
-        }
-
-        let after_missing_symbols = k_prime - rows.missing_isi - 1;
-        if after_missing_symbols != 0 {
-            let source_symbol = encoded_start + rows.missing_isi;
-            let source_start = source_symbol * symbol_size;
-            let byte_len = after_missing_symbols * symbol_size;
-            dest.copy_block_from(
-                encoded_start + rows.missing_isi + 1,
-                &symbols.as_bytes()[source_start..source_start + byte_len],
-            );
-        }
-        return;
-    }
-
-    for &(isi, matrix_row) in &rows.systematic_rows {
-        dest.get_mut(s + h + isi)
-            .copy_from_slice(symbols.get(matrix_row + h));
-    }
-}
-
-#[cfg(feature = "std")]
-fn single_repair_rows_are_contiguous(
-    rows: &SingleRepairSystematicRows,
-    s: usize,
-    k_prime: usize,
-) -> bool {
-    rows.repair_matrix_row == s + k_prime - 1 && rows.systematic_rows.len() + 1 == k_prime
+    Some(decoded)
 }
 
 #[cfg(feature = "std")]
@@ -2234,6 +2262,7 @@ mod tests {
     use crate::constraint_matrix::generate_constraint_matrix;
     use crate::matrix::{BinaryMatrix, DenseBinaryMatrix};
     use crate::sparse_matrix::SparseBinaryMatrix;
+    use crate::systematic_constants::num_hdpc_symbols;
 
     #[test]
     fn large_non_planning_matrix_uses_non_recording_solver_without_ops() {
@@ -2772,6 +2801,53 @@ mod tests {
     }
 
     #[test]
+    fn repair_source_coefficients_match_direct_basis_projection() {
+        let source_symbols = 10;
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        let repair_isi = extended_source_block_symbols(source_symbols);
+        let plan = cached_systematic_plan(source_symbols);
+        let repair_entries = systematic_constraint_row_entries(source_symbols, repair_isi);
+
+        let coefficients = repair_source_coefficients_for_entries(&plan, &repair_entries);
+
+        for source_col in 0..width {
+            let basis = apply_prepared_systematic_plan_to_basis_coefficients(&plan, source_col);
+            let expected = repair_entries
+                .iter()
+                .fold(0u8, |acc, &col| acc ^ basis[col]);
+            assert_eq!(
+                coefficients[source_col], expected,
+                "source_col {source_col}"
+            );
+        }
+    }
+
+    #[test]
+    fn repair_source_coefficients_handle_batched_back_substitution() {
+        let plan = CachedSystematicPlan {
+            forward_steps: Vec::new(),
+            pivot_symbol_cycles: Vec::new(),
+            back_substitution: CachedSystematicBackSubstitution::Batches(vec![
+                Vec::new().into_boxed_slice(),
+                vec![(0, Octet::new(7))].into_boxed_slice(),
+                vec![(1, Octet::new(3)), (0, Octet::new(5))].into_boxed_slice(),
+            ]),
+            width: 3,
+        };
+
+        let coefficients = repair_source_coefficients_for_entries(&plan, &[0]);
+
+        assert_eq!(
+            coefficients,
+            vec![
+                1,
+                7,
+                (Octet::new(5) + Octet::new(7) * Octet::new(3)).value()
+            ]
+        );
+    }
+
+    #[test]
     fn scaled_coefficient_add_ignores_zero_source() {
         let mut dest = 0x5a;
 
@@ -2788,7 +2864,7 @@ mod tests {
         let s = num_ldpc_symbols(source_symbols) as usize;
         let h = width - s - k_prime as usize;
         let symbol_size = 3;
-        let missing_isi = 3;
+        let missing_isi = 3usize;
         let repair_isi = k_prime;
 
         let mut full_d = SymbolSlab::with_zeros(width, symbol_size);
@@ -2803,7 +2879,7 @@ mod tests {
         apply_cached_systematic_plan(source_symbols, &mut expected_intermediate);
 
         let encoded_isis = (0..k_prime)
-            .filter(|&isi| isi != missing_isi)
+            .filter(|&isi| isi != missing_isi as u32)
             .chain(core::iter::once(repair_isi))
             .collect::<Vec<_>>();
         let (matrix, hdpc_rows) =
@@ -2833,12 +2909,34 @@ mod tests {
             &decode_symbols,
             source_symbols,
         );
-        assert_eq!(fast_decoded.as_ref(), Some(&expected_intermediate));
+        let fast_decoded = fast_decoded.unwrap();
+        assert_eq!(
+            rebuilt_source_symbol(&fast_decoded, source_symbols, missing_isi),
+            full_d.get(s + h + missing_isi)
+        );
 
         let (decoded, ops) =
             fused_inverse_mul_symbols(matrix, hdpc_rows, decode_symbols, source_symbols);
-        assert_eq!(decoded, Some(expected_intermediate));
+        let decoded = decoded.unwrap();
+        assert_eq!(
+            rebuilt_source_symbol(&decoded, source_symbols, missing_isi),
+            full_d.get(s + h + missing_isi)
+        );
         assert!(ops.is_none());
+    }
+
+    fn rebuilt_source_symbol(
+        intermediate_symbols: &SymbolSlab,
+        source_symbols: u32,
+        source_isi: usize,
+    ) -> Vec<u8> {
+        let mut rebuilt = vec![0u8; intermediate_symbols.symbol_size()];
+        let entries = systematic_constraint_row_entries(source_symbols, source_isi as u32);
+        rebuilt.copy_from_slice(intermediate_symbols.get(entries[0]));
+        for &col in &entries[1..] {
+            add_assign(&mut rebuilt, intermediate_symbols.get(col));
+        }
+        rebuilt
     }
 
     #[test]

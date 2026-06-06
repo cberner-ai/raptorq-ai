@@ -18,6 +18,9 @@ pub fn mulassign_scalar(dest: &mut [u8], scalar: &Octet) {
     if scalar.is_zero() {
         dest.fill(0);
     } else if *scalar != Octet::one() {
+        if bytes_are_zero(dest) {
+            return;
+        }
         if try_mulassign_scalar_avx2(dest, scalar) {
             return;
         }
@@ -453,6 +456,15 @@ mod tests {
                 assert_eq!(data, expected);
             }
         }
+    }
+
+    #[test]
+    fn mulassign_scalar_keeps_zero_symbol_zero() {
+        let mut data = vec![0u8; 129];
+
+        mulassign_scalar(&mut data, &Octet::new(7));
+
+        assert_eq!(data, vec![0u8; 129]);
     }
 
     #[test]
