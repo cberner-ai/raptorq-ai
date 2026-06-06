@@ -42,7 +42,7 @@ const SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 1;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 #[cfg(feature = "std")]
-const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = 16_384;
+const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = 8_192;
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
@@ -760,18 +760,11 @@ fn prepare_cached_systematic_plan(
     }
 
     let back_substitution = if width >= BATCHED_BACK_SUBSTITUTION_MIN_WIDTH {
-        let mut batches = vec![Vec::new(); width];
-        for (col, &pivot) in pivot_for_col.iter().enumerate() {
-            for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
-                if dependent_col <= col {
-                    break;
-                }
-                batches[dependent_col].push((col, coefficient));
-            }
-        }
-        CachedSystematicBackSubstitution::Batches(
-            batches.into_iter().map(Vec::into_boxed_slice).collect(),
-        )
+        CachedSystematicBackSubstitution::Batches(prepare_back_substitution_batches(
+            &rows,
+            &pivot_for_col,
+            width,
+        ))
     } else {
         let mut rows_by_dest = Vec::with_capacity(width);
         for (col, &pivot) in pivot_for_col.iter().enumerate() {
@@ -793,6 +786,38 @@ fn prepare_cached_systematic_plan(
         back_substitution,
         width,
     }
+}
+
+#[cfg(feature = "std")]
+fn prepare_back_substitution_batches(
+    rows: &[CoefficientRow],
+    pivot_for_col: &[usize],
+    width: usize,
+) -> Vec<Box<[(usize, Octet)]>> {
+    let mut counts = vec![0usize; width];
+    for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        for &(dependent_col, _) in rows[pivot].iter().rev() {
+            if dependent_col <= col {
+                break;
+            }
+            counts[dependent_col] += 1;
+        }
+    }
+
+    let mut batches = counts
+        .into_iter()
+        .map(Vec::with_capacity)
+        .collect::<Vec<_>>();
+    for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
+            if dependent_col <= col {
+                break;
+            }
+            batches[dependent_col].push((col, coefficient));
+        }
+    }
+
+    batches.into_iter().map(Vec::into_boxed_slice).collect()
 }
 
 #[cfg(feature = "std")]
