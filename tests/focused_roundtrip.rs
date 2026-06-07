@@ -145,6 +145,23 @@ fn large_source_block_encoding_plan_generation_does_not_panic() {
     let _plan = SourceBlockEncodingPlan::generate(5_000);
 }
 
+#[test]
+fn large_mixed_one_repair_round_trip() {
+    let symbol_count = 4_096;
+    let data = deterministic_data(symbol_count);
+    let config = ObjectTransmissionInformation::new(0, SYMBOL_SIZE, 0, 1, 1);
+    let plan = SourceBlockEncodingPlan::generate(symbol_count as u16);
+    let encoder = SourceBlockEncoder::with_encoding_plan(0, &config, &data, &plan);
+    let mut packets = encoder.source_packets();
+    packets.pop();
+    packets.push(encoder.repair_packets(0, 1).remove(0));
+
+    let mut decoder = SourceBlockDecoder::new(0, &config, data.len() as u64);
+    let result = decoder.decode(packets);
+
+    assert_eq!(result, Some(data));
+}
+
 #[cfg(not(feature = "std"))]
 #[test]
 fn large_zero_no_std_source_block_encoder_does_not_panic() {
