@@ -598,16 +598,15 @@ fn generate_repair_source_coefficients(
     source_block_symbols: usize,
 ) -> CachedRepairSourceCoefficients {
     let coefficients = repair_source_coefficients_for_entries(plan, repair_entries);
-    let source_coefficients = (0..source_block_symbols)
-        .map(|isi| coefficients[s + h + isi])
-        .collect::<Vec<_>>();
-    let nonzero_sources = source_coefficients
-        .iter()
-        .enumerate()
-        .filter_map(|(isi, &coefficient)| {
-            (coefficient != 0).then_some((isi, Octet::new(coefficient)))
-        })
-        .collect::<Vec<_>>();
+    let mut source_coefficients = Vec::with_capacity(source_block_symbols);
+    let mut nonzero_sources = Vec::new();
+    for isi in 0..source_block_symbols {
+        let coefficient = coefficients[s + h + isi];
+        source_coefficients.push(coefficient);
+        if coefficient != 0 {
+            nonzero_sources.push((isi, Octet::new(coefficient)));
+        }
+    }
 
     CachedRepairSourceCoefficients {
         source_coefficients: source_coefficients.into_boxed_slice(),
@@ -640,7 +639,9 @@ fn apply_back_substitution_to_final_coefficients(
             for src in 0..plan.width {
                 for &(dest, coefficient) in batches[src].iter().rev() {
                     let dest_value = coefficients[dest];
-                    add_scaled_coefficient(&mut coefficients[src], dest_value, coefficient);
+                    if dest_value != 0 {
+                        add_scaled_coefficient(&mut coefficients[src], dest_value, coefficient);
+                    }
                 }
             }
         }
@@ -648,7 +649,9 @@ fn apply_back_substitution_to_final_coefficients(
             for src in 0..plan.width {
                 for &(dest, coefficient) in batches.slice(src).iter().rev() {
                     let dest_value = coefficients[dest];
-                    add_scaled_coefficient(&mut coefficients[src], dest_value, coefficient);
+                    if dest_value != 0 {
+                        add_scaled_coefficient(&mut coefficients[src], dest_value, coefficient);
+                    }
                 }
             }
         }
@@ -671,7 +674,9 @@ fn apply_forward_steps_to_final_coefficients(plan: &CachedSystematicPlan, coeffi
     for step in plan.forward_steps.iter().rev() {
         for &(dest, scalar) in step.dests.iter().rev() {
             let dest_value = coefficients[dest];
-            add_scaled_coefficient(&mut coefficients[step.pivot], dest_value, scalar);
+            if dest_value != 0 {
+                add_scaled_coefficient(&mut coefficients[step.pivot], dest_value, scalar);
+            }
         }
         if let Some(scale) = step.scale {
             let pivot_value = coefficients[step.pivot];
@@ -732,11 +737,13 @@ fn prepare_cached_systematic_plan(
 
     let mut row_merge_scratch = Vec::new();
     let mut bucket_heads = vec![None; width];
+    let mut bucket_counts = vec![0usize; width];
     let mut next_in_bucket = vec![None; height];
     for (row, coefficients) in rows.iter().enumerate() {
         if let Some(&(col, _)) = coefficients.first() {
-            push_row_bucket(
+            push_counted_row_bucket(
                 &mut bucket_heads,
+                &mut bucket_counts,
                 &mut next_in_bucket,
                 coefficient_col_index(col),
                 row,
@@ -749,9 +756,14 @@ fn prepare_cached_systematic_plan(
     let mut is_pivot_row = vec![false; height];
 
     for (col, pivot_slot) in pivot_for_col.iter_mut().enumerate() {
-        let (pivot, pivot_value) =
-            pop_lightest_coefficient_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
-                .expect("systematic plan matrix must be full rank");
+        let (pivot, pivot_value) = pop_lightest_counted_coefficient_row_bucket(
+            &rows,
+            &mut bucket_heads,
+            &mut bucket_counts,
+            &mut next_in_bucket,
+            col,
+        )
+        .expect("systematic plan matrix must be full rank");
         *pivot_slot = pivot;
         is_pivot_row[pivot] = true;
 
@@ -763,10 +775,15 @@ fn prepare_cached_systematic_plan(
             None
         };
 
-        let bucket_len = bucket_chain_len(&bucket_heads, &next_in_bucket, col);
+        let bucket_len = bucket_counts[col];
         let mut dests = Vec::with_capacity(bucket_len);
         if rows[pivot].len() == 1 {
-            while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+            while let Some(row) = pop_counted_row_bucket(
+                &mut bucket_heads,
+                &mut bucket_counts,
+                &mut next_in_bucket,
+                col,
+            ) {
                 debug_assert_ne!(row, pivot);
                 let factor = rows[row][0].1;
                 rows[row].remove(0);
@@ -774,8 +791,9 @@ fn prepare_cached_systematic_plan(
 
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
-                    push_row_bucket(
+                    push_counted_row_bucket(
                         &mut bucket_heads,
+                        &mut bucket_counts,
                         &mut next_in_bucket,
                         coefficient_col_index(next_col),
                         row,
@@ -783,7 +801,12 @@ fn prepare_cached_systematic_plan(
                 }
             }
         } else if width >= CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH {
-            while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+            while let Some(row) = pop_counted_row_bucket(
+                &mut bucket_heads,
+                &mut bucket_counts,
+                &mut next_in_bucket,
+                col,
+            ) {
                 debug_assert_ne!(row, pivot);
                 let factor = rows[row][0].1;
                 let (pivot_coefficients, row_coefficients) =
@@ -799,8 +822,9 @@ fn prepare_cached_systematic_plan(
 
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
-                    push_row_bucket(
+                    push_counted_row_bucket(
                         &mut bucket_heads,
+                        &mut bucket_counts,
                         &mut next_in_bucket,
                         coefficient_col_index(next_col),
                         row,
@@ -809,7 +833,12 @@ fn prepare_cached_systematic_plan(
             }
         } else {
             let pivot_coefficients = rows[pivot].clone();
-            while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+            while let Some(row) = pop_counted_row_bucket(
+                &mut bucket_heads,
+                &mut bucket_counts,
+                &mut next_in_bucket,
+                col,
+            ) {
                 debug_assert_ne!(row, pivot);
                 let factor = rows[row][0].1;
                 add_scaled_matrix_row(
@@ -823,8 +852,9 @@ fn prepare_cached_systematic_plan(
 
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
-                    push_row_bucket(
+                    push_counted_row_bucket(
                         &mut bucket_heads,
+                        &mut bucket_counts,
                         &mut next_in_bucket,
                         coefficient_col_index(next_col),
                         row,
@@ -2335,6 +2365,17 @@ fn push_row_bucket(
     bucket_heads[col] = Some(row);
 }
 
+fn push_counted_row_bucket(
+    bucket_heads: &mut [Option<usize>],
+    bucket_counts: &mut [usize],
+    next_in_bucket: &mut [Option<usize>],
+    col: usize,
+    row: usize,
+) {
+    push_row_bucket(bucket_heads, next_in_bucket, col, row);
+    bucket_counts[col] += 1;
+}
+
 fn pop_row_bucket(
     bucket_heads: &mut [Option<usize>],
     next_in_bucket: &mut [Option<usize>],
@@ -2346,18 +2387,16 @@ fn pop_row_bucket(
     Some(row)
 }
 
-fn bucket_chain_len(
-    bucket_heads: &[Option<usize>],
-    next_in_bucket: &[Option<usize>],
+fn pop_counted_row_bucket(
+    bucket_heads: &mut [Option<usize>],
+    bucket_counts: &mut [usize],
+    next_in_bucket: &mut [Option<usize>],
     col: usize,
-) -> usize {
-    let mut len = 0usize;
-    let mut current = bucket_heads[col];
-    while let Some(row) = current {
-        len += 1;
-        current = next_in_bucket[row];
-    }
-    len
+) -> Option<usize> {
+    let row = pop_row_bucket(bucket_heads, next_in_bucket, col)?;
+    debug_assert_ne!(bucket_counts[col], 0);
+    bucket_counts[col] -= 1;
+    Some(row)
 }
 
 fn pop_lightest_coefficient_row_bucket(
@@ -2414,6 +2453,19 @@ fn pop_lightest_coefficient_row_bucket(
     }
     next_in_bucket[best] = None;
     Some((best, best_value))
+}
+
+fn pop_lightest_counted_coefficient_row_bucket(
+    rows: &[CoefficientRow],
+    bucket_heads: &mut [Option<usize>],
+    bucket_counts: &mut [usize],
+    next_in_bucket: &mut [Option<usize>],
+    col: usize,
+) -> Option<(usize, Octet)> {
+    let result = pop_lightest_coefficient_row_bucket(rows, bucket_heads, next_in_bucket, col)?;
+    debug_assert_ne!(bucket_counts[col], 0);
+    bucket_counts[col] -= 1;
+    Some(result)
 }
 
 fn pop_lightest_binary_row_bucket(
