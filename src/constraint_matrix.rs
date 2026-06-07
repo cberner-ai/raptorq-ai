@@ -14,11 +14,36 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "std")]
 const HDPC_ROWS_CACHE_CAPACITY: usize = 16;
+const FAST_CONTIGUOUS_SINGLE_REPAIR_MIN_SYMBOLS: u32 = 4096;
 
 pub fn generate_constraint_matrix<M: BinaryMatrix>(
     source_block_symbols: u32,
     encoded_isis: &[u32],
 ) -> (M, DenseOctetMatrix) {
+    let k_prime = extended_source_block_symbols(source_block_symbols);
+    if k_prime >= FAST_CONTIGUOUS_SINGLE_REPAIR_MIN_SYMBOLS
+        && let Some((missing_isi, repair_matrix_row, repair_isi)) =
+            contiguous_single_repair_systematic_rows(
+                k_prime,
+                num_ldpc_symbols(k_prime) as usize,
+                encoded_isis,
+            )
+    {
+        let l = num_intermediate_symbols(k_prime);
+        let h = num_hdpc_symbols(k_prime);
+        let mut matrix = M::new(
+            num_ldpc_symbols(k_prime) as usize + encoded_isis.len(),
+            l as usize,
+        );
+        matrix.mark_contiguous_single_repair_systematic_rows(
+            k_prime,
+            missing_isi,
+            repair_matrix_row,
+            repair_isi,
+        );
+        return (matrix, DenseOctetMatrix::new(h as usize, l as usize));
+    }
+
     let matrix = generate_constraint_matrix_no_hdpc::<M>(source_block_symbols, encoded_isis);
     let hdpc = generate_hdpc_rows(source_block_symbols);
     (matrix, hdpc)
@@ -513,6 +538,42 @@ mod tests {
                 num_ldpc_symbols(source_symbols) as usize + k_prime as usize - 1,
                 repair_isi,
             ))
+        );
+    }
+
+    #[test]
+    fn large_contiguous_single_repair_matrix_is_fast_tagged() {
+        let source_symbols = FAST_CONTIGUOUS_SINGLE_REPAIR_MIN_SYMBOLS;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let missing_isi = k_prime - 1;
+        let repair_isi = k_prime;
+        let indices = (0..k_prime)
+            .filter(|&isi| isi != missing_isi)
+            .chain(core::iter::once(repair_isi))
+            .collect::<Vec<_>>();
+
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        assert_eq!(
+            matrix.contiguous_single_repair_systematic_rows(),
+            Some((
+                k_prime,
+                missing_isi as usize,
+                num_ldpc_symbols(k_prime) as usize + k_prime as usize - 1,
+                repair_isi,
+            ))
+        );
+        assert_eq!(
+            matrix.height(),
+            num_ldpc_symbols(k_prime) as usize + k_prime as usize
+        );
+        assert_eq!(matrix.width(), num_intermediate_symbols(k_prime) as usize);
+        assert!(matrix.row_entries(0).is_empty());
+        assert_eq!(hdpc_rows.height(), num_hdpc_symbols(k_prime) as usize);
+        assert_eq!(
+            hdpc_rows.width(),
+            num_intermediate_symbols(k_prime) as usize
         );
     }
 
