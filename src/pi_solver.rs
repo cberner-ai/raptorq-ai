@@ -1443,8 +1443,7 @@ fn copy_binary_row<M: BinaryMatrix>(matrix: &M, row: usize) -> CoefficientRow {
 
 fn copy_octet_row(matrix: &DenseOctetMatrix, row: usize) -> CoefficientRow {
     let mut result = Vec::new();
-    for col in 0..matrix.width() {
-        let value = matrix.get(row, col);
+    for (col, &value) in matrix.row(row).iter().enumerate() {
         if !value.is_zero() {
             result.push((coefficient_col(col), value));
         }
