@@ -28,7 +28,8 @@ use crate::systematic_constants::{
     num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
 };
 
-type CoefficientRow = Vec<(u32, Octet)>;
+type CoefficientColumn = u16;
+type CoefficientRow = Vec<(CoefficientColumn, Octet)>;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
@@ -42,9 +43,9 @@ const SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 1;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 #[cfg(feature = "std")]
-const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = 8_192;
+const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH + 1;
 #[cfg(feature = "std")]
-const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = 16_384;
+const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = 8_192;
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
@@ -52,12 +53,12 @@ const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 
-fn coefficient_col(col: usize) -> u32 {
-    debug_assert!(u32::try_from(col).is_ok());
-    col as u32
+fn coefficient_col(col: usize) -> CoefficientColumn {
+    debug_assert!(CoefficientColumn::try_from(col).is_ok());
+    col as CoefficientColumn
 }
 
-fn coefficient_col_index(col: u32) -> usize {
+fn coefficient_col_index(col: CoefficientColumn) -> usize {
     col as usize
 }
 
@@ -876,7 +877,6 @@ fn prepare_cached_systematic_plan(
             "systematic plan matrix has a non-pivot residual row"
         );
     }
-
     let back_substitution = if width >= FLAT_BACK_SUBSTITUTION_MIN_WIDTH {
         CachedSystematicBackSubstitution::FlatBatches(prepare_flat_back_substitution_batches(
             &rows,
