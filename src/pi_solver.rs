@@ -1121,18 +1121,17 @@ fn coefficient_rows<M: BinaryMatrix>(
 ) -> Vec<CoefficientRow> {
     let s = num_ldpc_symbols(source_block_symbols) as usize;
     let total_rows = matrix.height() + hdpc_rows.height();
-    let mut rows = vec![Vec::new(); total_rows];
+    let mut rows = Vec::with_capacity(total_rows);
     for row in 0..s {
-        rows[row] = copy_binary_row(matrix, row);
+        rows.push(copy_binary_row(matrix, row));
     }
     for row in 0..hdpc_rows.height() {
-        let dest = s + row;
-        rows[dest] = copy_octet_row(hdpc_rows, row);
+        rows.push(copy_octet_row(hdpc_rows, row));
     }
     for row in s..matrix.height() {
-        let dest = row + hdpc_rows.height();
-        rows[dest] = copy_binary_row(matrix, row);
+        rows.push(copy_binary_row(matrix, row));
     }
+    debug_assert_eq!(rows.len(), total_rows);
 
     rows
 }
@@ -1148,23 +1147,21 @@ fn coefficient_rows_from_binary_entries(
     assert!(matrix_height >= s);
 
     let total_rows = matrix_height + hdpc_rows.height();
-    let mut rows = vec![Vec::new(); total_rows];
+    let mut rows = Vec::with_capacity(total_rows);
     let mut binary_entries = binary_entries.into_iter();
-    for row in 0..s {
+    for _ in 0..s {
         let entries = binary_entries
             .next()
             .expect("LDPC row entries must be present");
-        rows[row] = coefficient_row_from_binary_entries(entries);
+        rows.push(coefficient_row_from_binary_entries(entries));
     }
     for row in 0..hdpc_rows.height() {
-        let dest = s + row;
-        rows[dest] = copy_octet_row(hdpc_rows, row);
+        rows.push(copy_octet_row(hdpc_rows, row));
     }
-    for (offset, entries) in binary_entries.enumerate() {
-        let row = s + offset;
-        let dest = row + hdpc_rows.height();
-        rows[dest] = coefficient_row_from_binary_entries(entries);
+    for entries in binary_entries {
+        rows.push(coefficient_row_from_binary_entries(entries));
     }
+    debug_assert_eq!(rows.len(), total_rows);
 
     rows
 }
