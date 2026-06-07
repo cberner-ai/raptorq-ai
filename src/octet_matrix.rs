@@ -49,6 +49,7 @@ impl DenseOctetMatrix {
         &self.data
     }
 
+    #[allow(dead_code)]
     pub fn get(&self, row: usize, col: usize) -> Octet {
         assert!(row < self.height);
         assert!(col < self.width);
