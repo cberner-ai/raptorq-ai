@@ -2481,9 +2481,10 @@ fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {
 
 fn scale_matrix_row(row: &mut CoefficientRow, start_col: usize, scalar: Octet) {
     let start_col = coefficient_col(start_col);
+    let table = scalar.mul_table();
     for (col, value) in row.iter_mut() {
         if *col >= start_col {
-            *value *= scalar;
+            *value = multiply_with_table(*value, table);
         }
     }
 }
@@ -2553,6 +2554,7 @@ fn add_scaled_matrix_row(
     } else {
         src.partition_point(|&(col, _)| col < start_col)
     };
+    let table = scalar.mul_table();
     scratch.clear();
     scratch.reserve(dest.len() + src.len() - src_index);
 
@@ -2563,10 +2565,10 @@ fn add_scaled_matrix_row(
                     scratch.push((dest_col, dest_value));
                     dest_index += 1;
                 } else if src_col < dest_col {
-                    scratch.push((src_col, src_value * scalar));
+                    scratch.push((src_col, multiply_with_table(src_value, table)));
                     src_index += 1;
                 } else {
-                    let value = dest_value + src_value * scalar;
+                    let value = dest_value + multiply_with_table(src_value, table);
                     if !value.is_zero() {
                         scratch.push((dest_col, value));
                     }
@@ -2579,7 +2581,7 @@ fn add_scaled_matrix_row(
                 dest_index += 1;
             }
             (None, Some(&(src_col, src_value))) => {
-                scratch.push((src_col, src_value * scalar));
+                scratch.push((src_col, multiply_with_table(src_value, table)));
                 src_index += 1;
             }
             (None, None) => break,
@@ -2587,6 +2589,10 @@ fn add_scaled_matrix_row(
     }
 
     core::mem::swap(dest, scratch);
+}
+
+fn multiply_with_table(value: Octet, table: &[u8; 256]) -> Octet {
+    Octet::new(table[value.value() as usize])
 }
 
 fn disjoint_coefficient_rows_mut(
