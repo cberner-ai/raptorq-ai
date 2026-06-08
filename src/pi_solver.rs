@@ -30,6 +30,7 @@ use crate::systematic_constants::{
 
 type CoefficientColumn = u16;
 type CoefficientRow = Vec<(CoefficientColumn, Octet)>;
+const NO_BUCKET_ROW: usize = usize::MAX;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
@@ -737,13 +738,16 @@ fn prepare_cached_systematic_plan(
     assert_eq!(height, width);
 
     let mut row_merge_scratch = Vec::new();
-    let mut bucket_heads = vec![None; width];
+    let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut unit_bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut bucket_counts = vec![0usize; width];
-    let mut next_in_bucket = vec![None; height];
+    let mut next_in_bucket = vec![NO_BUCKET_ROW; height];
     for (row, coefficients) in rows.iter().enumerate() {
         if let Some(&(col, _)) = coefficients.first() {
             push_counted_row_bucket(
+                &rows,
                 &mut bucket_heads,
+                &mut unit_bucket_heads,
                 &mut bucket_counts,
                 &mut next_in_bucket,
                 coefficient_col_index(col),
@@ -760,6 +764,7 @@ fn prepare_cached_systematic_plan(
         let (pivot, pivot_value) = pop_lightest_counted_coefficient_row_bucket(
             &rows,
             &mut bucket_heads,
+            &mut unit_bucket_heads,
             &mut bucket_counts,
             &mut next_in_bucket,
             col,
@@ -781,6 +786,7 @@ fn prepare_cached_systematic_plan(
         if rows[pivot].len() == 1 {
             while let Some(row) = pop_counted_row_bucket(
                 &mut bucket_heads,
+                &mut unit_bucket_heads,
                 &mut bucket_counts,
                 &mut next_in_bucket,
                 col,
@@ -793,7 +799,9 @@ fn prepare_cached_systematic_plan(
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
                     push_counted_row_bucket(
+                        &rows,
                         &mut bucket_heads,
+                        &mut unit_bucket_heads,
                         &mut bucket_counts,
                         &mut next_in_bucket,
                         coefficient_col_index(next_col),
@@ -804,6 +812,7 @@ fn prepare_cached_systematic_plan(
         } else if width >= CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH {
             while let Some(row) = pop_counted_row_bucket(
                 &mut bucket_heads,
+                &mut unit_bucket_heads,
                 &mut bucket_counts,
                 &mut next_in_bucket,
                 col,
@@ -824,7 +833,9 @@ fn prepare_cached_systematic_plan(
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
                     push_counted_row_bucket(
+                        &rows,
                         &mut bucket_heads,
+                        &mut unit_bucket_heads,
                         &mut bucket_counts,
                         &mut next_in_bucket,
                         coefficient_col_index(next_col),
@@ -836,6 +847,7 @@ fn prepare_cached_systematic_plan(
             let pivot_coefficients = rows[pivot].clone();
             while let Some(row) = pop_counted_row_bucket(
                 &mut bucket_heads,
+                &mut unit_bucket_heads,
                 &mut bucket_counts,
                 &mut next_in_bucket,
                 col,
@@ -854,7 +866,9 @@ fn prepare_cached_systematic_plan(
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
                     push_counted_row_bucket(
+                        &rows,
                         &mut bucket_heads,
+                        &mut unit_bucket_heads,
                         &mut bucket_counts,
                         &mut next_in_bucket,
                         coefficient_col_index(next_col),
@@ -1279,8 +1293,8 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     }
 
     let mut rows = matrix.packed_rows();
-    let mut bucket_heads = vec![None; width];
-    let mut next_in_bucket = vec![None; binary_height];
+    let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for row in 0..binary_height {
         if let Some(col) = rows.first_one_at_or_after(row, 0) {
             push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
@@ -2078,8 +2092,8 @@ fn solve_without_recording_bucketed(
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     let height = rows.len();
     let mut row_merge_scratch = Vec::new();
-    let mut bucket_heads = vec![None; width];
-    let mut next_in_bucket = vec![None; height];
+    let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut next_in_bucket = vec![NO_BUCKET_ROW; height];
     for (row, coefficients) in rows.iter().enumerate() {
         if let Some(&(col, _)) = coefficients.first() {
             push_row_bucket(
@@ -2301,8 +2315,8 @@ fn solve_binary(
 
     let height = rows.height();
     assert_eq!(height, symbols.len());
-    let mut bucket_heads = vec![None; width];
-    let mut next_in_bucket = vec![None; height];
+    let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut next_in_bucket = vec![NO_BUCKET_ROW; height];
     for row in 0..height {
         if let Some(col) = rows.first_one_at_or_after(row, 0) {
             push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
@@ -2352,45 +2366,60 @@ fn solve_binary(
 }
 
 fn push_row_bucket(
-    bucket_heads: &mut [Option<usize>],
-    next_in_bucket: &mut [Option<usize>],
+    bucket_heads: &mut [usize],
+    next_in_bucket: &mut [usize],
     col: usize,
     row: usize,
 ) {
-    debug_assert!(next_in_bucket[row].is_none());
+    debug_assert_eq!(next_in_bucket[row], NO_BUCKET_ROW);
     next_in_bucket[row] = bucket_heads[col];
-    bucket_heads[col] = Some(row);
+    bucket_heads[col] = row;
 }
 
 fn push_counted_row_bucket(
-    bucket_heads: &mut [Option<usize>],
+    rows: &[CoefficientRow],
+    bucket_heads: &mut [usize],
+    unit_bucket_heads: &mut [usize],
     bucket_counts: &mut [usize],
-    next_in_bucket: &mut [Option<usize>],
+    next_in_bucket: &mut [usize],
     col: usize,
     row: usize,
 ) {
-    push_row_bucket(bucket_heads, next_in_bucket, col, row);
+    if is_unit_bucket_row(&rows[row], col) {
+        push_row_bucket(unit_bucket_heads, next_in_bucket, col, row);
+    } else {
+        push_row_bucket(bucket_heads, next_in_bucket, col, row);
+    }
     bucket_counts[col] += 1;
 }
 
+fn is_unit_bucket_row(row: &CoefficientRow, col: usize) -> bool {
+    row.len() == 1 && row[0] == (coefficient_col(col), Octet::one())
+}
+
 fn pop_row_bucket(
-    bucket_heads: &mut [Option<usize>],
-    next_in_bucket: &mut [Option<usize>],
+    bucket_heads: &mut [usize],
+    next_in_bucket: &mut [usize],
     col: usize,
 ) -> Option<usize> {
-    let row = bucket_heads[col]?;
+    let row = bucket_heads[col];
+    if row == NO_BUCKET_ROW {
+        return None;
+    }
     bucket_heads[col] = next_in_bucket[row];
-    next_in_bucket[row] = None;
+    next_in_bucket[row] = NO_BUCKET_ROW;
     Some(row)
 }
 
 fn pop_counted_row_bucket(
-    bucket_heads: &mut [Option<usize>],
+    bucket_heads: &mut [usize],
+    unit_bucket_heads: &mut [usize],
     bucket_counts: &mut [usize],
-    next_in_bucket: &mut [Option<usize>],
+    next_in_bucket: &mut [usize],
     col: usize,
 ) -> Option<usize> {
-    let row = pop_row_bucket(bucket_heads, next_in_bucket, col)?;
+    let row = pop_row_bucket(unit_bucket_heads, next_in_bucket, col)
+        .or_else(|| pop_row_bucket(bucket_heads, next_in_bucket, col))?;
     debug_assert_ne!(bucket_counts[col], 0);
     bucket_counts[col] -= 1;
     Some(row)
@@ -2398,28 +2427,32 @@ fn pop_counted_row_bucket(
 
 fn pop_lightest_coefficient_row_bucket(
     rows: &[CoefficientRow],
-    bucket_heads: &mut [Option<usize>],
-    next_in_bucket: &mut [Option<usize>],
+    bucket_heads: &mut [usize],
+    next_in_bucket: &mut [usize],
     col: usize,
 ) -> Option<(usize, Octet)> {
-    let head = bucket_heads[col]?;
+    let head = bucket_heads[col];
+    if head == NO_BUCKET_ROW {
+        return None;
+    }
     debug_assert_eq!(
         rows[head].first().map(|&(entry_col, _)| entry_col),
         Some(coefficient_col(col))
     );
-    if next_in_bucket[head].is_none() {
-        bucket_heads[col] = None;
+    if next_in_bucket[head] == NO_BUCKET_ROW {
+        bucket_heads[col] = NO_BUCKET_ROW;
         return Some((head, rows[head][0].1));
     }
 
     let mut best = head;
-    let mut best_previous = None;
+    let mut best_previous = NO_BUCKET_ROW;
     let mut best_suffix_len = rows[head].len();
     let mut best_value = rows[head][0].1;
     let mut previous = head;
     let mut current = next_in_bucket[head];
 
-    while let Some(row) = current {
+    while current != NO_BUCKET_ROW {
+        let row = current;
         debug_assert_eq!(
             rows[row].first().map(|&(entry_col, _)| entry_col),
             Some(coefficient_col(col))
@@ -2432,7 +2465,7 @@ fn pop_lightest_coefficient_row_bucket(
                 && best_value != Octet::one())
         {
             best = row;
-            best_previous = Some(previous);
+            best_previous = previous;
             best_suffix_len = suffix_len;
             best_value = value;
             if suffix_len == 1 && value == Octet::one() {
@@ -2443,23 +2476,29 @@ fn pop_lightest_coefficient_row_bucket(
         current = next_in_bucket[row];
     }
 
-    if let Some(previous) = best_previous {
-        next_in_bucket[previous] = next_in_bucket[best];
-    } else {
+    if best_previous == NO_BUCKET_ROW {
         bucket_heads[col] = next_in_bucket[best];
+    } else {
+        next_in_bucket[best_previous] = next_in_bucket[best];
     }
-    next_in_bucket[best] = None;
+    next_in_bucket[best] = NO_BUCKET_ROW;
     Some((best, best_value))
 }
 
 fn pop_lightest_counted_coefficient_row_bucket(
     rows: &[CoefficientRow],
-    bucket_heads: &mut [Option<usize>],
+    bucket_heads: &mut [usize],
+    unit_bucket_heads: &mut [usize],
     bucket_counts: &mut [usize],
-    next_in_bucket: &mut [Option<usize>],
+    next_in_bucket: &mut [usize],
     col: usize,
 ) -> Option<(usize, Octet)> {
-    let result = pop_lightest_coefficient_row_bucket(rows, bucket_heads, next_in_bucket, col)?;
+    let result = if let Some(row) = pop_row_bucket(unit_bucket_heads, next_in_bucket, col) {
+        debug_assert!(is_unit_bucket_row(&rows[row], col));
+        (row, Octet::one())
+    } else {
+        pop_lightest_coefficient_row_bucket(rows, bucket_heads, next_in_bucket, col)?
+    };
     debug_assert_ne!(bucket_counts[col], 0);
     bucket_counts[col] -= 1;
     Some(result)
@@ -2467,27 +2506,31 @@ fn pop_lightest_counted_coefficient_row_bucket(
 
 fn pop_lightest_binary_row_bucket(
     rows: &PackedBinaryRows,
-    bucket_heads: &mut [Option<usize>],
-    next_in_bucket: &mut [Option<usize>],
+    bucket_heads: &mut [usize],
+    next_in_bucket: &mut [usize],
     col: usize,
 ) -> Option<usize> {
-    let head = bucket_heads[col]?;
-    if next_in_bucket[head].is_none() {
-        bucket_heads[col] = None;
+    let head = bucket_heads[col];
+    if head == NO_BUCKET_ROW {
+        return None;
+    }
+    if next_in_bucket[head] == NO_BUCKET_ROW {
+        bucket_heads[col] = NO_BUCKET_ROW;
         return Some(head);
     }
 
     let mut best = head;
-    let mut best_previous = None;
+    let mut best_previous = NO_BUCKET_ROW;
     let mut best_weight = rows.weight_at_or_after(head, col);
     let mut previous = head;
     let mut current = next_in_bucket[head];
 
-    while let Some(row) = current {
+    while current != NO_BUCKET_ROW {
+        let row = current;
         let weight = rows.weight_at_or_after(row, col);
         if weight < best_weight {
             best = row;
-            best_previous = Some(previous);
+            best_previous = previous;
             best_weight = weight;
             if weight == 1 {
                 break;
@@ -2497,12 +2540,12 @@ fn pop_lightest_binary_row_bucket(
         current = next_in_bucket[row];
     }
 
-    if let Some(previous) = best_previous {
-        next_in_bucket[previous] = next_in_bucket[best];
-    } else {
+    if best_previous == NO_BUCKET_ROW {
         bucket_heads[col] = next_in_bucket[best];
+    } else {
+        next_in_bucket[best_previous] = next_in_bucket[best];
     }
-    next_in_bucket[best] = None;
+    next_in_bucket[best] = NO_BUCKET_ROW;
     Some(best)
 }
 
@@ -2530,10 +2573,13 @@ fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {
 fn scale_matrix_row(row: &mut CoefficientRow, start_col: usize, scalar: Octet) {
     let start_col = coefficient_col(start_col);
     let table = scalar.mul_table();
-    for (col, value) in row.iter_mut() {
-        if *col >= start_col {
-            *value = multiply_with_table(*value, table);
-        }
+    let start_index = if row.first().is_some_and(|&(col, _)| col >= start_col) {
+        0
+    } else {
+        row.partition_point(|&(col, _)| col < start_col)
+    };
+    for (_, value) in &mut row[start_index..] {
+        *value = multiply_with_table(*value, table);
     }
 }
 
