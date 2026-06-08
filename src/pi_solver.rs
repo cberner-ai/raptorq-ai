@@ -50,6 +50,8 @@ const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
+const SHORT_PIVOT_MERGE_MAX_LEN: usize = 64;
+#[cfg(feature = "std")]
 const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
@@ -821,13 +823,17 @@ fn prepare_cached_systematic_plan(
                 let factor = rows[row][0].1;
                 let (pivot_coefficients, row_coefficients) =
                     disjoint_coefficient_rows_mut(&mut rows, pivot, row);
-                add_scaled_matrix_row(
-                    row_coefficients,
-                    pivot_coefficients,
-                    col,
-                    factor,
-                    &mut row_merge_scratch,
-                );
+                if pivot_coefficients.len() <= SHORT_PIVOT_MERGE_MAX_LEN {
+                    add_scaled_short_matrix_row(row_coefficients, pivot_coefficients, col, factor);
+                } else {
+                    add_scaled_matrix_row(
+                        row_coefficients,
+                        pivot_coefficients,
+                        col,
+                        factor,
+                        &mut row_merge_scratch,
+                    );
+                }
                 dests.push((row, factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
@@ -2704,6 +2710,40 @@ fn disjoint_coefficient_rows_mut(
     }
 }
 
+fn add_scaled_short_matrix_row(
+    dest: &mut CoefficientRow,
+    src: &CoefficientRow,
+    start_col: usize,
+    scalar: Octet,
+) {
+    debug_assert_eq!(
+        dest.first().map(|&(col, _)| col),
+        Some(coefficient_col(start_col))
+    );
+    debug_assert_eq!(
+        src.first().map(|&(col, _)| col),
+        Some(coefficient_col(start_col))
+    );
+    dest.remove(0);
+    let table = (scalar != Octet::one()).then(|| scalar.mul_table());
+    for &(src_col, src_value) in &src[1..] {
+        let scaled = table
+            .as_ref()
+            .map_or(src_value, |table| multiply_with_table(src_value, table));
+        match dest.binary_search_by_key(&src_col, |&(dest_col, _)| dest_col) {
+            Ok(index) => {
+                let value = dest[index].1 + scaled;
+                if value.is_zero() {
+                    dest.remove(index);
+                } else {
+                    dest[index].1 = value;
+                }
+            }
+            Err(index) => dest.insert(index, (src_col, scaled)),
+        }
+    }
+}
+
 fn add_unscaled_matrix_row(
     dest: &mut CoefficientRow,
     src: &CoefficientRow,
@@ -3046,6 +3086,33 @@ mod tests {
             add_scaled_binary_matrix_row(&mut binary, &src_cols, scalar, &mut binary_scratch);
 
             assert_eq!(binary, generic);
+        }
+    }
+
+    #[test]
+    fn short_matrix_row_merge_matches_generic_merge() {
+        let src = vec![
+            (0, Octet::one()),
+            (2, Octet::new(5)),
+            (5, Octet::new(9)),
+            (8, Octet::new(11)),
+        ];
+        for scalar in [Octet::one(), Octet::new(7)] {
+            let dest = vec![
+                (0, scalar),
+                (1, Octet::new(3)),
+                (2, Octet::new(7)),
+                (5, Octet::new(63)),
+                (9, Octet::new(13)),
+            ];
+            let mut generic = dest.clone();
+            let mut short = dest;
+            let mut scratch = Vec::new();
+
+            add_scaled_matrix_row(&mut generic, &src, 0, scalar, &mut scratch);
+            add_scaled_short_matrix_row(&mut short, &src, 0, scalar);
+
+            assert_eq!(short, generic);
         }
     }
 
