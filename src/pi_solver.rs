@@ -824,7 +824,12 @@ fn prepare_cached_systematic_plan(
                 let (pivot_coefficients, row_coefficients) =
                     disjoint_coefficient_rows_mut(&mut rows, pivot, row);
                 if pivot_coefficients.len() <= SHORT_PIVOT_MERGE_MAX_LEN {
-                    add_scaled_short_matrix_row(row_coefficients, pivot_coefficients, col, factor);
+                    add_scaled_normalized_short_matrix_row(
+                        row_coefficients,
+                        pivot_coefficients,
+                        col,
+                        factor,
+                    );
                 } else {
                     add_scaled_matrix_row(
                         row_coefficients,
@@ -2583,13 +2588,13 @@ fn coefficient_at(row: &CoefficientRow, col: usize) -> Octet {
 
 fn scale_matrix_row(row: &mut CoefficientRow, start_col: usize, scalar: Octet) {
     let start_col = coefficient_col(start_col);
-    let table = scalar.mul_table();
-    let start_index = if row.first().is_some_and(|&(col, _)| col >= start_col) {
+    let start = if row.first().is_some_and(|&(col, _)| col >= start_col) {
         0
     } else {
         row.partition_point(|&(col, _)| col < start_col)
     };
-    for (_, value) in &mut row[start_index..] {
+    let table = scalar.mul_table();
+    for (_, value) in row[start..].iter_mut() {
         *value = multiply_with_table(*value, table);
     }
 }
@@ -2700,7 +2705,7 @@ fn multiply_with_table(value: Octet, table: &[u8; 256]) -> Octet {
     Octet::new(table[value.value() as usize])
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(test, feature = "std"))]
 fn add_scaled_short_matrix_row(
     dest: &mut CoefficientRow,
     src: &CoefficientRow,
@@ -2758,36 +2763,66 @@ fn disjoint_coefficient_rows_mut(
     }
 }
 
-fn add_scaled_short_matrix_row(
+#[cfg(feature = "std")]
+fn add_scaled_normalized_short_matrix_row(
     dest: &mut CoefficientRow,
     src: &CoefficientRow,
     start_col: usize,
     scalar: Octet,
 ) {
-    debug_assert_eq!(
-        dest.first().map(|&(col, _)| col),
-        Some(coefficient_col(start_col))
-    );
-    debug_assert_eq!(
-        src.first().map(|&(col, _)| col),
-        Some(coefficient_col(start_col))
-    );
-    dest.remove(0);
-    let table = (scalar != Octet::one()).then(|| scalar.mul_table());
-    for &(src_col, src_value) in &src[1..] {
-        let scaled = table
-            .as_ref()
-            .map_or(src_value, |table| multiply_with_table(src_value, table));
-        match dest.binary_search_by_key(&src_col, |&(dest_col, _)| dest_col) {
-            Ok(index) => {
-                let value = dest[index].1 + scaled;
-                if value.is_zero() {
-                    dest.remove(index);
-                } else {
-                    dest[index].1 = value;
-                }
+    let start_col = coefficient_col(start_col);
+    debug_assert_eq!(src.first().copied(), Some((start_col, Octet::one())));
+    debug_assert_eq!(dest.first().map(|&(col, _)| col), Some(start_col));
+    debug_assert_eq!(dest.first().map(|&(_, value)| value), Some(scalar));
+
+    if dest.len() == 1 {
+        dest.clear();
+    } else {
+        dest.remove(0);
+    }
+
+    let src_tail = &src[1..];
+    if src_tail.is_empty() {
+        return;
+    }
+
+    let scalar_table = (scalar != Octet::one()).then(|| scalar.mul_table());
+    if dest.is_empty() {
+        dest.reserve(src_tail.len());
+        for &(src_col, src_value) in src_tail {
+            let scaled = match scalar_table.as_ref() {
+                Some(table) => multiply_with_table(src_value, table),
+                None => src_value,
+            };
+            dest.push((src_col, scaled));
+        }
+        return;
+    }
+
+    let mut search_start = 0usize;
+    for &(src_col, src_value) in src_tail {
+        let scaled = match scalar_table.as_ref() {
+            Some(table) => multiply_with_table(src_value, table),
+            None => src_value,
+        };
+        let offset = dest[search_start..].partition_point(|&(dest_col, _)| dest_col < src_col);
+        let index = search_start + offset;
+
+        if dest
+            .get(index)
+            .is_some_and(|&(dest_col, _)| dest_col == src_col)
+        {
+            let value = dest[index].1 + scaled;
+            if value.is_zero() {
+                dest.remove(index);
+                search_start = index;
+            } else {
+                dest[index].1 = value;
+                search_start = index + 1;
             }
-            Err(index) => dest.insert(index, (src_col, scaled)),
+        } else {
+            dest.insert(index, (src_col, scaled));
+            search_start = index + 1;
         }
     }
 }
@@ -3159,6 +3194,28 @@ mod tests {
 
             add_scaled_matrix_row(&mut generic, &src, 0, scalar, &mut scratch);
             add_scaled_short_matrix_row(&mut short, &src, 0, scalar);
+
+            assert_eq!(short, generic);
+        }
+    }
+
+    #[test]
+    fn normalized_short_matrix_row_matches_generic_merge() {
+        let src = vec![(2, Octet::one()), (4, Octet::new(17)), (8, Octet::new(91))];
+
+        for scalar in [Octet::one(), Octet::new(11)] {
+            let dest = vec![
+                (2, scalar),
+                (4, Octet::new(19)),
+                (5, Octet::new(7)),
+                (9, Octet::new(13)),
+            ];
+            let mut generic = dest.clone();
+            let mut short = dest;
+            let mut scratch = Vec::new();
+
+            add_scaled_matrix_row(&mut generic, &src, 2, scalar, &mut scratch);
+            add_scaled_normalized_short_matrix_row(&mut short, &src, 2, scalar);
 
             assert_eq!(short, generic);
         }
