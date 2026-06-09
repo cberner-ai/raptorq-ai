@@ -2449,6 +2449,11 @@ fn pop_lightest_coefficient_row_bucket(
         bucket_heads[col] = NO_BUCKET_ROW;
         return Some((head, rows[head][0].1));
     }
+    if rows[head].len() == 1 {
+        bucket_heads[col] = next_in_bucket[head];
+        next_in_bucket[head] = None;
+        return Some((head, rows[head][0].1));
+    }
 
     let mut best = head;
     let mut best_previous = NO_BUCKET_ROW;
@@ -2474,7 +2479,7 @@ fn pop_lightest_coefficient_row_bucket(
             best_previous = previous;
             best_suffix_len = suffix_len;
             best_value = value;
-            if suffix_len == 1 && value == Octet::one() {
+            if suffix_len == 1 {
                 break;
             }
         }
@@ -2693,6 +2698,49 @@ fn add_scaled_matrix_row(
 
 fn multiply_with_table(value: Octet, table: &[u8; 256]) -> Octet {
     Octet::new(table[value.value() as usize])
+}
+
+#[cfg(feature = "std")]
+fn add_scaled_short_matrix_row(
+    dest: &mut CoefficientRow,
+    src: &CoefficientRow,
+    start_col: usize,
+    scalar: Octet,
+) {
+    let start_col = coefficient_col(start_col);
+    let src_start = if src.first().is_some_and(|&(col, _)| col >= start_col) {
+        0
+    } else {
+        src.partition_point(|&(col, _)| col < start_col)
+    };
+    let scalar_table = (scalar != Octet::one()).then(|| scalar.mul_table());
+    let mut search_start = 0usize;
+
+    for &(src_col, src_value) in &src[src_start..] {
+        let scaled = match scalar_table.as_ref() {
+            Some(table) => multiply_with_table(src_value, table),
+            None => src_value,
+        };
+        let offset = dest[search_start..].partition_point(|&(dest_col, _)| dest_col < src_col);
+        let index = search_start + offset;
+
+        if dest
+            .get(index)
+            .is_some_and(|&(dest_col, _)| dest_col == src_col)
+        {
+            let value = dest[index].1 + scaled;
+            if value.is_zero() {
+                dest.remove(index);
+                search_start = index;
+            } else {
+                dest[index].1 = value;
+                search_start = index + 1;
+            }
+        } else {
+            dest.insert(index, (src_col, scaled));
+            search_start = index + 1;
+        }
+    }
 }
 
 fn disjoint_coefficient_rows_mut(
