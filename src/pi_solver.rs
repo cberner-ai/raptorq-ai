@@ -190,6 +190,7 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
 struct CachedSystematicPlan {
     // Large systematic plans replay only symbol operations; coefficient elimination is cached.
     forward_steps: Vec<CachedSystematicForwardStep>,
+    forward_dests: CachedSystematicSlices,
     pivot_symbol_cycles: Vec<Box<[usize]>>,
     back_substitution: CachedSystematicBackSubstitution,
     width: usize,
@@ -199,7 +200,6 @@ struct CachedSystematicPlan {
 struct CachedSystematicForwardStep {
     pivot: usize,
     scale: Option<Octet>,
-    dests: Box<[(usize, Octet)]>,
 }
 
 #[cfg(feature = "std")]
@@ -526,7 +526,7 @@ fn apply_prepared_systematic_plan_to_basis_coefficients(
     let mut coefficients = vec![0u8; plan.width];
     coefficients[source_col] = 1;
 
-    for step in &plan.forward_steps {
+    for (step_index, step) in plan.forward_steps.iter().enumerate() {
         if let Some(scale) = step.scale {
             coefficients[step.pivot] = (Octet::new(coefficients[step.pivot]) * scale).value();
         }
@@ -535,7 +535,7 @@ fn apply_prepared_systematic_plan_to_basis_coefficients(
         if src_value == 0 {
             continue;
         }
-        for &(dest, scalar) in step.dests.iter() {
+        for &(dest, scalar) in plan.forward_dests.slice(step_index) {
             add_scaled_coefficient(&mut coefficients[dest], src_value, scalar);
         }
     }
@@ -675,8 +675,9 @@ fn move_final_coefficients_to_pivot_rows(coefficients: &mut [u8], cycles: &[Box<
 
 #[cfg(feature = "std")]
 fn apply_forward_steps_to_final_coefficients(plan: &CachedSystematicPlan, coefficients: &mut [u8]) {
-    for step in plan.forward_steps.iter().rev() {
-        for &(dest, scalar) in step.dests.iter().rev() {
+    for step_index in (0..plan.forward_steps.len()).rev() {
+        let step = &plan.forward_steps[step_index];
+        for &(dest, scalar) in plan.forward_dests.slice(step_index).iter().rev() {
             let dest_value = coefficients[dest];
             if dest_value != 0 {
                 add_scaled_coefficient(&mut coefficients[step.pivot], dest_value, scalar);
@@ -759,6 +760,8 @@ fn prepare_cached_systematic_plan(
     }
 
     let mut forward_steps = Vec::with_capacity(width);
+    let mut forward_dest_ranges = Vec::with_capacity(width);
+    let mut forward_dest_entries = Vec::new();
     let mut pivot_for_col = vec![usize::MAX; width];
     let mut is_pivot_row = vec![false; height];
 
@@ -784,7 +787,8 @@ fn prepare_cached_systematic_plan(
         };
 
         let bucket_len = bucket_counts[col];
-        let mut dests = Vec::with_capacity(bucket_len);
+        let dest_start = forward_dest_entries.len();
+        forward_dest_entries.reserve(bucket_len);
         if rows[pivot].len() == 1 {
             while let Some(row) = pop_counted_row_bucket(
                 &mut bucket_heads,
@@ -796,7 +800,7 @@ fn prepare_cached_systematic_plan(
                 debug_assert_ne!(row, pivot);
                 let factor = rows[row][0].1;
                 rows[row].remove(0);
-                dests.push((row, factor));
+                forward_dest_entries.push((row, factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
@@ -839,7 +843,7 @@ fn prepare_cached_systematic_plan(
                         &mut row_merge_scratch,
                     );
                 }
-                dests.push((row, factor));
+                forward_dest_entries.push((row, factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
@@ -872,7 +876,7 @@ fn prepare_cached_systematic_plan(
                     factor,
                     &mut row_merge_scratch,
                 );
-                dests.push((row, factor));
+                forward_dest_entries.push((row, factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
@@ -888,12 +892,9 @@ fn prepare_cached_systematic_plan(
                 }
             }
         }
+        forward_dest_ranges.push((dest_start, forward_dest_entries.len()));
 
-        forward_steps.push(CachedSystematicForwardStep {
-            pivot,
-            scale,
-            dests: dests.into_boxed_slice(),
-        });
+        forward_steps.push(CachedSystematicForwardStep { pivot, scale });
     }
 
     for (row, is_pivot) in is_pivot_row.into_iter().enumerate() {
@@ -931,6 +932,10 @@ fn prepare_cached_systematic_plan(
 
     CachedSystematicPlan {
         forward_steps,
+        forward_dests: CachedSystematicSlices {
+            ranges: forward_dest_ranges,
+            entries: forward_dest_entries,
+        },
         pivot_symbol_cycles: pivot_symbol_cycles(&pivot_for_col),
         back_substitution,
         width,
@@ -1035,11 +1040,11 @@ fn slices_from_counts(counts: Vec<usize>) -> CachedSystematicSliceParts {
 fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut SymbolSlab) {
     assert_eq!(symbols.len(), plan.width);
 
-    for step in &plan.forward_steps {
+    for (step_index, step) in plan.forward_steps.iter().enumerate() {
         if let Some(scale) = step.scale {
             mulassign_scalar(symbols.get_mut(step.pivot), &scale);
         }
-        fused_addassign_symbol_batch(symbols, step.pivot, &step.dests);
+        fused_addassign_symbol_batch(symbols, step.pivot, plan.forward_dests.slice(step_index));
     }
 
     move_pivot_symbols_to_columns(symbols, &plan.pivot_symbol_cycles);
@@ -3595,6 +3600,10 @@ mod tests {
         for source_block_symbols in 0..=SYSTEMATIC_PLAN_CACHE_CAPACITY as u32 {
             let plan = std::sync::Arc::new(CachedSystematicPlan {
                 forward_steps: Vec::new(),
+                forward_dests: CachedSystematicSlices {
+                    ranges: Vec::new(),
+                    entries: Vec::new(),
+                },
                 pivot_symbol_cycles: Vec::new(),
                 back_substitution: CachedSystematicBackSubstitution::Rows(Vec::new()),
                 width: 0,
@@ -3689,6 +3698,10 @@ mod tests {
     fn repair_source_coefficients_handle_batched_back_substitution() {
         let plan = CachedSystematicPlan {
             forward_steps: Vec::new(),
+            forward_dests: CachedSystematicSlices {
+                ranges: Vec::new(),
+                entries: Vec::new(),
+            },
             pivot_symbol_cycles: Vec::new(),
             back_substitution: CachedSystematicBackSubstitution::Batches(vec![
                 Vec::new().into_boxed_slice(),
