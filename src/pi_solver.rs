@@ -212,15 +212,20 @@ enum CachedSystematicBackSubstitution {
 #[cfg(feature = "std")]
 struct CachedSystematicSlices {
     ranges: Vec<(usize, usize)>,
-    entries: Vec<(usize, Octet)>,
+    entries: Vec<(CoefficientColumn, Octet)>,
 }
 
 #[cfg(feature = "std")]
-type CachedSystematicSliceParts = (Vec<(usize, usize)>, Vec<usize>, Vec<(usize, Octet)>, usize);
+type CachedSystematicSliceParts = (
+    Vec<(usize, usize)>,
+    Vec<usize>,
+    Vec<(CoefficientColumn, Octet)>,
+    usize,
+);
 
 #[cfg(feature = "std")]
 impl CachedSystematicSlices {
-    fn slice(&self, index: usize) -> &[(usize, Octet)] {
+    fn slice(&self, index: usize) -> &[(CoefficientColumn, Octet)] {
         let (start, end) = self.ranges[index];
         &self.entries[start..end]
     }
@@ -536,6 +541,7 @@ fn apply_prepared_systematic_plan_to_basis_coefficients(
             continue;
         }
         for &(dest, scalar) in plan.forward_dests.slice(step_index) {
+            let dest = coefficient_col_index(dest);
             add_scaled_coefficient(&mut coefficients[dest], src_value, scalar);
         }
     }
@@ -568,6 +574,7 @@ fn apply_prepared_systematic_plan_to_basis_coefficients(
                     continue;
                 }
                 for &(dest, scalar) in batches.slice(src) {
+                    let dest = coefficient_col_index(dest);
                     add_scaled_coefficient(&mut coefficients[dest], src_value, scalar);
                 }
             }
@@ -652,6 +659,7 @@ fn apply_back_substitution_to_final_coefficients(
         CachedSystematicBackSubstitution::FlatBatches(batches) => {
             for src in 0..plan.width {
                 for &(dest, coefficient) in batches.slice(src).iter().rev() {
+                    let dest = coefficient_col_index(dest);
                     let dest_value = coefficients[dest];
                     if dest_value != 0 {
                         add_scaled_coefficient(&mut coefficients[src], dest_value, coefficient);
@@ -678,6 +686,7 @@ fn apply_forward_steps_to_final_coefficients(plan: &CachedSystematicPlan, coeffi
     for step_index in (0..plan.forward_steps.len()).rev() {
         let step = &plan.forward_steps[step_index];
         for &(dest, scalar) in plan.forward_dests.slice(step_index).iter().rev() {
+            let dest = coefficient_col_index(dest);
             let dest_value = coefficients[dest];
             if dest_value != 0 {
                 add_scaled_coefficient(&mut coefficients[step.pivot], dest_value, scalar);
@@ -800,7 +809,7 @@ fn prepare_cached_systematic_plan(
                 debug_assert_ne!(row, pivot);
                 let factor = rows[row][0].1;
                 rows[row].remove(0);
-                forward_dest_entries.push((row, factor));
+                forward_dest_entries.push((coefficient_col(row), factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
@@ -843,7 +852,7 @@ fn prepare_cached_systematic_plan(
                         &mut row_merge_scratch,
                     );
                 }
-                forward_dest_entries.push((row, factor));
+                forward_dest_entries.push((coefficient_col(row), factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
@@ -876,7 +885,7 @@ fn prepare_cached_systematic_plan(
                     factor,
                     &mut row_merge_scratch,
                 );
-                forward_dest_entries.push((row, factor));
+                forward_dest_entries.push((coefficient_col(row), factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
                     debug_assert!(coefficient_col_index(next_col) > col);
@@ -1005,7 +1014,10 @@ fn prepare_flat_back_substitution_batches(
             // The first pass counted this slot, and each dependent column advances
             // monotonically inside its assigned range.
             unsafe {
-                entries.as_mut_ptr().add(offset).write((col, coefficient));
+                entries
+                    .as_mut_ptr()
+                    .add(offset)
+                    .write((coefficient_col(col), coefficient));
             }
             offsets[dependent_col] += 1;
         }
@@ -1044,7 +1056,11 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
         if let Some(scale) = step.scale {
             mulassign_scalar(symbols.get_mut(step.pivot), &scale);
         }
-        fused_addassign_symbol_batch(symbols, step.pivot, plan.forward_dests.slice(step_index));
+        fused_addassign_cached_symbol_batch(
+            symbols,
+            step.pivot,
+            plan.forward_dests.slice(step_index),
+        );
     }
 
     move_pivot_symbols_to_columns(symbols, &plan.pivot_symbol_cycles);
@@ -1065,7 +1081,48 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
         }
         CachedSystematicBackSubstitution::FlatBatches(batches) => {
             for src in (0..plan.width).rev() {
-                fused_addassign_symbol_batch(symbols, src, batches.slice(src));
+                fused_addassign_cached_symbol_batch(symbols, src, batches.slice(src));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+fn fused_addassign_cached_symbol_batch(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    dests: &[(CoefficientColumn, Octet)],
+) {
+    if dests.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let bytes = symbols.as_mut_bytes();
+    let src_start = src * symbol_size;
+    assert!(src_start + symbol_size <= bytes.len());
+    let src_ptr = unsafe { bytes.as_ptr().add(src_start) };
+    let src_symbol = unsafe { core::slice::from_raw_parts(src_ptr, symbol_size) };
+    if bytes_are_zero(src_symbol) {
+        return;
+    }
+    let bytes_ptr = bytes.as_mut_ptr();
+
+    for &(dest, scalar) in dests {
+        if scalar.is_zero() {
+            continue;
+        }
+        let dest = coefficient_col_index(dest);
+        assert_ne!(dest, src);
+        let dest_start = dest * symbol_size;
+        assert!(dest_start + symbol_size <= bytes.len());
+        unsafe {
+            let dest_symbol =
+                core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
+            if scalar == Octet::one() {
+                add_assign(dest_symbol, src_symbol);
+            } else {
+                fused_addassign_mul_scalar(dest_symbol, src_symbol, &scalar);
             }
         }
     }
@@ -2461,7 +2518,7 @@ fn pop_lightest_coefficient_row_bucket(
     }
     if rows[head].len() == 1 {
         bucket_heads[col] = next_in_bucket[head];
-        next_in_bucket[head] = None;
+        next_in_bucket[head] = NO_BUCKET_ROW;
         return Some((head, rows[head][0].1));
     }
 
