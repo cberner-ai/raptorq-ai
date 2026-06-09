@@ -50,6 +50,8 @@ const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
+const FORWARD_DESTS_PER_SYMBOL_CAPACITY_HINT: usize = 96;
+#[cfg(feature = "std")]
 const SHORT_PIVOT_MERGE_MAX_LEN: usize = 64;
 #[cfg(feature = "std")]
 const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
@@ -770,7 +772,8 @@ fn prepare_cached_systematic_plan(
 
     let mut forward_steps = Vec::with_capacity(width);
     let mut forward_dest_ranges = Vec::with_capacity(width);
-    let mut forward_dest_entries = Vec::new();
+    let mut forward_dest_entries =
+        Vec::with_capacity(width.saturating_mul(FORWARD_DESTS_PER_SYMBOL_CAPACITY_HINT));
     let mut pivot_for_col = vec![usize::MAX; width];
     let mut is_pivot_row = vec![false; height];
 
