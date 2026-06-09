@@ -34,6 +34,8 @@ const NO_BUCKET_ROW: usize = usize::MAX;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
+const SPARSE_SOURCE_MERGE_DEST_FACTOR: usize = 8;
+const SPARSE_SOURCE_MERGE_MAX_SOURCE_LEN: usize = 48;
 const TRIANGULAR_RECORDING_MIN_WIDTH: usize = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
 const SQUARE_HYBRID_MAX_WIDTH: usize = 16_384;
 const OVERDETERMINED_HYBRID_MAX_WIDTH: usize = 16_384;
@@ -2729,9 +2731,19 @@ fn add_scaled_matrix_row(
     } else {
         src.partition_point(|&(col, _)| col < start_col)
     };
+    let src_tail_len = src.len() - src_index;
+    if use_sparse_source_merge(dest.len(), src_tail_len) {
+        let dest_start = if dest.first().is_some_and(|&(col, _)| col >= start_col) {
+            0
+        } else {
+            dest.partition_point(|&(col, _)| col < start_col)
+        };
+        add_scaled_sparse_source_matrix_row_tail(dest, &src[src_index..], scalar, dest_start);
+        return;
+    }
     let table = scalar.mul_table();
     scratch.clear();
-    scratch.reserve(dest.len() + src.len() - src_index);
+    scratch.reserve(dest.len() + src_tail_len);
 
     while dest_index < dest.len() || src_index < src.len() {
         match (dest.get(dest_index), src.get(src_index)) {
@@ -2768,6 +2780,69 @@ fn add_scaled_matrix_row(
 
 fn multiply_with_table(value: Octet, table: &[u8; 256]) -> Octet {
     Octet::new(table[value.value() as usize])
+}
+
+fn use_sparse_source_merge(dest_len: usize, src_tail_len: usize) -> bool {
+    src_tail_len != 0
+        && src_tail_len <= SPARSE_SOURCE_MERGE_MAX_SOURCE_LEN
+        && dest_len / src_tail_len >= SPARSE_SOURCE_MERGE_DEST_FACTOR
+}
+
+fn add_scaled_sparse_source_matrix_row_tail(
+    dest: &mut CoefficientRow,
+    src_tail: &[(CoefficientColumn, Octet)],
+    scalar: Octet,
+    search_start: usize,
+) {
+    let mut search_start = search_start;
+    if scalar == Octet::one() {
+        for &(src_col, src_value) in src_tail {
+            search_start = add_short_matrix_row_entry(dest, search_start, src_col, src_value);
+        }
+        return;
+    }
+
+    let table = scalar.mul_table();
+    for &(src_col, src_value) in src_tail {
+        search_start = add_short_matrix_row_entry(
+            dest,
+            search_start,
+            src_col,
+            multiply_with_table(src_value, table),
+        );
+    }
+}
+
+fn add_short_matrix_row_entry(
+    dest: &mut CoefficientRow,
+    search_start: usize,
+    src_col: CoefficientColumn,
+    scaled: Octet,
+) -> usize {
+    debug_assert!(search_start <= dest.len());
+    if search_start == dest.len() || dest.last().is_some_and(|&(dest_col, _)| dest_col < src_col) {
+        dest.push((src_col, scaled));
+        return dest.len();
+    }
+
+    let offset = dest[search_start..].partition_point(|&(dest_col, _)| dest_col < src_col);
+    let index = search_start + offset;
+    if dest
+        .get(index)
+        .is_some_and(|&(dest_col, _)| dest_col == src_col)
+    {
+        let value = dest[index].1 + scaled;
+        if value.is_zero() {
+            dest.remove(index);
+            index
+        } else {
+            dest[index].1 = value;
+            index + 1
+        }
+    } else {
+        dest.insert(index, (src_col, scaled));
+        index + 1
+    }
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -3316,6 +3391,36 @@ mod tests {
 
             assert_eq!(short, generic);
         }
+    }
+
+    #[test]
+    fn sparse_source_matrix_row_merge_matches_dense_projection() {
+        let scalar = Octet::new(7);
+        let mut dest = (0..128)
+            .map(|col| (coefficient_col(col), Octet::new((col % 251 + 1) as u8)))
+            .collect::<Vec<_>>();
+        let src = vec![
+            (0, Octet::one()),
+            (5, Octet::new(11)),
+            (31, Octet::new(17)),
+            (64, Octet::new(19)),
+            (127, Octet::new(23)),
+        ];
+        let mut expected_coefficients = dest.iter().map(|&(_, value)| value).collect::<Vec<_>>();
+        let mut scratch = Vec::new();
+
+        add_scaled_matrix_row(&mut dest, &src, 0, scalar, &mut scratch);
+        for &(col, value) in &src {
+            let col = coefficient_col_index(col);
+            expected_coefficients[col] += value * scalar;
+        }
+        let expected = expected_coefficients
+            .into_iter()
+            .enumerate()
+            .filter_map(|(col, value)| (!value.is_zero()).then_some((coefficient_col(col), value)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(dest, expected);
     }
 
     fn bucketed_rebucket_system(
