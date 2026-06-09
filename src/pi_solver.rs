@@ -2791,25 +2791,23 @@ fn add_scaled_normalized_short_matrix_row(
         return;
     }
 
-    let scalar_table = (scalar != Octet::one()).then(|| scalar.mul_table());
+    if scalar == Octet::one() {
+        add_normalized_short_matrix_row_tail(dest, src_tail);
+        return;
+    }
+
+    let scalar_table = scalar.mul_table();
     if dest.is_empty() {
         dest.reserve(src_tail.len());
         for &(src_col, src_value) in src_tail {
-            let scaled = match scalar_table.as_ref() {
-                Some(table) => multiply_with_table(src_value, table),
-                None => src_value,
-            };
-            dest.push((src_col, scaled));
+            dest.push((src_col, multiply_with_table(src_value, scalar_table)));
         }
         return;
     }
 
     let mut search_start = 0usize;
     for &(src_col, src_value) in src_tail {
-        let scaled = match scalar_table.as_ref() {
-            Some(table) => multiply_with_table(src_value, table),
-            None => src_value,
-        };
+        let scaled = multiply_with_table(src_value, scalar_table);
         let offset = dest[search_start..].partition_point(|&(dest_col, _)| dest_col < src_col);
         let index = search_start + offset;
 
@@ -2827,6 +2825,40 @@ fn add_scaled_normalized_short_matrix_row(
             }
         } else {
             dest.insert(index, (src_col, scaled));
+            search_start = index + 1;
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+fn add_normalized_short_matrix_row_tail(
+    dest: &mut CoefficientRow,
+    src_tail: &[(CoefficientColumn, Octet)],
+) {
+    if dest.is_empty() {
+        dest.extend_from_slice(src_tail);
+        return;
+    }
+
+    let mut search_start = 0usize;
+    for &(src_col, src_value) in src_tail {
+        let offset = dest[search_start..].partition_point(|&(dest_col, _)| dest_col < src_col);
+        let index = search_start + offset;
+
+        if dest
+            .get(index)
+            .is_some_and(|&(dest_col, _)| dest_col == src_col)
+        {
+            let value = dest[index].1 + src_value;
+            if value.is_zero() {
+                dest.remove(index);
+                search_start = index;
+            } else {
+                dest[index].1 = value;
+                search_start = index + 1;
+            }
+        } else {
+            dest.insert(index, (src_col, src_value));
             search_start = index + 1;
         }
     }
