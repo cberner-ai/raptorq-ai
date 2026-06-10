@@ -349,13 +349,17 @@ fn cached_systematic_plan_from_matrix<M: BinaryMatrix>(
 
     let width = matrix.width();
     let matrix_height = matrix.height();
-    let rows = coefficient_rows_from_binary_entries(
+    let (rows, binary_rows) = coefficient_rows_from_binary_entries(
         matrix.into_row_entries(),
         matrix_height,
         hdpc_rows,
         source_block_symbols,
     );
-    let generated = Arc::new(prepare_cached_systematic_plan(rows, width));
+    let generated = Arc::new(prepare_cached_systematic_plan_with_binary_rows(
+        rows,
+        width,
+        binary_rows,
+    ));
     let cache = systematic_plan_cache();
     let mut guard = cache
         .lock()
@@ -735,8 +739,9 @@ fn generate_systematic_plan(source_block_symbols: u32) -> CachedSystematicPlan {
     let (matrix, hdpc_rows) =
         generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
     let width = matrix.width();
-    let rows = coefficient_rows(&matrix, &hdpc_rows, source_block_symbols);
-    prepare_cached_systematic_plan(rows, width)
+    let (rows, binary_rows) =
+        coefficient_rows_with_binary_flags(&matrix, &hdpc_rows, source_block_symbols);
+    prepare_cached_systematic_plan_with_binary_rows(rows, width, binary_rows)
 }
 
 #[cfg(feature = "std")]
@@ -745,13 +750,21 @@ pub(crate) fn apply_cached_systematic_plan(source_block_symbols: u32, symbols: &
     apply_prepared_systematic_plan(&plan, symbols);
 }
 
+#[cfg(all(test, feature = "std"))]
+fn prepare_cached_systematic_plan(rows: Vec<CoefficientRow>, width: usize) -> CachedSystematicPlan {
+    let binary_rows = coefficient_row_binary_flags(&rows);
+    prepare_cached_systematic_plan_with_binary_rows(rows, width, binary_rows)
+}
+
 #[cfg(feature = "std")]
-fn prepare_cached_systematic_plan(
+fn prepare_cached_systematic_plan_with_binary_rows(
     mut rows: Vec<CoefficientRow>,
     width: usize,
+    mut binary_rows: Vec<u8>,
 ) -> CachedSystematicPlan {
     let height = rows.len();
     assert_eq!(height, width);
+    assert_eq!(binary_rows.len(), height);
 
     let mut row_merge_scratch = Vec::new();
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
@@ -795,10 +808,12 @@ fn prepare_cached_systematic_plan(
         let scale = if pivot_value != Octet::one() {
             let scalar = pivot_value.inverse();
             scale_matrix_row(&mut rows[pivot], col, scalar);
+            binary_rows[pivot] = 0;
             Some(scalar)
         } else {
             None
         };
+        let pivot_is_binary = binary_rows[pivot] != 0;
 
         let bucket_len = bucket_counts[col];
         let dest_start = forward_dest_entries.len();
@@ -841,21 +856,30 @@ fn prepare_cached_systematic_plan(
                 let factor = rows[row][0].1;
                 let (pivot_coefficients, row_coefficients) =
                     disjoint_coefficient_rows_mut(&mut rows, pivot, row);
-                if pivot_coefficients.len() <= SHORT_PIVOT_MERGE_MAX_LEN {
-                    add_scaled_normalized_short_matrix_row(
-                        row_coefficients,
-                        pivot_coefficients,
-                        col,
-                        factor,
-                    );
+                let binary_merge =
+                    pivot_is_binary && binary_rows[row] != 0 && factor == Octet::one();
+                if binary_merge && pivot_coefficients.len() <= SHORT_PIVOT_MERGE_MAX_LEN {
+                    add_normalized_binary_short_matrix_row(row_coefficients, pivot_coefficients);
                 } else {
-                    add_scaled_matrix_row(
-                        row_coefficients,
-                        pivot_coefficients,
-                        col,
-                        factor,
-                        &mut row_merge_scratch,
-                    );
+                    if !binary_merge {
+                        binary_rows[row] = 0;
+                    }
+                    if pivot_coefficients.len() <= SHORT_PIVOT_MERGE_MAX_LEN {
+                        add_scaled_normalized_short_matrix_row(
+                            row_coefficients,
+                            pivot_coefficients,
+                            col,
+                            factor,
+                        );
+                    } else {
+                        add_scaled_matrix_row(
+                            row_coefficients,
+                            pivot_coefficients,
+                            col,
+                            factor,
+                            &mut row_merge_scratch,
+                        );
+                    }
                 }
                 forward_dest_entries.push((coefficient_col(row), factor));
 
@@ -1211,21 +1235,34 @@ fn coefficient_rows<M: BinaryMatrix>(
     hdpc_rows: &DenseOctetMatrix,
     source_block_symbols: u32,
 ) -> Vec<CoefficientRow> {
+    coefficient_rows_with_binary_flags(matrix, hdpc_rows, source_block_symbols).0
+}
+
+fn coefficient_rows_with_binary_flags<M: BinaryMatrix>(
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    source_block_symbols: u32,
+) -> (Vec<CoefficientRow>, Vec<u8>) {
     let s = num_ldpc_symbols(source_block_symbols) as usize;
     let total_rows = matrix.height() + hdpc_rows.height();
     let mut rows = Vec::with_capacity(total_rows);
+    let mut binary_rows = Vec::with_capacity(total_rows);
     for row in 0..s {
         rows.push(copy_binary_row(matrix, row));
+        binary_rows.push(1);
     }
     for row in 0..hdpc_rows.height() {
         rows.push(copy_octet_row(hdpc_rows, row));
+        binary_rows.push(0);
     }
     for row in s..matrix.height() {
         rows.push(copy_binary_row(matrix, row));
+        binary_rows.push(1);
     }
     debug_assert_eq!(rows.len(), total_rows);
+    debug_assert_eq!(binary_rows.len(), total_rows);
 
-    rows
+    (rows, binary_rows)
 }
 
 fn coefficient_rows_from_binary_entries(
@@ -1233,35 +1270,47 @@ fn coefficient_rows_from_binary_entries(
     matrix_height: usize,
     hdpc_rows: &DenseOctetMatrix,
     source_block_symbols: u32,
-) -> Vec<CoefficientRow> {
+) -> (Vec<CoefficientRow>, Vec<u8>) {
     let s = num_ldpc_symbols(source_block_symbols) as usize;
     assert_eq!(binary_entries.len(), matrix_height);
     assert!(matrix_height >= s);
 
     let total_rows = matrix_height + hdpc_rows.height();
     let mut rows = Vec::with_capacity(total_rows);
+    let mut binary_rows = Vec::with_capacity(total_rows);
     let mut binary_entries = binary_entries.into_iter();
     for _ in 0..s {
         let entries = binary_entries
             .next()
             .expect("LDPC row entries must be present");
         rows.push(coefficient_row_from_binary_entries(entries));
+        binary_rows.push(1);
     }
     for row in 0..hdpc_rows.height() {
         rows.push(copy_octet_row(hdpc_rows, row));
+        binary_rows.push(0);
     }
     for entries in binary_entries {
         rows.push(coefficient_row_from_binary_entries(entries));
+        binary_rows.push(1);
     }
     debug_assert_eq!(rows.len(), total_rows);
+    debug_assert_eq!(binary_rows.len(), total_rows);
 
-    rows
+    (rows, binary_rows)
 }
 
 fn coefficient_row_from_binary_entries(entries: Vec<usize>) -> CoefficientRow {
     entries
         .into_iter()
         .map(|col| (coefficient_col(col), Octet::one()))
+        .collect()
+}
+
+#[cfg(all(test, feature = "std"))]
+fn coefficient_row_binary_flags(rows: &[CoefficientRow]) -> Vec<u8> {
+    rows.iter()
+        .map(|row| u8::from(row.iter().all(|&(_, value)| value == Octet::one())))
         .collect()
 }
 
@@ -2967,6 +3016,84 @@ fn add_scaled_normalized_short_matrix_row_tail_from(
     }
 }
 
+#[cfg(feature = "std")]
+fn add_normalized_binary_short_matrix_row(dest: &mut CoefficientRow, src: &CoefficientRow) {
+    debug_assert!(!dest.is_empty());
+    debug_assert!(!src.is_empty());
+    debug_assert_eq!(dest[0], src[0]);
+    debug_assert_eq!(src[0].1, Octet::one());
+
+    let src_tail = &src[1..];
+    if src_tail.is_empty() {
+        dest.remove(0);
+        return;
+    }
+
+    if dest.len() == 1 {
+        dest.clear();
+        dest.extend_from_slice(src_tail);
+        return;
+    }
+
+    let mut search_start = add_binary_short_matrix_row_entry_and_remove_pivot(dest, src_tail[0].0);
+    for &(src_col, _) in &src_tail[1..] {
+        search_start = add_binary_short_matrix_row_entry_from(dest, src_col, search_start);
+    }
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn add_binary_short_matrix_row_entry_from(
+    dest: &mut CoefficientRow,
+    src_col: CoefficientColumn,
+    search_start: usize,
+) -> usize {
+    let offset = dest[search_start..].partition_point(|&(dest_col, _)| dest_col < src_col);
+    let index = search_start + offset;
+
+    if dest
+        .get(index)
+        .is_some_and(|&(dest_col, _)| dest_col == src_col)
+    {
+        dest.remove(index);
+        index
+    } else {
+        dest.insert(index, (src_col, Octet::one()));
+        index + 1
+    }
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn add_binary_short_matrix_row_entry_and_remove_pivot(
+    dest: &mut CoefficientRow,
+    src_col: CoefficientColumn,
+) -> usize {
+    debug_assert!(!dest.is_empty());
+    let len = dest.len();
+    let offset = dest[1..].partition_point(|&(dest_col, _)| dest_col < src_col);
+    let index = 1 + offset;
+
+    if index < len && dest[index].0 == src_col {
+        if index > 1 {
+            dest.copy_within(1..index, 0);
+        }
+        if index + 1 < len {
+            dest.copy_within(index + 1..len, index - 1);
+        }
+        dest.truncate(len - 2);
+        index - 1
+    } else {
+        if index > 1 {
+            dest.copy_within(1..index, 0);
+        }
+        dest[index - 1] = (src_col, Octet::one());
+        index
+    }
+}
+
+#[cfg(feature = "std")]
+#[inline]
 fn add_short_matrix_row_entry_and_remove_pivot(
     dest: &mut CoefficientRow,
     src_col: CoefficientColumn,
@@ -3471,6 +3598,31 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(dest, expected);
+    }
+
+    #[test]
+    fn normalized_binary_matrix_row_matches_generic_merge() {
+        let one = Octet::one();
+        let cases = [
+            (vec![(2, one)], vec![(2, one), (5, one)]),
+            (vec![(2, one), (3, one)], vec![(2, one), (5, one)]),
+            (vec![(2, one), (9, one)], vec![(2, one), (5, one)]),
+            (
+                vec![(2, one), (5, one), (7, one)],
+                vec![(2, one), (5, one), (8, one)],
+            ),
+        ];
+
+        for (src, dest) in cases {
+            let mut generic = dest.clone();
+            let mut binary_short = dest;
+            let mut scratch = Vec::new();
+
+            add_scaled_matrix_row(&mut generic, &src, 2, one, &mut scratch);
+            add_normalized_binary_short_matrix_row(&mut binary_short, &src);
+
+            assert_eq!(binary_short, generic);
+        }
     }
 
     fn bucketed_rebucket_system(
