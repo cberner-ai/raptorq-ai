@@ -32,6 +32,8 @@ type CoefficientColumn = u16;
 type CoefficientRow = Vec<(CoefficientColumn, Octet)>;
 const NO_BUCKET_ROW: usize = usize::MAX;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
+#[cfg(feature = "std")]
+const SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT: usize = 96;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
 const SPARSE_SOURCE_MERGE_DEST_FACTOR: usize = 8;
@@ -51,8 +53,6 @@ const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WI
 const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH + 1;
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
-#[cfg(feature = "std")]
-const FORWARD_DESTS_PER_SYMBOL_CAPACITY_HINT: usize = 96;
 #[cfg(feature = "std")]
 const SHORT_PIVOT_MERGE_MAX_LEN: usize = 64;
 #[cfg(feature = "std")]
@@ -766,7 +766,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
     assert_eq!(height, width);
     assert_eq!(binary_rows.len(), height);
 
-    let mut row_merge_scratch = Vec::new();
+    let mut row_merge_scratch = Vec::with_capacity(width / 4);
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut unit_bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut bucket_counts = vec![0usize; width];
@@ -788,7 +788,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
     let mut forward_steps = Vec::with_capacity(width);
     let mut forward_dest_ranges = Vec::with_capacity(width);
     let mut forward_dest_entries =
-        Vec::with_capacity(width.saturating_mul(FORWARD_DESTS_PER_SYMBOL_CAPACITY_HINT));
+        Vec::with_capacity(width.saturating_mul(SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT));
     let mut pivot_for_col = vec![usize::MAX; width];
     let mut is_pivot_row = vec![false; height];
 
