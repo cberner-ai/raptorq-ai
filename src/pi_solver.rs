@@ -768,7 +768,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
 
     let mut row_merge_scratch = Vec::with_capacity(width / 4);
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
-    let mut unit_bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut singleton_bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut bucket_counts = vec![0usize; width];
     let mut next_in_bucket = vec![NO_BUCKET_ROW; height];
     for (row, coefficients) in rows.iter().enumerate() {
@@ -776,7 +776,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
             push_counted_row_bucket(
                 &rows,
                 &mut bucket_heads,
-                &mut unit_bucket_heads,
+                &mut singleton_bucket_heads,
                 &mut bucket_counts,
                 &mut next_in_bucket,
                 coefficient_col_index(col),
@@ -796,7 +796,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
         let (pivot, pivot_value) = pop_lightest_counted_coefficient_row_bucket(
             &rows,
             &mut bucket_heads,
-            &mut unit_bucket_heads,
+            &mut singleton_bucket_heads,
             &mut bucket_counts,
             &mut next_in_bucket,
             col,
@@ -821,7 +821,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
         if rows[pivot].len() == 1 {
             while let Some(row) = pop_counted_row_bucket(
                 &mut bucket_heads,
-                &mut unit_bucket_heads,
+                &mut singleton_bucket_heads,
                 &mut bucket_counts,
                 &mut next_in_bucket,
                 col,
@@ -836,7 +836,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
                     push_counted_row_bucket(
                         &rows,
                         &mut bucket_heads,
-                        &mut unit_bucket_heads,
+                        &mut singleton_bucket_heads,
                         &mut bucket_counts,
                         &mut next_in_bucket,
                         coefficient_col_index(next_col),
@@ -847,7 +847,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
         } else if width >= CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH {
             while let Some(row) = pop_counted_row_bucket(
                 &mut bucket_heads,
-                &mut unit_bucket_heads,
+                &mut singleton_bucket_heads,
                 &mut bucket_counts,
                 &mut next_in_bucket,
                 col,
@@ -888,7 +888,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
                     push_counted_row_bucket(
                         &rows,
                         &mut bucket_heads,
-                        &mut unit_bucket_heads,
+                        &mut singleton_bucket_heads,
                         &mut bucket_counts,
                         &mut next_in_bucket,
                         coefficient_col_index(next_col),
@@ -900,7 +900,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
             let pivot_coefficients = rows[pivot].clone();
             while let Some(row) = pop_counted_row_bucket(
                 &mut bucket_heads,
-                &mut unit_bucket_heads,
+                &mut singleton_bucket_heads,
                 &mut bucket_counts,
                 &mut next_in_bucket,
                 col,
@@ -921,7 +921,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
                     push_counted_row_bucket(
                         &rows,
                         &mut bucket_heads,
-                        &mut unit_bucket_heads,
+                        &mut singleton_bucket_heads,
                         &mut bucket_counts,
                         &mut next_in_bucket,
                         coefficient_col_index(next_col),
@@ -2506,22 +2506,26 @@ fn push_row_bucket(
 fn push_counted_row_bucket(
     rows: &[CoefficientRow],
     bucket_heads: &mut [usize],
-    unit_bucket_heads: &mut [usize],
+    singleton_bucket_heads: &mut [usize],
     bucket_counts: &mut [usize],
     next_in_bucket: &mut [usize],
     col: usize,
     row: usize,
 ) {
-    if is_unit_bucket_row(&rows[row], col) {
-        push_row_bucket(unit_bucket_heads, next_in_bucket, col, row);
+    debug_assert_eq!(
+        rows[row].first().map(|&(entry_col, _)| entry_col),
+        Some(coefficient_col(col))
+    );
+    if is_singleton_bucket_row(&rows[row], col) {
+        push_row_bucket(singleton_bucket_heads, next_in_bucket, col, row);
     } else {
         push_row_bucket(bucket_heads, next_in_bucket, col, row);
     }
     bucket_counts[col] += 1;
 }
 
-fn is_unit_bucket_row(row: &CoefficientRow, col: usize) -> bool {
-    row.len() == 1 && row[0] == (coefficient_col(col), Octet::one())
+fn is_singleton_bucket_row(row: &CoefficientRow, col: usize) -> bool {
+    row.len() == 1 && row[0].0 == coefficient_col(col)
 }
 
 fn pop_row_bucket(
@@ -2540,12 +2544,12 @@ fn pop_row_bucket(
 
 fn pop_counted_row_bucket(
     bucket_heads: &mut [usize],
-    unit_bucket_heads: &mut [usize],
+    singleton_bucket_heads: &mut [usize],
     bucket_counts: &mut [usize],
     next_in_bucket: &mut [usize],
     col: usize,
 ) -> Option<usize> {
-    let row = pop_row_bucket(unit_bucket_heads, next_in_bucket, col)
+    let row = pop_row_bucket(singleton_bucket_heads, next_in_bucket, col)
         .or_else(|| pop_row_bucket(bucket_heads, next_in_bucket, col))?;
     debug_assert_ne!(bucket_counts[col], 0);
     bucket_counts[col] -= 1;
@@ -2553,6 +2557,34 @@ fn pop_counted_row_bucket(
 }
 
 fn pop_lightest_coefficient_row_bucket(
+    rows: &[CoefficientRow],
+    bucket_heads: &mut [usize],
+    next_in_bucket: &mut [usize],
+    col: usize,
+) -> Option<(usize, Octet)> {
+    pop_lightest_coefficient_row_bucket_with_min_suffix::<1>(
+        rows,
+        bucket_heads,
+        next_in_bucket,
+        col,
+    )
+}
+
+fn pop_lightest_non_singleton_coefficient_row_bucket(
+    rows: &[CoefficientRow],
+    bucket_heads: &mut [usize],
+    next_in_bucket: &mut [usize],
+    col: usize,
+) -> Option<(usize, Octet)> {
+    pop_lightest_coefficient_row_bucket_with_min_suffix::<2>(
+        rows,
+        bucket_heads,
+        next_in_bucket,
+        col,
+    )
+}
+
+fn pop_lightest_coefficient_row_bucket_with_min_suffix<const MIN_SUFFIX_LEN: usize>(
     rows: &[CoefficientRow],
     bucket_heads: &mut [usize],
     next_in_bucket: &mut [usize],
@@ -2566,20 +2598,22 @@ fn pop_lightest_coefficient_row_bucket(
         rows[head].first().map(|&(entry_col, _)| entry_col),
         Some(coefficient_col(col))
     );
+    debug_assert!(rows[head].len() >= MIN_SUFFIX_LEN);
     if next_in_bucket[head] == NO_BUCKET_ROW {
         bucket_heads[col] = NO_BUCKET_ROW;
         return Some((head, rows[head][0].1));
     }
-    if rows[head].len() == 1 {
+    let head_value = rows[head][0].1;
+    if rows[head].len() == MIN_SUFFIX_LEN && (MIN_SUFFIX_LEN == 1 || head_value == Octet::one()) {
         bucket_heads[col] = next_in_bucket[head];
         next_in_bucket[head] = NO_BUCKET_ROW;
-        return Some((head, rows[head][0].1));
+        return Some((head, head_value));
     }
 
     let mut best = head;
     let mut best_previous = NO_BUCKET_ROW;
     let mut best_suffix_len = rows[head].len();
-    let mut best_value = rows[head][0].1;
+    let mut best_value = head_value;
     let mut previous = head;
     let mut current = next_in_bucket[head];
 
@@ -2589,6 +2623,7 @@ fn pop_lightest_coefficient_row_bucket(
             rows[row].first().map(|&(entry_col, _)| entry_col),
             Some(coefficient_col(col))
         );
+        debug_assert!(rows[row].len() >= MIN_SUFFIX_LEN);
         let value = rows[row][0].1;
         let suffix_len = rows[row].len();
         if suffix_len < best_suffix_len
@@ -2600,7 +2635,7 @@ fn pop_lightest_coefficient_row_bucket(
             best_previous = previous;
             best_suffix_len = suffix_len;
             best_value = value;
-            if suffix_len == 1 {
+            if suffix_len == MIN_SUFFIX_LEN && (MIN_SUFFIX_LEN == 1 || best_value == Octet::one()) {
                 break;
             }
         }
@@ -2620,16 +2655,16 @@ fn pop_lightest_coefficient_row_bucket(
 fn pop_lightest_counted_coefficient_row_bucket(
     rows: &[CoefficientRow],
     bucket_heads: &mut [usize],
-    unit_bucket_heads: &mut [usize],
+    singleton_bucket_heads: &mut [usize],
     bucket_counts: &mut [usize],
     next_in_bucket: &mut [usize],
     col: usize,
 ) -> Option<(usize, Octet)> {
-    let result = if let Some(row) = pop_row_bucket(unit_bucket_heads, next_in_bucket, col) {
-        debug_assert!(is_unit_bucket_row(&rows[row], col));
-        (row, Octet::one())
+    let result = if let Some(row) = pop_row_bucket(singleton_bucket_heads, next_in_bucket, col) {
+        debug_assert!(is_singleton_bucket_row(&rows[row], col));
+        (row, rows[row][0].1)
     } else {
-        pop_lightest_coefficient_row_bucket(rows, bucket_heads, next_in_bucket, col)?
+        pop_lightest_non_singleton_coefficient_row_bucket(rows, bucket_heads, next_in_bucket, col)?
     };
     debug_assert_ne!(bucket_counts[col], 0);
     bucket_counts[col] -= 1;
@@ -3455,6 +3490,51 @@ mod tests {
 
         assert_eq!(replayed, expected.unwrap());
         assert!(ops.is_none());
+    }
+
+    #[test]
+    fn prepared_systematic_plan_handles_non_unit_singleton_pivot() {
+        let rows = vec![
+            vec![(0, Octet::new(7))],
+            vec![(0, Octet::new(3)), (1, Octet::new(5))],
+        ];
+        let symbols = SymbolSlab::from_bytes(vec![11, 19], 1);
+
+        let (expected, _) = solve(rows.clone(), 2, symbols.clone(), OperationRecording::Skip);
+        let plan = prepare_cached_systematic_plan(rows, 2);
+        let mut replayed = symbols;
+        apply_prepared_systematic_plan(&plan, &mut replayed);
+
+        assert_eq!(replayed, expected.unwrap());
+    }
+
+    #[test]
+    fn non_singleton_bucket_preserves_unit_tie_break_at_min_suffix() {
+        let rows = vec![
+            vec![
+                (coefficient_col(0), Octet::new(7)),
+                (coefficient_col(2), Octet::one()),
+            ],
+            vec![
+                (coefficient_col(0), Octet::one()),
+                (coefficient_col(1), Octet::one()),
+            ],
+        ];
+        let mut bucket_heads = vec![NO_BUCKET_ROW; 1];
+        let mut next_in_bucket = vec![NO_BUCKET_ROW; rows.len()];
+
+        push_row_bucket(&mut bucket_heads, &mut next_in_bucket, 0, 1);
+        push_row_bucket(&mut bucket_heads, &mut next_in_bucket, 0, 0);
+
+        assert_eq!(
+            pop_lightest_non_singleton_coefficient_row_bucket(
+                &rows,
+                &mut bucket_heads,
+                &mut next_in_bucket,
+                0,
+            ),
+            Some((1, Octet::one()))
+        );
     }
 
     fn prepared_plan_test_system() -> (Vec<CoefficientRow>, SymbolSlab) {
