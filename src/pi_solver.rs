@@ -828,7 +828,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
             ) {
                 debug_assert_ne!(row, pivot);
                 let factor = rows[row][0].1;
-                rows[row].remove(0);
+                remove_matrix_row_entry_at(&mut rows[row], 0);
                 forward_dest_entries.push((coefficient_col(row), factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
@@ -2831,6 +2831,31 @@ fn multiply_with_table(value: Octet, table: &[u8; 256]) -> Octet {
     Octet::new(table[value.value() as usize])
 }
 
+#[inline]
+fn remove_matrix_row_entry_at(row: &mut CoefficientRow, index: usize) {
+    let len = row.len();
+    debug_assert!(index < len);
+    if index + 1 < len {
+        row.copy_within(index + 1..len, index);
+    }
+    row.truncate(len - 1);
+}
+
+#[inline]
+fn insert_matrix_row_entry_at(
+    row: &mut CoefficientRow,
+    index: usize,
+    entry: (CoefficientColumn, Octet),
+) {
+    let len = row.len();
+    debug_assert!(index <= len);
+    row.push(entry);
+    if index < len {
+        row.copy_within(index..len, index + 1);
+        row[index] = entry;
+    }
+}
+
 fn use_sparse_source_merge(dest_len: usize, src_tail_len: usize) -> bool {
     src_tail_len != 0
         && src_tail_len <= SPARSE_SOURCE_MERGE_MAX_SOURCE_LEN
@@ -2874,22 +2899,39 @@ fn add_short_matrix_row_entry(
         return dest.len();
     }
 
-    let offset = dest[search_start..].partition_point(|&(dest_col, _)| dest_col < src_col);
-    let index = search_start + offset;
+    let &(dest_col, dest_value) = &dest[search_start];
+    if dest_col == src_col {
+        let value = dest_value + scaled;
+        if value.is_zero() {
+            remove_matrix_row_entry_at(dest, search_start);
+            return search_start;
+        }
+
+        dest[search_start].1 = value;
+        return search_start + 1;
+    }
+    if dest_col > src_col {
+        insert_matrix_row_entry_at(dest, search_start, (src_col, scaled));
+        return search_start + 1;
+    }
+
+    let search_from = search_start + 1;
+    let offset = dest[search_from..].partition_point(|&(dest_col, _)| dest_col < src_col);
+    let index = search_from + offset;
     if dest
         .get(index)
         .is_some_and(|&(dest_col, _)| dest_col == src_col)
     {
         let value = dest[index].1 + scaled;
         if value.is_zero() {
-            dest.remove(index);
+            remove_matrix_row_entry_at(dest, index);
             index
         } else {
             dest[index].1 = value;
             index + 1
         }
     } else {
-        dest.insert(index, (src_col, scaled));
+        insert_matrix_row_entry_at(dest, index, (src_col, scaled));
         index + 1
     }
 }
@@ -2968,7 +3010,7 @@ fn add_scaled_normalized_short_matrix_row(
         if dest.len() == 1 {
             dest.clear();
         } else {
-            dest.remove(0);
+            remove_matrix_row_entry_at(dest, 0);
         }
         return;
     };
@@ -3025,7 +3067,7 @@ fn add_normalized_binary_short_matrix_row(dest: &mut CoefficientRow, src: &Coeff
 
     let src_tail = &src[1..];
     if src_tail.is_empty() {
-        dest.remove(0);
+        remove_matrix_row_entry_at(dest, 0);
         return;
     }
 
@@ -3048,17 +3090,33 @@ fn add_binary_short_matrix_row_entry_from(
     src_col: CoefficientColumn,
     search_start: usize,
 ) -> usize {
-    let offset = dest[search_start..].partition_point(|&(dest_col, _)| dest_col < src_col);
-    let index = search_start + offset;
+    if search_start == dest.len() || dest.last().is_some_and(|&(dest_col, _)| dest_col < src_col) {
+        dest.push((src_col, Octet::one()));
+        return dest.len();
+    }
+
+    let dest_col = dest[search_start].0;
+    if dest_col == src_col {
+        remove_matrix_row_entry_at(dest, search_start);
+        return search_start;
+    }
+    if dest_col > src_col {
+        insert_matrix_row_entry_at(dest, search_start, (src_col, Octet::one()));
+        return search_start + 1;
+    }
+
+    let search_from = search_start + 1;
+    let offset = dest[search_from..].partition_point(|&(dest_col, _)| dest_col < src_col);
+    let index = search_from + offset;
 
     if dest
         .get(index)
         .is_some_and(|&(dest_col, _)| dest_col == src_col)
     {
-        dest.remove(index);
+        remove_matrix_row_entry_at(dest, index);
         index
     } else {
-        dest.insert(index, (src_col, Octet::one()));
+        insert_matrix_row_entry_at(dest, index, (src_col, Octet::one()));
         index + 1
     }
 }
