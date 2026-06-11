@@ -39,6 +39,7 @@ const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
 const SPARSE_SOURCE_MERGE_DEST_FACTOR: usize = 4;
 const SPARSE_SOURCE_MERGE_MAX_SOURCE_LEN: usize = 256;
 const SPARSE_SOURCE_LINEAR_SCAN_LIMIT: usize = 14;
+const SHORT_ROW_LINEAR_SCAN_LIMIT: usize = 8;
 const TRIANGULAR_RECORDING_MIN_WIDTH: usize = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
 const SQUARE_HYBRID_MAX_WIDTH: usize = 16_384;
 const OVERDETERMINED_HYBRID_MAX_WIDTH: usize = 16_384;
@@ -55,7 +56,7 @@ const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
-const SHORT_PIVOT_MERGE_MAX_LEN: usize = 64;
+const SHORT_PIVOT_MERGE_MAX_LEN: usize = 48;
 #[cfg(feature = "std")]
 const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
 #[cfg(all(test, feature = "std"))]
@@ -3052,24 +3053,51 @@ fn add_short_matrix_row_entry(
         return search_start + 1;
     }
 
-    let search_from = search_start + 1;
-    let offset = dest[search_from..].partition_point(|&(dest_col, _)| dest_col < src_col);
-    let index = search_from + offset;
-    if dest
-        .get(index)
-        .is_some_and(|&(dest_col, _)| dest_col == src_col)
-    {
-        let value = dest[index].1 + scaled;
-        if value.is_zero() {
-            remove_matrix_row_entry_at(dest, index);
-            index
-        } else {
-            dest[index].1 = value;
+    match find_matrix_row_entry_from(dest, search_start + 1, src_col, SHORT_ROW_LINEAR_SCAN_LIMIT) {
+        Ok(index) => {
+            let value = dest[index].1 + scaled;
+            if value.is_zero() {
+                remove_matrix_row_entry_at(dest, index);
+                index
+            } else {
+                dest[index].1 = value;
+                index + 1
+            }
+        }
+        Err(index) => {
+            insert_matrix_row_entry_at(dest, index, (src_col, scaled));
             index + 1
         }
+    }
+}
+
+#[inline]
+fn find_matrix_row_entry_from(
+    row: &CoefficientRow,
+    mut search_start: usize,
+    col: CoefficientColumn,
+    mut linear_limit: usize,
+) -> Result<usize, usize> {
+    while search_start < row.len() && linear_limit != 0 {
+        let row_col = row[search_start].0;
+        if row_col < col {
+            search_start += 1;
+            linear_limit -= 1;
+            continue;
+        }
+        return if row_col == col {
+            Ok(search_start)
+        } else {
+            Err(search_start)
+        };
+    }
+
+    let offset = row[search_start..].partition_point(|&(row_col, _)| row_col < col);
+    let index = search_start + offset;
+    if row.get(index).is_some_and(|&(row_col, _)| row_col == col) {
+        Ok(index)
     } else {
-        insert_matrix_row_entry_at(dest, index, (src_col, scaled));
-        index + 1
+        Err(index)
     }
 }
 
@@ -3242,19 +3270,15 @@ fn add_binary_short_matrix_row_entry_from(
         return search_start + 1;
     }
 
-    let search_from = search_start + 1;
-    let offset = dest[search_from..].partition_point(|&(dest_col, _)| dest_col < src_col);
-    let index = search_from + offset;
-
-    if dest
-        .get(index)
-        .is_some_and(|&(dest_col, _)| dest_col == src_col)
-    {
-        remove_matrix_row_entry_at(dest, index);
-        index
-    } else {
-        insert_matrix_row_entry_at(dest, index, (src_col, Octet::one()));
-        index + 1
+    match find_matrix_row_entry_from(dest, search_start + 1, src_col, SHORT_ROW_LINEAR_SCAN_LIMIT) {
+        Ok(index) => {
+            remove_matrix_row_entry_at(dest, index);
+            index
+        }
+        Err(index) => {
+            insert_matrix_row_entry_at(dest, index, (src_col, Octet::one()));
+            index + 1
+        }
     }
 }
 
