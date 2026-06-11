@@ -2,7 +2,7 @@ use crate::base::deg;
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
-use crate::rng::rand;
+use crate::rng::RfcRand;
 use crate::systematic_constants::{
     calculate_p1, extended_source_block_symbols, num_hdpc_symbols, num_intermediate_symbols,
     num_ldpc_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
@@ -195,16 +195,14 @@ impl EncodingTupleParameters {
 
     #[inline]
     fn tuple_from_y(self, internal_symbol_id: u32, y: u32) -> (u32, u32, u32, u32, u32, u32) {
-        let d = deg(rand(y, 0u32, 1048576), self.lt_symbols);
-        let a = 1 + rand(y, 1u32, self.lt_symbols - 1);
-        let b = rand(y, 2u32, self.lt_symbols);
-        let d1 = if d < 4 {
-            2 + rand(internal_symbol_id, 3u32, 2)
-        } else {
-            2
-        };
-        let a1 = 1 + rand(internal_symbol_id, 4u32, self.p1 - 1);
-        let b1 = rand(internal_symbol_id, 5u32, self.p1);
+        let y_rand = RfcRand::new(y);
+        let d = deg(y_rand.get(0u32, 1048576), self.lt_symbols);
+        let a = 1 + y_rand.get(1u32, self.lt_symbols - 1);
+        let b = y_rand.get(2u32, self.lt_symbols);
+        let isi_rand = RfcRand::new(internal_symbol_id);
+        let d1 = if d < 4 { 2 + isi_rand.get(3u32, 2) } else { 2 };
+        let a1 = 1 + isi_rand.get(4u32, self.p1 - 1);
+        let b1 = isi_rand.get(5u32, self.p1);
 
         (d, a, b, d1, a1, b1)
     }
@@ -342,8 +340,9 @@ fn generate_hdpc_rows_uncached(k_prime: u32) -> DenseOctetMatrix {
     let mut mt = vec![Octet::zero(); h as usize * gamma_width as usize];
 
     for j in 0..(gamma_width - 1) {
-        let row_a = rand(j + 1, 6u32, h);
-        let row_b = (row_a + rand(j + 1, 7u32, h - 1) + 1) % h;
+        let random = RfcRand::new(j + 1);
+        let row_a = random.get(6u32, h);
+        let row_b = (row_a + random.get(7u32, h - 1) + 1) % h;
         mt[row_a as usize * gamma_width as usize + j as usize] += Octet::one();
         mt[row_b as usize * gamma_width as usize + j as usize] += Octet::one();
     }
