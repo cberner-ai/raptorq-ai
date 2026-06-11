@@ -36,8 +36,9 @@ pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 const SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT: usize = 96;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
-const SPARSE_SOURCE_MERGE_DEST_FACTOR: usize = 8;
-const SPARSE_SOURCE_MERGE_MAX_SOURCE_LEN: usize = 48;
+const SPARSE_SOURCE_MERGE_DEST_FACTOR: usize = 4;
+const SPARSE_SOURCE_MERGE_MAX_SOURCE_LEN: usize = 256;
+const SPARSE_SOURCE_LINEAR_SCAN_LIMIT: usize = 14;
 const TRIANGULAR_RECORDING_MIN_WIDTH: usize = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
 const SQUARE_HYBRID_MAX_WIDTH: usize = 16_384;
 const OVERDETERMINED_HYBRID_MAX_WIDTH: usize = 16_384;
@@ -2906,19 +2907,75 @@ fn add_scaled_sparse_source_matrix_row_tail(
     let mut search_start = search_start;
     if scalar == Octet::one() {
         for &(src_col, src_value) in src_tail {
-            search_start = add_short_matrix_row_entry(dest, search_start, src_col, src_value);
+            search_start =
+                add_sparse_source_matrix_row_entry(dest, search_start, src_col, src_value);
         }
         return;
     }
 
     let table = scalar.mul_table();
     for &(src_col, src_value) in src_tail {
-        search_start = add_short_matrix_row_entry(
+        search_start = add_sparse_source_matrix_row_entry(
             dest,
             search_start,
             src_col,
             multiply_with_table(src_value, table),
         );
+    }
+}
+
+fn add_sparse_source_matrix_row_entry(
+    dest: &mut CoefficientRow,
+    mut search_start: usize,
+    src_col: CoefficientColumn,
+    scaled: Octet,
+) -> usize {
+    debug_assert!(search_start <= dest.len());
+    if search_start == dest.len() || dest.last().is_some_and(|&(dest_col, _)| dest_col < src_col) {
+        dest.push((src_col, scaled));
+        return dest.len();
+    }
+
+    let mut remaining_linear = SPARSE_SOURCE_LINEAR_SCAN_LIMIT;
+    while remaining_linear != 0 {
+        let (dest_col, dest_value) = dest[search_start];
+        if dest_col < src_col {
+            search_start += 1;
+            remaining_linear -= 1;
+            continue;
+        }
+        if dest_col == src_col {
+            let value = dest_value + scaled;
+            if value.is_zero() {
+                remove_matrix_row_entry_at(dest, search_start);
+                return search_start;
+            }
+
+            dest[search_start].1 = value;
+            return search_start + 1;
+        }
+
+        insert_matrix_row_entry_at(dest, search_start, (src_col, scaled));
+        return search_start + 1;
+    }
+
+    let offset = dest[search_start..].partition_point(|&(dest_col, _)| dest_col < src_col);
+    let index = search_start + offset;
+    if dest
+        .get(index)
+        .is_some_and(|&(dest_col, _)| dest_col == src_col)
+    {
+        let value = dest[index].1 + scaled;
+        if value.is_zero() {
+            remove_matrix_row_entry_at(dest, index);
+            index
+        } else {
+            dest[index].1 = value;
+            index + 1
+        }
+    } else {
+        insert_matrix_row_entry_at(dest, index, (src_col, scaled));
+        index + 1
     }
 }
 
