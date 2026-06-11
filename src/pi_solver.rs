@@ -218,6 +218,7 @@ enum CachedSystematicBackSubstitution {
 struct CachedSystematicSlices {
     ranges: Vec<(usize, usize)>,
     entries: Vec<(CoefficientColumn, Octet)>,
+    unit_only: Vec<bool>,
 }
 
 #[cfg(feature = "std")]
@@ -233,6 +234,10 @@ impl CachedSystematicSlices {
     fn slice(&self, index: usize) -> &[(CoefficientColumn, Octet)] {
         let (start, end) = self.ranges[index];
         &self.entries[start..end]
+    }
+
+    fn is_unit_only(&self, index: usize) -> bool {
+        self.unit_only[index]
     }
 }
 
@@ -788,6 +793,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
 
     let mut forward_steps = Vec::with_capacity(width);
     let mut forward_dest_ranges = Vec::with_capacity(width);
+    let mut forward_dest_unit_only = Vec::with_capacity(width);
     let mut forward_dest_entries =
         Vec::with_capacity(width.saturating_mul(SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT));
     let mut pivot_for_col = vec![usize::MAX; width];
@@ -818,6 +824,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
 
         let bucket_len = bucket_counts[col];
         let dest_start = forward_dest_entries.len();
+        let mut dest_unit_only = true;
         forward_dest_entries.reserve(bucket_len);
         if rows[pivot].len() == 1 {
             while let Some(row) = pop_counted_row_bucket(
@@ -830,6 +837,9 @@ fn prepare_cached_systematic_plan_with_binary_rows(
                 debug_assert_ne!(row, pivot);
                 let factor = rows[row][0].1;
                 remove_matrix_row_entry_at(&mut rows[row], 0);
+                if dest_unit_only && factor != Octet::one() {
+                    dest_unit_only = false;
+                }
                 forward_dest_entries.push((coefficient_col(row), factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
@@ -882,6 +892,9 @@ fn prepare_cached_systematic_plan_with_binary_rows(
                         );
                     }
                 }
+                if dest_unit_only && factor != Octet::one() {
+                    dest_unit_only = false;
+                }
                 forward_dest_entries.push((coefficient_col(row), factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
@@ -915,6 +928,9 @@ fn prepare_cached_systematic_plan_with_binary_rows(
                     factor,
                     &mut row_merge_scratch,
                 );
+                if dest_unit_only && factor != Octet::one() {
+                    dest_unit_only = false;
+                }
                 forward_dest_entries.push((coefficient_col(row), factor));
 
                 if let Some(&(next_col, _)) = rows[row].first() {
@@ -932,6 +948,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
             }
         }
         forward_dest_ranges.push((dest_start, forward_dest_entries.len()));
+        forward_dest_unit_only.push(dest_unit_only);
 
         forward_steps.push(CachedSystematicForwardStep { pivot, scale });
     }
@@ -974,6 +991,7 @@ fn prepare_cached_systematic_plan_with_binary_rows(
         forward_dests: CachedSystematicSlices {
             ranges: forward_dest_ranges,
             entries: forward_dest_entries,
+            unit_only: forward_dest_unit_only,
         },
         pivot_symbol_cycles: pivot_symbol_cycles(&pivot_for_col),
         back_substitution,
@@ -1033,11 +1051,15 @@ fn prepare_flat_back_substitution_batches(
     }
 
     let (ranges, mut offsets, mut entries, entries_len) = slices_from_counts(counts);
+    let mut unit_only = vec![true; width];
     for (col, &pivot) in pivot_for_col.iter().enumerate() {
         for &(dependent_col, coefficient) in rows[pivot].iter().rev() {
             let dependent_col = coefficient_col_index(dependent_col);
             if dependent_col <= col {
                 break;
+            }
+            if unit_only[dependent_col] && coefficient != Octet::one() {
+                unit_only[dependent_col] = false;
             }
             let offset = offsets[dependent_col];
             debug_assert!(offset < entries_len);
@@ -1061,7 +1083,11 @@ fn prepare_flat_back_substitution_batches(
         entries.set_len(entries_len);
     }
 
-    CachedSystematicSlices { ranges, entries }
+    CachedSystematicSlices {
+        ranges,
+        entries,
+        unit_only,
+    }
 }
 
 #[cfg(feature = "std")]
@@ -1090,6 +1116,7 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
             symbols,
             step.pivot,
             plan.forward_dests.slice(step_index),
+            plan.forward_dests.is_unit_only(step_index),
         );
     }
 
@@ -1111,7 +1138,12 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
         }
         CachedSystematicBackSubstitution::FlatBatches(batches) => {
             for src in (0..plan.width).rev() {
-                fused_addassign_cached_symbol_batch(symbols, src, batches.slice(src));
+                fused_addassign_cached_symbol_batch(
+                    symbols,
+                    src,
+                    batches.slice(src),
+                    batches.is_unit_only(src),
+                );
             }
         }
     }
@@ -1122,6 +1154,7 @@ fn fused_addassign_cached_symbol_batch(
     symbols: &mut SymbolSlab,
     src: usize,
     dests: &[(CoefficientColumn, Octet)],
+    unit_only: bool,
 ) {
     if dests.is_empty() {
         return;
@@ -1138,10 +1171,22 @@ fn fused_addassign_cached_symbol_batch(
     }
     let bytes_ptr = bytes.as_mut_ptr();
 
-    for &(dest, scalar) in dests {
-        if scalar.is_zero() {
-            continue;
+    if unit_only {
+        for &(dest, _) in dests {
+            let dest = coefficient_col_index(dest);
+            assert_ne!(dest, src);
+            let dest_start = dest * symbol_size;
+            assert!(dest_start + symbol_size <= bytes.len());
+            unsafe {
+                let dest_symbol =
+                    core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
+                add_assign(dest_symbol, src_symbol);
+            }
         }
+        return;
+    }
+
+    for &(dest, scalar) in dests {
         let dest = coefficient_col_index(dest);
         assert_ne!(dest, src);
         let dest_start = dest * symbol_size;
@@ -4197,6 +4242,7 @@ mod tests {
                 forward_dests: CachedSystematicSlices {
                     ranges: Vec::new(),
                     entries: Vec::new(),
+                    unit_only: Vec::new(),
                 },
                 pivot_symbol_cycles: Vec::new(),
                 back_substitution: CachedSystematicBackSubstitution::Rows(Vec::new()),
@@ -4295,6 +4341,7 @@ mod tests {
             forward_dests: CachedSystematicSlices {
                 ranges: Vec::new(),
                 entries: Vec::new(),
+                unit_only: Vec::new(),
             },
             pivot_symbol_cycles: Vec::new(),
             back_substitution: CachedSystematicBackSubstitution::Batches(vec![
