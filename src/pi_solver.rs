@@ -67,6 +67,10 @@ const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
 const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 16_384;
 #[cfg(all(feature = "std", not(test)))]
+const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 1_024;
+#[cfg(all(feature = "std", test))]
+const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 64;
+#[cfg(all(feature = "std", not(test)))]
 const DIRECT_SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH;
 #[cfg(all(feature = "std", test))]
 const DIRECT_SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 1;
@@ -238,7 +242,7 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     #[cfg(feature = "std")]
     if recording == OperationRecording::Skip
         && square_hybrid_candidate
-        && width >= DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH
+        && width >= SQUARE_HYBRID_DECODE_MIN_WIDTH
     {
         match try_square_hybrid_binary_hdpc_solve_owned(
             source_block_symbols,
@@ -2117,6 +2121,9 @@ fn addassign_direct_symbol_batch(
     assert!(src_start + symbol_size <= bytes.len());
     let src_ptr = unsafe { bytes.as_ptr().add(src_start) };
     let src_symbol = unsafe { core::slice::from_raw_parts(src_ptr, symbol_size) };
+    if bytes_are_zero(src_symbol) {
+        return;
+    }
     let bytes_ptr = bytes.as_mut_ptr();
 
     for &dest in dests {
@@ -3193,13 +3200,6 @@ fn try_square_hybrid_binary_hdpc_solve_owned<M: BinaryMatrix>(
     let width = matrix.width();
     if matrix.height() + hdpc_rows.height() != width || symbols.len() != width {
         return SquareHybridDecodeResult::Fallback(symbols);
-    }
-
-    if width < NO_COEFFICIENT_COLUMN as usize
-        && let Some(plan) = prepare_direct_systematic_plan(matrix, hdpc_rows, source_block_symbols)
-    {
-        apply_prepared_direct_systematic_plan(&plan, &mut symbols);
-        return SquareHybridDecodeResult::Decoded(symbols);
     }
 
     let Some(plan) = prepare_cached_hybrid_systematic_plan(source_block_symbols, matrix, hdpc_rows)
