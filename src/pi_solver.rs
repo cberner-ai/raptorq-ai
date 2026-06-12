@@ -66,10 +66,16 @@ const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
 const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 16_384;
+#[cfg(all(feature = "std", not(test)))]
+const DIRECT_SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH;
+#[cfg(all(feature = "std", test))]
+const DIRECT_SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 1;
 #[cfg(feature = "std")]
 const SHORT_PIVOT_MERGE_MAX_LEN: usize = 64;
 #[cfg(feature = "std")]
 const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
+#[cfg(feature = "std")]
+const DIRECT_SINGLE_REPAIR_COEFFICIENT_CACHE_CAPACITY: usize = 32;
 #[cfg(all(feature = "std", not(test)))]
 const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 32_768;
 #[cfg(all(feature = "std", test))]
@@ -444,6 +450,14 @@ struct CachedRepairSourceCoefficients {
 }
 
 #[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct DirectSingleRepairCoefficientKey {
+    source_block_symbols: u32,
+    missing_isi: usize,
+    repair_isi: u32,
+}
+
+#[cfg(feature = "std")]
 #[derive(Default)]
 struct RepairSourceCoefficientsCache {
     coefficients: HashMap<RepairSourceCoefficientsKey, Arc<CachedRepairSourceCoefficients>>,
@@ -457,6 +471,22 @@ type RepairSourceCoefficientsCacheLock = Mutex<RepairSourceCoefficientsCache>;
 fn repair_source_coefficients_cache() -> &'static RepairSourceCoefficientsCacheLock {
     static CACHE: OnceLock<RepairSourceCoefficientsCacheLock> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(RepairSourceCoefficientsCache::default()))
+}
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct DirectSingleRepairCoefficientCache {
+    coefficients: HashMap<DirectSingleRepairCoefficientKey, Octet>,
+    insertion_order: VecDeque<DirectSingleRepairCoefficientKey>,
+}
+
+#[cfg(feature = "std")]
+type DirectSingleRepairCoefficientCacheLock = Mutex<DirectSingleRepairCoefficientCache>;
+
+#[cfg(feature = "std")]
+fn direct_single_repair_coefficient_cache() -> &'static DirectSingleRepairCoefficientCacheLock {
+    static CACHE: OnceLock<DirectSingleRepairCoefficientCacheLock> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DirectSingleRepairCoefficientCache::default()))
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -765,6 +795,85 @@ fn insert_repair_source_coefficients(
     cache.insertion_order.push_back(key);
     cache.coefficients.insert(key, Arc::clone(&generated));
     generated
+}
+
+#[cfg(feature = "std")]
+fn cached_direct_single_repair_coefficient(
+    source_block_symbols: u32,
+    missing_isi: usize,
+    repair_isi: u32,
+    repair_entries: &[usize],
+) -> Octet {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    let key = DirectSingleRepairCoefficientKey {
+        source_block_symbols,
+        missing_isi,
+        repair_isi,
+    };
+    {
+        let cache = direct_single_repair_coefficient_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(&coefficient) = guard.coefficients.get(&key) {
+            return coefficient;
+        }
+    }
+
+    let generated = generate_direct_single_repair_coefficient(
+        source_block_symbols,
+        missing_isi,
+        repair_entries,
+    );
+    let cache = direct_single_repair_coefficient_cache();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    insert_direct_single_repair_coefficient(&mut guard, key, generated)
+}
+
+#[cfg(feature = "std")]
+fn insert_direct_single_repair_coefficient(
+    cache: &mut DirectSingleRepairCoefficientCache,
+    key: DirectSingleRepairCoefficientKey,
+    generated: Octet,
+) -> Octet {
+    if let Some(&coefficient) = cache.coefficients.get(&key) {
+        return coefficient;
+    }
+
+    if cache.coefficients.len() >= DIRECT_SINGLE_REPAIR_COEFFICIENT_CACHE_CAPACITY
+        && let Some(evicted_key) = cache.insertion_order.pop_front()
+    {
+        cache.coefficients.remove(&evicted_key);
+    }
+
+    cache.insertion_order.push_back(key);
+    cache.coefficients.insert(key, generated);
+    generated
+}
+
+#[cfg(feature = "std")]
+fn generate_direct_single_repair_coefficient(
+    source_block_symbols: u32,
+    missing_isi: usize,
+    repair_entries: &[usize],
+) -> Octet {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    let width = num_intermediate_symbols(source_block_symbols) as usize;
+    let s = num_ldpc_symbols(source_block_symbols) as usize;
+    let h = crate::systematic_constants::num_hdpc_symbols(source_block_symbols) as usize;
+
+    let mut symbols = SymbolSlab::with_zeros(width, 1);
+    symbols.get_mut(s + h + missing_isi)[0] = 1;
+    let plan = cached_direct_systematic_plan(source_block_symbols);
+    apply_prepared_direct_systematic_plan(&plan, &mut symbols);
+
+    let mut coefficient = 0u8;
+    for &entry in repair_entries {
+        coefficient ^= symbols.get(entry)[0];
+    }
+    Octet::new(coefficient)
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -3084,14 +3193,32 @@ fn try_single_repair_systematic_decode<M: BinaryMatrix>(
     }
 
     let symbol_size = symbols.symbol_size();
+    let repair_entries = if let Some(repair_isi) = rows.repair_isi {
+        systematic_constraint_row_entries(source_block_symbols, repair_isi)
+    } else {
+        matrix.row_entries(rows.repair_matrix_row)
+    };
+    if repair_entries.is_empty() {
+        return None;
+    }
+
+    if width >= DIRECT_SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH
+        && let Some(decoded) = try_direct_single_repair_systematic_decode(
+            source_block_symbols,
+            &rows,
+            &repair_entries,
+            symbols,
+            s,
+            h,
+        )
+    {
+        return Some(decoded);
+    }
+
     let plan = cached_systematic_plan(k_prime as u32);
     let repair_coefficients = if let Some(repair_isi) = rows.repair_isi {
         cached_repair_source_coefficients(source_block_symbols, repair_isi, &plan, s, h)
     } else {
-        let repair_entries = matrix.row_entries(rows.repair_matrix_row);
-        if repair_entries.is_empty() {
-            return None;
-        }
         Arc::new(generate_repair_source_coefficients(
             &plan,
             &repair_entries,
@@ -3146,6 +3273,83 @@ fn try_single_repair_systematic_decode<M: BinaryMatrix>(
     let mut decoded = SymbolSlab::with_zeros(width, symbol_size);
     // SourceBlockDecoder copies received source rows directly, so the one-erasure
     // fast path only has to provide the entry that rebuilds the missing source.
+    decoded
+        .get_mut(missing_entry)
+        .copy_from_slice(&missing_symbol);
+
+    Some(decoded)
+}
+
+#[cfg(feature = "std")]
+fn try_direct_single_repair_systematic_decode(
+    source_block_symbols: u32,
+    rows: &SingleRepairSystematicRows,
+    repair_entries: &[usize],
+    symbols: &SymbolSlab,
+    s: usize,
+    h: usize,
+) -> Option<SymbolSlab> {
+    let width = symbols.len();
+    let symbol_size = symbols.symbol_size();
+    let missing_coefficient = if let Some(repair_isi) = rows.repair_isi {
+        cached_direct_single_repair_coefficient(
+            source_block_symbols,
+            rows.missing_isi,
+            repair_isi,
+            repair_entries,
+        )
+    } else {
+        generate_direct_single_repair_coefficient(
+            source_block_symbols,
+            rows.missing_isi,
+            repair_entries,
+        )
+    };
+    if missing_coefficient.is_zero() {
+        return None;
+    }
+
+    let mut known_symbols = SymbolSlab::with_zeros(width, symbol_size);
+    match &rows.systematic_rows {
+        SingleRepairSystematicRowLayout::Contiguous => {
+            for isi in 0..source_block_symbols as usize {
+                if isi == rows.missing_isi {
+                    continue;
+                }
+                let matrix_row = s + if isi < rows.missing_isi { isi } else { isi - 1 };
+                known_symbols
+                    .get_mut(s + h + isi)
+                    .copy_from_slice(symbols.get(matrix_row + h));
+            }
+        }
+        SingleRepairSystematicRowLayout::Explicit(systematic_rows) => {
+            for &(isi, matrix_row) in systematic_rows {
+                if isi >= source_block_symbols as usize || isi == rows.missing_isi {
+                    continue;
+                }
+                known_symbols
+                    .get_mut(s + h + isi)
+                    .copy_from_slice(symbols.get(matrix_row + h));
+            }
+        }
+    }
+
+    let plan = cached_direct_systematic_plan(source_block_symbols);
+    apply_prepared_direct_systematic_plan(&plan, &mut known_symbols);
+
+    let mut known_repair_symbol = vec![0u8; symbol_size];
+    for &entry in repair_entries {
+        add_assign(&mut known_repair_symbol, known_symbols.get(entry));
+    }
+
+    let mut missing_symbol = symbols.get(rows.repair_matrix_row + h).to_vec();
+    add_assign(&mut missing_symbol, &known_repair_symbol);
+    mulassign_scalar(&mut missing_symbol, &missing_coefficient.inverse());
+
+    let missing_entries =
+        systematic_constraint_row_entries(source_block_symbols, rows.missing_isi as u32);
+    let &missing_entry = missing_entries.first()?;
+    let mut decoded = SymbolSlab::with_zeros(width, symbol_size);
     decoded
         .get_mut(missing_entry)
         .copy_from_slice(&missing_symbol);
