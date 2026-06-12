@@ -31,6 +31,7 @@ pub enum SymbolOps {
     ApplyCachedSystematicPlan {
         source_block_symbols: u32,
     },
+    #[cfg_attr(feature = "serde_support", serde(alias = "ApplyDirectSystematicSolve"))]
     DirectSystematicSolve {
         source_block_symbols: u32,
     },
