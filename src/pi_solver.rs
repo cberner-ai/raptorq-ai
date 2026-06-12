@@ -30,7 +30,11 @@ use crate::systematic_constants::{
 
 type CoefficientColumn = u16;
 type CoefficientRow = Vec<(CoefficientColumn, Octet)>;
+#[cfg(feature = "std")]
+type DirectSystematicFreeRows = Vec<Box<[(CoefficientColumn, Octet)]>>;
 const NO_BUCKET_ROW: usize = usize::MAX;
+#[cfg(feature = "std")]
+const NO_COEFFICIENT_COLUMN: CoefficientColumn = u16::MAX;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT: usize = 96;
@@ -49,6 +53,8 @@ const SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 4096;
 const SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 1;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
+#[cfg(feature = "std")]
+const DIRECT_SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 #[cfg(feature = "std")]
 const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH + 1;
 #[cfg(feature = "std")]
@@ -126,19 +132,33 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
         let op = SymbolOps::DirectSystematicSolve {
             source_block_symbols,
         };
+        #[cfg(feature = "std")]
+        {
+            cached_direct_systematic_plan(source_block_symbols);
+        }
         if symbol_is_zero(symbols.as_bytes()) {
             let decoded = SymbolSlab::with_zeros(matrix.width(), symbols.symbol_size());
             return (Some(decoded), Some(vec![op]));
         }
 
-        let (decoded, _) = fused_inverse_mul_symbols_impl(
-            matrix,
-            hdpc_rows,
-            symbols,
-            source_block_symbols,
-            OperationRecording::Skip,
-        );
-        return (decoded, Some(vec![op]));
+        #[cfg(feature = "std")]
+        {
+            let mut decoded = symbols.clone();
+            apply_direct_systematic_solve(source_block_symbols, &mut decoded);
+            return (Some(decoded), Some(vec![op]));
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            let (decoded, _) = fused_inverse_mul_symbols_impl(
+                matrix,
+                hdpc_rows,
+                symbols,
+                source_block_symbols,
+                OperationRecording::Skip,
+            );
+            return (decoded, Some(vec![op]));
+        }
     }
 
     fused_inverse_mul_symbols_impl(matrix, hdpc_rows, symbols, source_block_symbols, recording)
@@ -271,6 +291,48 @@ impl CachedSystematicSlices {
 }
 
 #[cfg(feature = "std")]
+struct DirectSystematicPlan {
+    forward_steps: Vec<DirectSystematicForwardStep>,
+    forward_dests: DirectSystematicSlices,
+    hdpc_updates: CachedSystematicSlices,
+    hdpc_free_rows: DirectSystematicFreeRows,
+    free_cols: Box<[CoefficientColumn]>,
+    pivot_for_col: Vec<CoefficientColumn>,
+    back_substitution: DirectSystematicSlices,
+    width: usize,
+    binary_height: usize,
+    s: usize,
+    h: usize,
+}
+
+#[cfg(feature = "std")]
+struct DirectSystematicForwardStep {
+    pivot: CoefficientColumn,
+}
+
+#[cfg(feature = "std")]
+struct DirectSystematicSlices {
+    ranges: Vec<(usize, usize)>,
+    entries: Vec<CoefficientColumn>,
+}
+
+#[cfg(feature = "std")]
+type DirectSystematicSliceParts = (
+    Vec<(usize, usize)>,
+    Vec<usize>,
+    Vec<CoefficientColumn>,
+    usize,
+);
+
+#[cfg(feature = "std")]
+impl DirectSystematicSlices {
+    fn slice(&self, index: usize) -> &[CoefficientColumn] {
+        let (start, end) = self.ranges[index];
+        &self.entries[start..end]
+    }
+}
+
+#[cfg(feature = "std")]
 #[derive(Default)]
 struct SystematicPlanCache {
     plans: HashMap<u32, Arc<CachedSystematicPlan>>,
@@ -300,6 +362,22 @@ fn systematic_plan_cache() -> &'static SystematicPlanCacheLock {
 fn hybrid_systematic_plan_cache() -> &'static HybridSystematicPlanCacheLock {
     static CACHE: OnceLock<HybridSystematicPlanCacheLock> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HybridSystematicPlanCache::default()))
+}
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct DirectSystematicPlanCache {
+    plans: HashMap<u32, Arc<DirectSystematicPlan>>,
+    insertion_order: VecDeque<u32>,
+}
+
+#[cfg(feature = "std")]
+type DirectSystematicPlanCacheLock = Mutex<DirectSystematicPlanCache>;
+
+#[cfg(feature = "std")]
+fn direct_systematic_plan_cache() -> &'static DirectSystematicPlanCacheLock {
+    static CACHE: OnceLock<DirectSystematicPlanCacheLock> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DirectSystematicPlanCache::default()))
 }
 
 #[cfg(feature = "std")]
@@ -506,6 +584,50 @@ fn insert_hybrid_systematic_plan(
     }
 
     if cache.plans.len() >= SYSTEMATIC_PLAN_CACHE_CAPACITY
+        && let Some(evicted_source_block_symbols) = cache.insertion_order.pop_front()
+    {
+        cache.plans.remove(&evicted_source_block_symbols);
+    }
+
+    cache.insertion_order.push_back(source_block_symbols);
+    cache
+        .plans
+        .insert(source_block_symbols, Arc::clone(&generated));
+    generated
+}
+
+#[cfg(feature = "std")]
+fn cached_direct_systematic_plan(source_block_symbols: u32) -> Arc<DirectSystematicPlan> {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    {
+        let cache = direct_systematic_plan_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(plan) = guard.plans.get(&source_block_symbols) {
+            return Arc::clone(plan);
+        }
+    }
+
+    let generated = Arc::new(generate_direct_systematic_plan(source_block_symbols));
+    let cache = direct_systematic_plan_cache();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    insert_direct_systematic_plan(&mut guard, source_block_symbols, generated)
+}
+
+#[cfg(feature = "std")]
+fn insert_direct_systematic_plan(
+    cache: &mut DirectSystematicPlanCache,
+    source_block_symbols: u32,
+    generated: Arc<DirectSystematicPlan>,
+) -> Arc<DirectSystematicPlan> {
+    if let Some(plan) = cache.plans.get(&source_block_symbols) {
+        return Arc::clone(plan);
+    }
+
+    if cache.plans.len() >= DIRECT_SYSTEMATIC_PLAN_CACHE_CAPACITY
         && let Some(evicted_source_block_symbols) = cache.insertion_order.pop_front()
     {
         cache.plans.remove(&evicted_source_block_symbols);
@@ -873,6 +995,16 @@ fn generate_systematic_plan(source_block_symbols: u32) -> CachedSystematicPlan {
 }
 
 #[cfg(feature = "std")]
+fn generate_direct_systematic_plan(source_block_symbols: u32) -> DirectSystematicPlan {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    let indices: Vec<u32> = (0..source_block_symbols).collect();
+    let (matrix, hdpc_rows) =
+        generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
+    prepare_direct_systematic_plan(&matrix, &hdpc_rows, source_block_symbols)
+        .expect("systematic direct plan generation failed")
+}
+
+#[cfg(feature = "std")]
 pub(crate) fn apply_cached_systematic_plan(source_block_symbols: u32, symbols: &mut SymbolSlab) {
     let plan = cached_systematic_plan(source_block_symbols);
     apply_prepared_systematic_plan(&plan, symbols);
@@ -1122,6 +1254,120 @@ fn prepare_cached_systematic_plan_with_binary_rows(
 }
 
 #[cfg(feature = "std")]
+fn prepare_direct_systematic_plan<M: BinaryMatrix>(
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    source_block_symbols: u32,
+) -> Option<DirectSystematicPlan> {
+    let s = num_ldpc_symbols(source_block_symbols) as usize;
+    let h = hdpc_rows.height();
+    let width = matrix.width();
+    let binary_height = matrix.height();
+    assert!(width < NO_COEFFICIENT_COLUMN as usize);
+    assert!(binary_height < NO_COEFFICIENT_COLUMN as usize);
+    assert_eq!(hdpc_rows.width(), width);
+    assert!(binary_height >= s);
+
+    let mut rows = matrix.packed_rows();
+    let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
+    for row in 0..binary_height {
+        if let Some(col) = rows.first_one_at_or_after(row, 0) {
+            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+        }
+    }
+
+    let mut pivot_for_col = vec![NO_COEFFICIENT_COLUMN; width];
+    let mut is_pivot_row = vec![false; binary_height];
+    let mut forward_steps = Vec::with_capacity(width);
+    let mut forward_ranges = Vec::with_capacity(width);
+    let mut forward_entries = Vec::new();
+    for col in 0..width {
+        let Some(pivot) =
+            pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
+        else {
+            continue;
+        };
+        pivot_for_col[col] = coefficient_col(pivot);
+        is_pivot_row[pivot] = true;
+
+        let dest_start = forward_entries.len();
+        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+            rows.xor_suffix(row, pivot, col);
+            forward_entries.push(coefficient_col(row));
+
+            if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+            }
+        }
+
+        if dest_start != forward_entries.len() {
+            forward_steps.push(DirectSystematicForwardStep {
+                pivot: coefficient_col(pivot),
+            });
+            forward_ranges.push((dest_start, forward_entries.len()));
+        }
+    }
+
+    if is_pivot_row.into_iter().any(|is_pivot| !is_pivot) {
+        return None;
+    }
+
+    let free_cols = pivot_for_col
+        .iter()
+        .enumerate()
+        .filter_map(|(col, &pivot)| {
+            (pivot == NO_COEFFICIENT_COLUMN).then_some(coefficient_col(col))
+        })
+        .collect::<Vec<_>>();
+    if free_cols.len() > h {
+        return None;
+    }
+
+    let mut hdpc_coefficients = dense_hdpc_coefficients(hdpc_rows);
+    let mut hdpc_update_rows = (0..h).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        if pivot == NO_COEFFICIENT_COLUMN {
+            continue;
+        }
+        let pivot = coefficient_col_index(pivot);
+
+        for (row, updates) in hdpc_update_rows.iter_mut().enumerate() {
+            let row_start = row * width;
+            let factor = hdpc_coefficients[row_start + col];
+            if factor.is_zero() {
+                continue;
+            }
+            rows.visit_ones_at_or_after(pivot, col, |entry_col| {
+                hdpc_coefficients[row_start + entry_col] += factor;
+            });
+            updates.push((coefficient_col(pivot), factor));
+        }
+    }
+
+    let hdpc_updates = octet_slices_from_rows(hdpc_update_rows);
+    let hdpc_free_rows = direct_hdpc_free_rows(hdpc_coefficients, &free_cols, width)?;
+    let back_substitution = prepare_direct_back_substitution_batches(&rows, &pivot_for_col, width);
+
+    Some(DirectSystematicPlan {
+        forward_steps,
+        forward_dests: DirectSystematicSlices {
+            ranges: forward_ranges,
+            entries: forward_entries,
+        },
+        hdpc_updates,
+        hdpc_free_rows,
+        free_cols: free_cols.into_boxed_slice(),
+        pivot_for_col,
+        back_substitution,
+        width,
+        binary_height,
+        s,
+        h,
+    })
+}
+
+#[cfg(feature = "std")]
 fn prepare_back_substitution_batches(
     rows: &[CoefficientRow],
     pivot_for_col: &[usize],
@@ -1213,7 +1459,108 @@ fn prepare_flat_back_substitution_batches(
 }
 
 #[cfg(feature = "std")]
+fn prepare_direct_back_substitution_batches(
+    rows: &PackedBinaryRows,
+    pivot_for_col: &[CoefficientColumn],
+    width: usize,
+) -> DirectSystematicSlices {
+    let mut counts = vec![0usize; width];
+    for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        if pivot == NO_COEFFICIENT_COLUMN {
+            continue;
+        }
+        rows.visit_ones_at_or_after(coefficient_col_index(pivot), col + 1, |dependent_col| {
+            counts[dependent_col] += 1;
+        });
+    }
+
+    let (ranges, mut offsets, mut entries, entries_len) = direct_slices_from_counts(counts);
+    for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        if pivot == NO_COEFFICIENT_COLUMN {
+            continue;
+        }
+        rows.visit_ones_at_or_after(coefficient_col_index(pivot), col + 1, |dependent_col| {
+            let offset = offsets[dependent_col];
+            debug_assert!(offset < entries_len);
+            unsafe {
+                entries.as_mut_ptr().add(offset).write(coefficient_col(col));
+            }
+            offsets[dependent_col] += 1;
+        });
+    }
+
+    for (offset, &(_, end)) in offsets.iter().zip(ranges.iter()) {
+        debug_assert_eq!(*offset, end);
+    }
+    unsafe {
+        entries.set_len(entries_len);
+    }
+
+    DirectSystematicSlices { ranges, entries }
+}
+
+#[cfg(feature = "std")]
+fn octet_slices_from_rows(rows: Vec<Vec<(CoefficientColumn, Octet)>>) -> CachedSystematicSlices {
+    let mut ranges = Vec::with_capacity(rows.len());
+    let entries_len = rows.iter().map(Vec::len).sum();
+    let mut entries = Vec::with_capacity(entries_len);
+    for row in rows {
+        let start = entries.len();
+        entries.extend(row);
+        ranges.push((start, entries.len()));
+    }
+    CachedSystematicSlices { ranges, entries }
+}
+
+#[cfg(feature = "std")]
+fn direct_hdpc_free_rows(
+    hdpc_coefficients: Vec<Octet>,
+    free_cols: &[CoefficientColumn],
+    width: usize,
+) -> Option<DirectSystematicFreeRows> {
+    assert_eq!(hdpc_coefficients.len() % width, 0);
+    let h = hdpc_coefficients.len() / width;
+    let mut free_index_by_col = vec![usize::MAX; width];
+    for (index, &col) in free_cols.iter().enumerate() {
+        free_index_by_col[coefficient_col_index(col)] = index;
+    }
+
+    let mut free_rows = Vec::with_capacity(h);
+    for row in 0..h {
+        let row_start = row * width;
+        let mut free_row = Vec::with_capacity(free_cols.len());
+        for col in 0..width {
+            let value = hdpc_coefficients[row_start + col];
+            if value.is_zero() {
+                continue;
+            }
+            let free_index = free_index_by_col[col];
+            if free_index == usize::MAX {
+                return None;
+            }
+            free_row.push((coefficient_col(free_index), value));
+        }
+        free_rows.push(free_row.into_boxed_slice());
+    }
+    Some(free_rows)
+}
+
+#[cfg(feature = "std")]
 fn slices_from_counts(counts: Vec<usize>) -> CachedSystematicSliceParts {
+    let mut ranges = Vec::with_capacity(counts.len());
+    let mut next_start = 0usize;
+    for count in counts {
+        let start = next_start;
+        next_start += count;
+        ranges.push((start, next_start));
+    }
+    let offsets = ranges.iter().map(|&(start, _)| start).collect::<Vec<_>>();
+    let entries = Vec::with_capacity(next_start);
+    (ranges, offsets, entries, next_start)
+}
+
+#[cfg(feature = "std")]
+fn direct_slices_from_counts(counts: Vec<usize>) -> DirectSystematicSliceParts {
     let mut ranges = Vec::with_capacity(counts.len());
     let mut next_start = 0usize;
     for count in counts {
@@ -1272,6 +1619,99 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
 }
 
 #[cfg(feature = "std")]
+fn apply_prepared_direct_systematic_plan(plan: &DirectSystematicPlan, symbols: &mut SymbolSlab) {
+    assert_eq!(symbols.len(), plan.width);
+
+    let symbol_size = symbols.symbol_size();
+    let mut binary_symbols = SymbolSlab::with_zeros(plan.binary_height, symbol_size);
+    for row in 0..plan.s {
+        binary_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(row));
+    }
+    for row in plan.s..plan.binary_height {
+        binary_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(row + plan.h));
+    }
+
+    for (step_index, step) in plan.forward_steps.iter().enumerate() {
+        addassign_direct_symbol_batch(
+            &mut binary_symbols,
+            coefficient_col_index(step.pivot),
+            plan.forward_dests.slice(step_index),
+        );
+    }
+
+    let mut hdpc_symbols = SymbolSlab::with_zeros(plan.h, symbol_size);
+    for row in 0..plan.h {
+        hdpc_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(plan.s + row));
+        for &(pivot, factor) in plan.hdpc_updates.slice(row) {
+            fused_addassign_mul_scalar(
+                hdpc_symbols.get_mut(row),
+                binary_symbols.get(coefficient_col_index(pivot)),
+                &factor,
+            );
+        }
+    }
+
+    let free_values = solve_prepared_hdpc_free_variables(
+        &plan.hdpc_free_rows,
+        hdpc_symbols,
+        plan.free_cols.len(),
+        symbol_size,
+    )
+    .expect("prepared direct systematic HDPC solve failed");
+
+    let mut decoded = SymbolSlab::with_zeros(plan.width, symbol_size);
+    for (free_index, &col) in plan.free_cols.iter().enumerate() {
+        decoded
+            .get_mut(coefficient_col_index(col))
+            .copy_from_slice(free_values.get(free_index));
+    }
+    for (col, &pivot) in plan.pivot_for_col.iter().enumerate() {
+        if pivot == NO_COEFFICIENT_COLUMN {
+            continue;
+        }
+        decoded
+            .get_mut(col)
+            .copy_from_slice(binary_symbols.get(coefficient_col_index(pivot)));
+    }
+    for src in (0..plan.width).rev() {
+        addassign_direct_symbol_batch(&mut decoded, src, plan.back_substitution.slice(src));
+    }
+
+    for row in 0..plan.width {
+        symbols.get_mut(row).copy_from_slice(decoded.get(row));
+    }
+}
+
+#[cfg(feature = "std")]
+fn solve_prepared_hdpc_free_variables(
+    rows: &[Box<[(CoefficientColumn, Octet)]>],
+    hdpc_symbols: SymbolSlab,
+    free_count: usize,
+    symbol_size: usize,
+) -> Option<SymbolSlab> {
+    if free_count == 0 {
+        if rows.iter().any(|row| !row.is_empty()) {
+            return None;
+        }
+        for row in 0..hdpc_symbols.len() {
+            if !symbol_is_zero(hdpc_symbols.get(row)) {
+                return None;
+            }
+        }
+        return Some(SymbolSlab::with_zeros(0, symbol_size));
+    }
+
+    let rows = rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>();
+    solve_without_recording(rows, free_count, hdpc_symbols).0
+}
+
+#[cfg(feature = "std")]
 fn fused_addassign_cached_symbol_batch(
     symbols: &mut SymbolSlab,
     src: usize,
@@ -1321,6 +1761,40 @@ fn fused_addassign_cached_symbol_batch(
             } else {
                 fused_addassign_mul_scalar(dest_symbol, src_symbol, &scalar);
             }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+fn addassign_direct_symbol_batch(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    dests: &[CoefficientColumn],
+) {
+    if dests.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let bytes = symbols.as_mut_bytes();
+    let src_start = src * symbol_size;
+    assert!(src_start + symbol_size <= bytes.len());
+    let src_ptr = unsafe { bytes.as_ptr().add(src_start) };
+    let src_symbol = unsafe { core::slice::from_raw_parts(src_ptr, symbol_size) };
+    if bytes_are_zero(src_symbol) {
+        return;
+    }
+    let bytes_ptr = bytes.as_mut_ptr();
+
+    for &dest in dests {
+        let dest = coefficient_col_index(dest);
+        assert_ne!(dest, src);
+        let dest_start = dest * symbol_size;
+        assert!(dest_start + symbol_size <= bytes.len());
+        unsafe {
+            let dest_symbol =
+                core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
+            add_assign(dest_symbol, src_symbol);
         }
     }
 }
@@ -1382,24 +1856,28 @@ fn move_pivot_symbols_to_columns(symbols: &mut SymbolSlab, cycles: &[Box<[usize]
 pub(crate) fn apply_direct_systematic_solve(source_block_symbols: u32, symbols: &mut SymbolSlab) {
     let source_block_symbols = extended_source_block_symbols(source_block_symbols);
     #[cfg(feature = "std")]
-    if let Some(plan) = cached_hybrid_systematic_plan(source_block_symbols) {
-        apply_cached_hybrid_systematic_plan(&plan, symbols);
+    {
+        let plan = cached_direct_systematic_plan(source_block_symbols);
+        apply_prepared_direct_systematic_plan(&plan, symbols);
         return;
     }
 
-    let indices: Vec<u32> = (0..source_block_symbols).collect();
-    let (matrix, hdpc_rows) =
-        generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
-    let (decoded, _) = fused_inverse_mul_symbols_impl(
-        matrix,
-        hdpc_rows,
-        symbols.clone(),
-        source_block_symbols,
-        OperationRecording::Skip,
-    );
-    let decoded = decoded.expect("direct systematic solve failed");
-    for row in 0..decoded.len() {
-        symbols.get_mut(row).copy_from_slice(decoded.get(row));
+    #[cfg(not(feature = "std"))]
+    {
+        let indices: Vec<u32> = (0..source_block_symbols).collect();
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
+        let (decoded, _) = fused_inverse_mul_symbols_impl(
+            matrix,
+            hdpc_rows,
+            symbols.clone(),
+            source_block_symbols,
+            OperationRecording::Skip,
+        );
+        let decoded = decoded.expect("direct systematic solve failed");
+        for row in 0..decoded.len() {
+            symbols.get_mut(row).copy_from_slice(decoded.get(row));
+        }
     }
 }
 
