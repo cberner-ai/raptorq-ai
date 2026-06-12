@@ -45,8 +45,24 @@ pub trait BinaryMatrix: Clone {
     fn packed_rows(&self) -> PackedBinaryRows {
         PackedBinaryRows::from_matrix(self)
     }
-    fn packed_rows_with_row_weights(&self) -> (PackedBinaryRows, Vec<u32>) {
-        PackedBinaryRows::from_matrix_with_row_weights(self)
+    fn packed_rows_with_first_ones(&self) -> (PackedBinaryRows, Vec<Option<usize>>) {
+        let rows = self.packed_rows();
+        let first_ones = (0..rows.height())
+            .map(|row| rows.first_one_at_or_after(row, 0))
+            .collect();
+        (rows, first_ones)
+    }
+    fn packed_rows_with_row_weights_and_first_ones(
+        &self,
+    ) -> (PackedBinaryRows, Vec<u32>, Vec<Option<usize>>) {
+        let rows = self.packed_rows();
+        let row_weights = (0..rows.height())
+            .map(|row| rows.weight_at_or_after(row, 0))
+            .collect();
+        let first_ones = (0..rows.height())
+            .map(|row| rows.first_one_at_or_after(row, 0))
+            .collect();
+        (rows, row_weights, first_ones)
     }
     fn toggle(&mut self, row: usize, col: usize) {
         let next = self.get(row, col) == Octet::zero();

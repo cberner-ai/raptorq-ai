@@ -49,22 +49,6 @@ impl PackedBinaryRows {
         packed
     }
 
-    pub(crate) fn from_matrix_with_row_weights<M: BinaryMatrix>(
-        matrix: &M,
-    ) -> (PackedBinaryRows, Vec<u32>) {
-        let mut packed = PackedBinaryRows::new(matrix.height(), matrix.width());
-        let mut row_weights = vec![0u32; matrix.height()];
-
-        for (row, row_weight) in row_weights.iter_mut().enumerate() {
-            matrix.visit_row_entries(row, |col| {
-                packed.set(row, col);
-                *row_weight += 1;
-            });
-        }
-
-        (packed, row_weights)
-    }
-
     pub(crate) fn width(&self) -> usize {
         self.width
     }
@@ -237,6 +221,15 @@ impl PackedBinaryRows {
     pub(crate) fn set(&mut self, row: usize, col: usize) {
         let word = self.word_index(row, col);
         self.words[word] |= bit_mask(col);
+    }
+
+    pub(crate) fn set_entries(&mut self, row: usize, cols: &[usize]) {
+        assert!(row < self.height);
+        let row_start = self.row_start(row);
+        for &col in cols {
+            debug_assert!(col < self.width);
+            self.words[row_start + col / u64::BITS as usize] |= bit_mask(col);
+        }
     }
 
     fn row_start(&self, row: usize) -> usize {
