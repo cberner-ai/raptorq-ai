@@ -74,6 +74,10 @@ const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
 const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 32_768;
 #[cfg(all(feature = "std", test))]
 const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 64;
+#[cfg(all(feature = "std", not(test)))]
+const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 32_768;
+#[cfg(all(feature = "std", test))]
+const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 
@@ -356,14 +360,6 @@ struct CachedBinarySlices {
 
 #[cfg(feature = "std")]
 type DirectSystematicSliceParts = (
-    Vec<(usize, usize)>,
-    Vec<usize>,
-    Vec<CoefficientColumn>,
-    usize,
-);
-
-#[cfg(feature = "std")]
-type CachedBinarySliceParts = (
     Vec<(usize, usize)>,
     Vec<usize>,
     Vec<CoefficientColumn>,
@@ -1341,7 +1337,12 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
     assert_eq!(hdpc_rows.width(), width);
     assert!(binary_height >= s);
 
-    let mut rows = matrix.packed_rows();
+    let use_weighted_buckets = width >= LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH;
+    let (mut rows, mut row_weights) = if use_weighted_buckets {
+        matrix.packed_rows_with_row_weights()
+    } else {
+        (matrix.packed_rows(), Vec::new())
+    };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for row in 0..binary_height {
@@ -1356,9 +1357,17 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
     let mut forward_ranges = Vec::with_capacity(width);
     let mut forward_entries = Vec::new();
     for col in 0..width {
-        let Some(pivot) =
+        let pivot = if use_weighted_buckets {
+            pop_lightest_weighted_binary_row_bucket(
+                &row_weights,
+                &mut bucket_heads,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
             pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
-        else {
+        };
+        let Some(pivot) = pivot else {
             continue;
         };
         pivot_for_col[col] = coefficient_col(pivot);
@@ -1366,7 +1375,11 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
 
         let dest_start = forward_entries.len();
         while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
-            rows.xor_suffix(row, pivot, col);
+            if use_weighted_buckets {
+                row_weights[row] = rows.xor_suffix_count_ones(row, pivot, col);
+            } else {
+                rows.xor_suffix(row, pivot, col);
+            }
             forward_entries.push(coefficient_col(direct_binary_symbol_index(row, s, h)));
 
             if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
@@ -2490,7 +2503,7 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
         return None;
     }
 
-    let use_weighted_buckets = width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH;
+    let use_weighted_buckets = width >= LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH;
     let (mut rows, mut row_weights) = if use_weighted_buckets {
         matrix.packed_rows_with_row_weights()
     } else {
