@@ -70,6 +70,10 @@ const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 16_384;
 const SHORT_PIVOT_MERGE_MAX_LEN: usize = 64;
 #[cfg(feature = "std")]
 const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
+#[cfg(all(feature = "std", not(test)))]
+const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 32_768;
+#[cfg(all(feature = "std", test))]
+const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 64;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 
@@ -260,7 +264,6 @@ struct CachedHybridSystematicPlan {
     back_substitution: CachedSystematicSlices,
     s: usize,
     h: usize,
-    binary_height: usize,
     width: usize,
 }
 
@@ -1988,20 +1991,28 @@ fn apply_cached_hybrid_systematic_plan(
     plan: &CachedHybridSystematicPlan,
     symbols: &mut SymbolSlab,
 ) {
+    if plan.width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH {
+        apply_cached_hybrid_systematic_plan_in_place(plan, symbols);
+    } else {
+        apply_cached_hybrid_systematic_plan_with_binary_slab(plan, symbols);
+    }
+}
+
+#[cfg(feature = "std")]
+fn apply_cached_hybrid_systematic_plan_with_binary_slab(
+    plan: &CachedHybridSystematicPlan,
+    symbols: &mut SymbolSlab,
+) {
     assert_eq!(symbols.len(), plan.width);
 
     let symbol_size = symbols.symbol_size();
-    let mut binary_symbols = SymbolSlab::with_zeros(plan.binary_height, symbol_size);
-    for row in 0..plan.s {
-        binary_symbols
-            .get_mut(row)
-            .copy_from_slice(symbols.get(row));
-    }
-    for row in plan.s..plan.binary_height {
-        binary_symbols
-            .get_mut(row)
-            .copy_from_slice(symbols.get(row + plan.h));
-    }
+    let binary_height = plan.width - plan.h;
+    let mut binary_symbols = SymbolSlab::with_zeros(binary_height, symbol_size);
+    let symbol_bytes = symbols.as_bytes();
+    let low_binary_bytes = plan.s * symbol_size;
+    binary_symbols.copy_block_from(0, &symbol_bytes[..low_binary_bytes]);
+    let high_binary_start = (plan.s + plan.h) * symbol_size;
+    binary_symbols.copy_block_from(plan.s, &symbol_bytes[high_binary_start..]);
 
     for (step_index, &(_, pivot)) in plan.pivots.iter().enumerate() {
         fused_addassign_cached_symbol_batch(
@@ -2013,11 +2024,9 @@ fn apply_cached_hybrid_systematic_plan(
     }
 
     let mut hdpc_symbols = SymbolSlab::with_zeros(plan.h, symbol_size);
-    for row in 0..plan.h {
-        hdpc_symbols
-            .get_mut(row)
-            .copy_from_slice(symbols.get(plan.s + row));
-    }
+    let hdpc_start = plan.s * symbol_size;
+    let hdpc_end = hdpc_start + plan.h * symbol_size;
+    hdpc_symbols.copy_block_from(0, &symbol_bytes[hdpc_start..hdpc_end]);
     for step in &plan.hdpc_symbol_steps {
         fused_addassign_mul_scalar(
             hdpc_symbols.get_mut(step.row),
@@ -2058,8 +2067,113 @@ fn apply_cached_hybrid_systematic_plan(
         );
     }
 
-    for row in 0..decoded.len() {
-        symbols.get_mut(row).copy_from_slice(decoded.get(row));
+    symbols.copy_block_from(0, decoded.as_bytes());
+}
+
+#[cfg(feature = "std")]
+fn apply_cached_hybrid_systematic_plan_in_place(
+    plan: &CachedHybridSystematicPlan,
+    symbols: &mut SymbolSlab,
+) {
+    assert_eq!(symbols.len(), plan.width);
+
+    let symbol_size = symbols.symbol_size();
+    for (step_index, &(_, pivot)) in plan.pivots.iter().enumerate() {
+        addassign_mapped_binary_symbol_batch(
+            symbols,
+            pivot,
+            plan.binary_forward_dests.slice(step_index),
+            plan.s,
+            plan.h,
+        );
+    }
+
+    for step in &plan.hdpc_symbol_steps {
+        let src = mapped_binary_symbol_row(step.pivot, plan.s, plan.h);
+        let dest = plan.s + step.row;
+        let (src_symbol, dest_symbol) = symbols.get_disjoint_mut(src, dest);
+        fused_addassign_mul_scalar(dest_symbol, src_symbol, &step.factor);
+    }
+
+    let free_values = if plan.free_cols.is_empty() {
+        assert!(
+            (0..plan.h).all(|row| symbol_is_zero(symbols.get(plan.s + row))),
+            "cached hybrid systematic solve has inconsistent HDPC rows"
+        );
+        SymbolSlab::with_zeros(0, symbol_size)
+    } else {
+        let mut hdpc_symbols = SymbolSlab::with_zeros(plan.h, symbol_size);
+        for row in 0..plan.h {
+            hdpc_symbols
+                .get_mut(row)
+                .copy_from_slice(symbols.get(plan.s + row));
+        }
+        solve_without_recording(plan.free_rows.clone(), plan.free_cols.len(), hdpc_symbols)
+            .0
+            .expect("cached hybrid systematic free-column solve failed")
+    };
+
+    let mut decoded = SymbolSlab::with_zeros(plan.width, symbol_size);
+    for (free_index, &col) in plan.free_cols.iter().enumerate() {
+        decoded
+            .get_mut(col)
+            .copy_from_slice(free_values.get(free_index));
+    }
+    for &(col, pivot) in plan.pivots.iter() {
+        let pivot = mapped_binary_symbol_row(pivot, plan.s, plan.h);
+        decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
+    }
+    for src in (0..plan.width).rev() {
+        fused_addassign_cached_symbol_batch(
+            &mut decoded,
+            src,
+            plan.back_substitution.slice(src),
+            true,
+        );
+    }
+
+    symbols.copy_block_from(0, decoded.as_bytes());
+}
+
+#[cfg(feature = "std")]
+fn mapped_binary_symbol_row(row: usize, s: usize, h: usize) -> usize {
+    if row < s { row } else { row + h }
+}
+
+#[cfg(feature = "std")]
+fn addassign_mapped_binary_symbol_batch(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    dests: &[(CoefficientColumn, Octet)],
+    s: usize,
+    h: usize,
+) {
+    let src = mapped_binary_symbol_row(src, s, h);
+    if dests.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let bytes = symbols.as_mut_bytes();
+    let src_start = src * symbol_size;
+    assert!(src_start + symbol_size <= bytes.len());
+    let src_ptr = unsafe { bytes.as_ptr().add(src_start) };
+    let src_symbol = unsafe { core::slice::from_raw_parts(src_ptr, symbol_size) };
+    if bytes_are_zero(src_symbol) {
+        return;
+    }
+    let bytes_ptr = bytes.as_mut_ptr();
+
+    for &(dest, _) in dests {
+        let dest = mapped_binary_symbol_row(coefficient_col_index(dest), s, h);
+        assert_ne!(dest, src);
+        let dest_start = dest * symbol_size;
+        assert!(dest_start + symbol_size <= bytes.len());
+        unsafe {
+            let dest_symbol =
+                core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
+            add_assign(dest_symbol, src_symbol);
+        }
     }
 }
 
@@ -2330,7 +2444,6 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
         back_substitution,
         s,
         h,
-        binary_height,
         width,
     })
 }
@@ -5312,10 +5425,16 @@ mod tests {
         let plan = prepare_cached_hybrid_systematic_plan(source_block_symbols, &matrix, &hdpc_rows)
             .unwrap();
 
-        let mut replayed = symbols;
+        let mut replayed = symbols.clone();
         apply_cached_hybrid_systematic_plan(&plan, &mut replayed);
+        let mut binary_slab_replayed = symbols.clone();
+        apply_cached_hybrid_systematic_plan_with_binary_slab(&plan, &mut binary_slab_replayed);
+        let mut in_place_replayed = symbols;
+        apply_cached_hybrid_systematic_plan_in_place(&plan, &mut in_place_replayed);
 
         assert_eq!(replayed, direct);
+        assert_eq!(binary_slab_replayed, direct);
+        assert_eq!(in_place_replayed, direct);
     }
 
     fn first_direct_systematic_source_symbols() -> u32 {
