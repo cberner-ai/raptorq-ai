@@ -1,11 +1,44 @@
 use crate::octet::Octet;
 
-pub fn add_assign(dest: &mut [u8], src: &[u8]) {
-    assert_eq!(dest.len(), src.len());
-    if try_add_assign_avx2(dest, src) {
-        return;
+#[derive(Clone, Copy)]
+pub(crate) struct AddAssignFastPath {
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    use_avx2: bool,
+}
+
+impl AddAssignFastPath {
+    pub(crate) fn new(symbol_len: usize) -> AddAssignFastPath {
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            return AddAssignFastPath {
+                use_avx2: symbol_len >= 64 && std::arch::is_x86_feature_detected!("avx2"),
+            };
+        }
+
+        #[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
+        {
+            let _ = symbol_len;
+            AddAssignFastPath {}
+        }
     }
-    add_assign_scalar(dest, src);
+
+    pub(crate) fn apply(self, dest: &mut [u8], src: &[u8]) {
+        assert_eq!(dest.len(), src.len());
+
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_avx2 {
+            unsafe {
+                add_assign_avx2(dest, src);
+            }
+            return;
+        }
+
+        add_assign_scalar(dest, src);
+    }
+}
+
+pub fn add_assign(dest: &mut [u8], src: &[u8]) {
+    AddAssignFastPath::new(dest.len()).apply(dest, src);
 }
 
 fn add_assign_scalar(dest: &mut [u8], src: &[u8]) {
@@ -99,23 +132,6 @@ fn fused_addassign_table(dest: &mut [u8], src: &[u8], table: &[u8; 256]) {
     {
         *d ^= table[*s as usize];
     }
-}
-
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-fn try_add_assign_avx2(dest: &mut [u8], src: &[u8]) -> bool {
-    if dest.len() < 64 || !std::arch::is_x86_feature_detected!("avx2") {
-        return false;
-    }
-
-    unsafe {
-        add_assign_avx2(dest, src);
-    }
-    true
-}
-
-#[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
-fn try_add_assign_avx2(_dest: &mut [u8], _src: &[u8]) -> bool {
-    false
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -508,6 +524,13 @@ mod tests {
             let mut direct = original.clone();
             add_assign(&mut direct, &src);
             assert_eq!(direct, expected, "add_assign failed for length {len}");
+
+            let mut fast_path_direct = original.clone();
+            AddAssignFastPath::new(len).apply(&mut fast_path_direct, &src);
+            assert_eq!(
+                fast_path_direct, expected,
+                "AddAssignFastPath failed for length {len}"
+            );
 
             let mut symbol = Symbol::new(original.clone());
             let other = Symbol::new(src.clone());
