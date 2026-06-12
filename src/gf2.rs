@@ -94,12 +94,23 @@ impl PackedBinaryRows {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn xor_suffix_count_ones(
         &mut self,
         dest: usize,
         src: usize,
         start_col: usize,
     ) -> u32 {
+        self.xor_suffix_count_ones_and_first_one(dest, src, start_col)
+            .0
+    }
+
+    pub(crate) fn xor_suffix_count_ones_and_first_one(
+        &mut self,
+        dest: usize,
+        src: usize,
+        start_col: usize,
+    ) -> (u32, Option<usize>) {
         debug_assert!(self.contains(dest, start_col));
 
         let first_word = start_col / u64::BITS as usize;
@@ -109,13 +120,36 @@ impl PackedBinaryRows {
 
         let first_index = dest_start + first_word;
         self.words[first_index] ^= self.words[src_start + first_word] & first_mask;
-        let mut weight = (self.words[first_index] & first_mask).count_ones();
-        for offset in (first_word + 1)..self.words_per_row {
+        let first_suffix_word = self.words[first_index] & first_mask;
+        let mut weight = first_suffix_word.count_ones();
+        let mut first_one = if first_suffix_word == 0 {
+            None
+        } else {
+            let col = first_word * u64::BITS as usize + first_suffix_word.trailing_zeros() as usize;
+            (col < self.width).then_some(col)
+        };
+
+        let mut offset = first_word + 1;
+        while first_one.is_none() && offset < self.words_per_row {
+            let index = dest_start + offset;
+            self.words[index] ^= self.words[src_start + offset];
+            let word = self.words[index];
+            weight += word.count_ones();
+            if word != 0 {
+                let col = offset * u64::BITS as usize + word.trailing_zeros() as usize;
+                if col < self.width {
+                    first_one = Some(col);
+                }
+            }
+            offset += 1;
+        }
+
+        for offset in offset..self.words_per_row {
             let index = dest_start + offset;
             self.words[index] ^= self.words[src_start + offset];
             weight += self.words[index].count_ones();
         }
-        weight
+        (weight, first_one)
     }
 
     pub(crate) fn first_one_at_or_after(&self, row: usize, start_col: usize) -> Option<usize> {
@@ -249,6 +283,17 @@ mod tests {
         assert!(packed.contains(1, 64));
         assert!(!packed.contains(1, 70));
         assert!(packed.contains(1, 95));
+    }
+
+    #[test]
+    fn xor_suffix_count_ones_and_first_one_returns_combined_suffix_state() {
+        let rows = vec![vec![1, 3, 70], vec![0, 3, 64, 70, 95]];
+        let mut packed = PackedBinaryRows::from_sparse(rows, 96);
+
+        let (weight, first_one) = packed.xor_suffix_count_ones_and_first_one(1, 0, 3);
+
+        assert_eq!(weight, 2);
+        assert_eq!(first_one, Some(64));
     }
 
     #[test]

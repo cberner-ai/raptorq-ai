@@ -1344,10 +1344,26 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
         (matrix.packed_rows(), Vec::new())
     };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut singleton_bucket_heads = if use_weighted_buckets {
+        vec![NO_BUCKET_ROW; width]
+    } else {
+        Vec::new()
+    };
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for row in 0..binary_height {
         if let Some(col) = rows.first_one_at_or_after(row, 0) {
-            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            if use_weighted_buckets {
+                push_weighted_binary_row_bucket(
+                    &row_weights,
+                    &mut bucket_heads,
+                    &mut singleton_bucket_heads,
+                    &mut next_in_bucket,
+                    col,
+                    row,
+                );
+            } else {
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            }
         }
     }
 
@@ -1361,6 +1377,7 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
             pop_lightest_weighted_binary_row_bucket(
                 &row_weights,
                 &mut bucket_heads,
+                &mut singleton_bucket_heads,
                 &mut next_in_bucket,
                 col,
             )
@@ -1374,17 +1391,36 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
         is_pivot_row[pivot] = true;
 
         let dest_start = forward_entries.len();
-        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+        while let Some(row) = if use_weighted_buckets {
+            pop_weighted_binary_row_bucket(
+                &mut bucket_heads,
+                &mut singleton_bucket_heads,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
+            pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
+        } {
             if use_weighted_buckets {
-                row_weights[row] = rows.xor_suffix_count_ones(row, pivot, col);
+                let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
+                row_weights[row] = weight;
+                if let Some(next_col) = next_col {
+                    push_weighted_binary_row_bucket(
+                        &row_weights,
+                        &mut bucket_heads,
+                        &mut singleton_bucket_heads,
+                        &mut next_in_bucket,
+                        next_col,
+                        row,
+                    );
+                }
             } else {
                 rows.xor_suffix(row, pivot, col);
+                if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
+                    push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                }
             }
             forward_entries.push(coefficient_col(direct_binary_symbol_index(row, s, h)));
-
-            if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
-                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
-            }
         }
 
         if dest_start != forward_entries.len() {
@@ -2510,10 +2546,26 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
         (matrix.packed_rows(), Vec::new())
     };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut singleton_bucket_heads = if use_weighted_buckets {
+        vec![NO_BUCKET_ROW; width]
+    } else {
+        Vec::new()
+    };
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for row in 0..binary_height {
         if let Some(col) = rows.first_one_at_or_after(row, 0) {
-            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            if use_weighted_buckets {
+                push_weighted_binary_row_bucket(
+                    &row_weights,
+                    &mut bucket_heads,
+                    &mut singleton_bucket_heads,
+                    &mut next_in_bucket,
+                    col,
+                    row,
+                );
+            } else {
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            }
         }
     }
 
@@ -2527,6 +2579,7 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
             pop_lightest_weighted_binary_row_bucket(
                 &row_weights,
                 &mut bucket_heads,
+                &mut singleton_bucket_heads,
                 &mut next_in_bucket,
                 col,
             )
@@ -2541,17 +2594,36 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
         pivots.push((col, pivot));
 
         let dest_start = binary_forward_entries.len();
-        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+        while let Some(row) = if use_weighted_buckets {
+            pop_weighted_binary_row_bucket(
+                &mut bucket_heads,
+                &mut singleton_bucket_heads,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
+            pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
+        } {
             if use_weighted_buckets {
-                row_weights[row] = rows.xor_suffix_count_ones(row, pivot, col);
+                let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
+                row_weights[row] = weight;
+                if let Some(next_col) = next_col {
+                    push_weighted_binary_row_bucket(
+                        &row_weights,
+                        &mut bucket_heads,
+                        &mut singleton_bucket_heads,
+                        &mut next_in_bucket,
+                        next_col,
+                        row,
+                    );
+                }
             } else {
                 rows.xor_suffix(row, pivot, col);
+                if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
+                    push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                }
             }
             binary_forward_entries.push(coefficient_col(row));
-
-            if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
-                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
-            }
         }
         binary_forward_ranges.push((dest_start, binary_forward_entries.len()));
     }
@@ -3847,6 +3919,33 @@ fn pop_row_bucket(
     Some(row)
 }
 
+#[cfg(feature = "std")]
+fn push_weighted_binary_row_bucket(
+    row_weights: &[u32],
+    bucket_heads: &mut [usize],
+    singleton_bucket_heads: &mut [usize],
+    next_in_bucket: &mut [usize],
+    col: usize,
+    row: usize,
+) {
+    if row_weights[row] == 1 {
+        push_row_bucket(singleton_bucket_heads, next_in_bucket, col, row);
+    } else {
+        push_row_bucket(bucket_heads, next_in_bucket, col, row);
+    }
+}
+
+#[cfg(feature = "std")]
+fn pop_weighted_binary_row_bucket(
+    bucket_heads: &mut [usize],
+    singleton_bucket_heads: &mut [usize],
+    next_in_bucket: &mut [usize],
+    col: usize,
+) -> Option<usize> {
+    pop_row_bucket(singleton_bucket_heads, next_in_bucket, col)
+        .or_else(|| pop_row_bucket(bucket_heads, next_in_bucket, col))
+}
+
 fn pop_counted_row_bucket(
     bucket_heads: &mut [usize],
     singleton_bucket_heads: &mut [usize],
@@ -4025,9 +4124,15 @@ fn pop_lightest_binary_row_bucket(
 fn pop_lightest_weighted_binary_row_bucket(
     row_weights: &[u32],
     bucket_heads: &mut [usize],
+    singleton_bucket_heads: &mut [usize],
     next_in_bucket: &mut [usize],
     col: usize,
 ) -> Option<usize> {
+    if let Some(row) = pop_row_bucket(singleton_bucket_heads, next_in_bucket, col) {
+        debug_assert_eq!(row_weights[row], 1);
+        return Some(row);
+    }
+
     let head = bucket_heads[col];
     if head == NO_BUCKET_ROW {
         return None;
@@ -4040,11 +4145,6 @@ fn pop_lightest_weighted_binary_row_bucket(
     let mut best = head;
     let mut best_previous = NO_BUCKET_ROW;
     let mut best_weight = row_weights[head];
-    if best_weight == 1 {
-        bucket_heads[col] = next_in_bucket[head];
-        next_in_bucket[head] = NO_BUCKET_ROW;
-        return Some(head);
-    }
     let mut previous = head;
     let mut current = next_in_bucket[head];
 
@@ -5038,19 +5138,22 @@ mod tests {
     #[test]
     fn weighted_binary_bucket_returns_head_singleton_without_scan() {
         let row_weights = vec![1, 3];
-        let mut bucket_heads = vec![0];
-        let mut next_in_bucket = vec![1, NO_BUCKET_ROW];
+        let mut bucket_heads = vec![1];
+        let mut singleton_bucket_heads = vec![0];
+        let mut next_in_bucket = vec![NO_BUCKET_ROW, NO_BUCKET_ROW];
 
         assert_eq!(
             pop_lightest_weighted_binary_row_bucket(
                 &row_weights,
                 &mut bucket_heads,
+                &mut singleton_bucket_heads,
                 &mut next_in_bucket,
                 0,
             ),
             Some(0)
         );
         assert_eq!(bucket_heads[0], 1);
+        assert_eq!(singleton_bucket_heads[0], NO_BUCKET_ROW);
         assert_eq!(next_in_bucket[0], NO_BUCKET_ROW);
     }
 
