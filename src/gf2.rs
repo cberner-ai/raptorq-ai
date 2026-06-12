@@ -79,7 +79,19 @@ impl PackedBinaryRows {
     }
 
     pub(crate) fn xor_suffix(&mut self, dest: usize, src: usize, start_col: usize) {
-        let _ = self.xor_suffix_count_ones(dest, src, start_col);
+        debug_assert!(self.contains(dest, start_col));
+
+        let first_word = start_col / u64::BITS as usize;
+        let first_mask = u64::MAX << (start_col % u64::BITS as usize);
+        let dest_start = self.row_start(dest);
+        let src_start = self.row_start(src);
+
+        let first_index = dest_start + first_word;
+        self.words[first_index] ^= self.words[src_start + first_word] & first_mask;
+        for offset in (first_word + 1)..self.words_per_row {
+            let index = dest_start + offset;
+            self.words[index] ^= self.words[src_start + offset];
+        }
     }
 
     pub(crate) fn xor_suffix_count_ones(
