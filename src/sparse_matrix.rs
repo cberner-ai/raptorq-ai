@@ -216,6 +216,18 @@ impl BinaryMatrix for SparseBinaryMatrix {
         packed
     }
 
+    fn packed_rows_with_row_weights(&self) -> (PackedBinaryRows, Vec<u32>) {
+        let mut packed = PackedBinaryRows::new(self.rows.len(), self.width);
+        let mut row_weights = Vec::with_capacity(self.rows.len());
+        for (row, entries) in self.rows.iter().enumerate() {
+            row_weights.push(entries.len() as u32);
+            for &col in entries {
+                packed.set(row, col);
+            }
+        }
+        (packed, row_weights)
+    }
+
     fn visit_row_entries<F>(&self, row: usize, mut visit: F)
     where
         F: FnMut(usize),
@@ -277,5 +289,20 @@ mod tests {
         assert!(matrix.rows_normalized);
         assert_eq!(matrix.rows[0], vec![3, 5, 7]);
         assert_eq!(matrix.row_entries(0), vec![3, 5, 7]);
+    }
+
+    #[test]
+    fn packed_rows_with_row_weights_counts_sparse_entries() {
+        let mut matrix = SparseBinaryMatrix::new(2, 96);
+        matrix.toggle(0, 70);
+        matrix.toggle(0, 3);
+        matrix.toggle(1, 64);
+
+        let (packed, row_weights) = matrix.packed_rows_with_row_weights();
+
+        assert_eq!(row_weights, vec![2, 1]);
+        assert!(packed.contains(0, 3));
+        assert!(packed.contains(0, 70));
+        assert!(packed.contains(1, 64));
     }
 }

@@ -49,6 +49,22 @@ impl PackedBinaryRows {
         packed
     }
 
+    pub(crate) fn from_matrix_with_row_weights<M: BinaryMatrix>(
+        matrix: &M,
+    ) -> (PackedBinaryRows, Vec<u32>) {
+        let mut packed = PackedBinaryRows::new(matrix.height(), matrix.width());
+        let mut row_weights = vec![0u32; matrix.height()];
+
+        for (row, row_weight) in row_weights.iter_mut().enumerate() {
+            matrix.visit_row_entries(row, |col| {
+                packed.set(row, col);
+                *row_weight += 1;
+            });
+        }
+
+        (packed, row_weights)
+    }
+
     pub(crate) fn width(&self) -> usize {
         self.width
     }
@@ -63,6 +79,15 @@ impl PackedBinaryRows {
     }
 
     pub(crate) fn xor_suffix(&mut self, dest: usize, src: usize, start_col: usize) {
+        let _ = self.xor_suffix_count_ones(dest, src, start_col);
+    }
+
+    pub(crate) fn xor_suffix_count_ones(
+        &mut self,
+        dest: usize,
+        src: usize,
+        start_col: usize,
+    ) -> u32 {
         debug_assert!(self.contains(dest, start_col));
 
         let first_word = start_col / u64::BITS as usize;
@@ -70,10 +95,15 @@ impl PackedBinaryRows {
         let dest_start = self.row_start(dest);
         let src_start = self.row_start(src);
 
-        self.words[dest_start + first_word] ^= self.words[src_start + first_word] & first_mask;
+        let first_index = dest_start + first_word;
+        self.words[first_index] ^= self.words[src_start + first_word] & first_mask;
+        let mut weight = (self.words[first_index] & first_mask).count_ones();
         for offset in (first_word + 1)..self.words_per_row {
-            self.words[dest_start + offset] ^= self.words[src_start + offset];
+            let index = dest_start + offset;
+            self.words[index] ^= self.words[src_start + offset];
+            weight += self.words[index].count_ones();
         }
+        weight
     }
 
     pub(crate) fn first_one_at_or_after(&self, row: usize, start_col: usize) -> Option<usize> {
@@ -192,6 +222,21 @@ mod tests {
         assert!(!packed.contains(1, 3));
         assert!(packed.contains(1, 64));
         assert!(!packed.contains(1, 70));
+    }
+
+    #[test]
+    fn xor_suffix_count_ones_returns_updated_suffix_weight() {
+        let rows = vec![vec![1, 3, 70], vec![0, 3, 64, 70, 95]];
+        let mut packed = PackedBinaryRows::from_sparse(rows, 96);
+
+        let weight = packed.xor_suffix_count_ones(1, 0, 3);
+
+        assert_eq!(weight, 2);
+        assert!(packed.contains(1, 0));
+        assert!(!packed.contains(1, 3));
+        assert!(packed.contains(1, 64));
+        assert!(!packed.contains(1, 70));
+        assert!(packed.contains(1, 95));
     }
 
     #[test]
