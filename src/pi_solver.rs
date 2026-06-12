@@ -238,7 +238,7 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     #[cfg(feature = "std")]
     if recording == OperationRecording::Skip
         && square_hybrid_candidate
-        && width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH
+        && width >= DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH
     {
         match try_square_hybrid_binary_hdpc_solve_owned(
             source_block_symbols,
@@ -3193,6 +3193,13 @@ fn try_square_hybrid_binary_hdpc_solve_owned<M: BinaryMatrix>(
     let width = matrix.width();
     if matrix.height() + hdpc_rows.height() != width || symbols.len() != width {
         return SquareHybridDecodeResult::Fallback(symbols);
+    }
+
+    if width < NO_COEFFICIENT_COLUMN as usize
+        && let Some(plan) = prepare_direct_systematic_plan(matrix, hdpc_rows, source_block_symbols)
+    {
+        apply_prepared_direct_systematic_plan(&plan, &mut symbols);
+        return SquareHybridDecodeResult::Decoded(symbols);
     }
 
     let Some(plan) = prepare_cached_hybrid_systematic_plan(source_block_symbols, matrix, hdpc_rows)
@@ -6262,6 +6269,47 @@ mod tests {
             &[(free_col - 1) as u8, (free_col - 1).wrapping_mul(3) as u8]
         );
         assert_eq!(decoded.get(free_col), &[0x5a, 0xa5]);
+    }
+
+    #[test]
+    fn direct_square_plan_matches_hybrid_decode_for_free_dependency() {
+        let width = 64;
+        let source_block_symbols = 10;
+        let s = num_ldpc_symbols(source_block_symbols) as usize;
+        let h = 1;
+        let symbol_size = 2;
+        let free_col = width - 1;
+        let binary_height = width - h;
+        let mut rows = PackedBinaryRows::new(binary_height, width);
+        rows.set(0, 0);
+        rows.set(0, free_col);
+        for col in 1..free_col {
+            rows.set(col, col);
+        }
+        let matrix = PackedOnlyMatrix::new(rows);
+        let mut hdpc_rows = DenseOctetMatrix::new(h, width);
+        hdpc_rows.set(0, free_col, Octet::one());
+        let mut symbols = SymbolSlab::with_zeros(width, symbol_size);
+        for row in 0..binary_height {
+            symbols
+                .get_mut(mapped_binary_symbol_row(row, s, h))
+                .copy_from_slice(&[row as u8, row.wrapping_mul(5) as u8]);
+        }
+        symbols.get_mut(0).copy_from_slice(&[0x33, 0x44]);
+        symbols.get_mut(s).copy_from_slice(&[0x9a, 0xbc]);
+
+        let mut direct = symbols.clone();
+        let plan = prepare_direct_systematic_plan(&matrix, &hdpc_rows, source_block_symbols)
+            .expect("square direct plan should solve the free HDPC dependency");
+        apply_prepared_direct_systematic_plan(&plan, &mut direct);
+
+        let hybrid =
+            try_hybrid_binary_hdpc_solve(&matrix, &hdpc_rows, &symbols, source_block_symbols)
+                .expect("hybrid solve should succeed");
+
+        assert_eq!(direct, hybrid);
+        assert_eq!(direct.get(0), &[0xa9, 0xf8]);
+        assert_eq!(direct.get(free_col), &[0x9a, 0xbc]);
     }
 
     #[test]
