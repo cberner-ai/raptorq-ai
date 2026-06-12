@@ -262,6 +262,7 @@ struct CachedHybridSystematicPlan {
     free_rows: Vec<CoefficientRow>,
     pivots: Box<[(usize, usize)]>,
     back_substitution: CachedSystematicSlices,
+    output_symbol_cycles: Option<Vec<Box<[usize]>>>,
     s: usize,
     h: usize,
     width: usize,
@@ -1909,9 +1910,47 @@ fn pivot_symbol_cycles(pivot_for_col: &[usize]) -> Vec<Box<[usize]>> {
         dest_for_pivot[pivot] = col;
     }
 
+    symbol_cycles_from_destinations(&dest_for_pivot)
+}
+
+#[cfg(feature = "std")]
+fn hybrid_output_symbol_cycles(
+    pivots: &[(usize, usize)],
+    free_cols: &[usize],
+    s: usize,
+    h: usize,
+    width: usize,
+) -> Option<Vec<Box<[usize]>>> {
+    if free_cols.len() != h {
+        return None;
+    }
+
+    let mut dest_for_source = vec![usize::MAX; width];
+    for &(col, pivot) in pivots {
+        let source = mapped_binary_symbol_row(pivot, s, h);
+        if dest_for_source[source] != usize::MAX {
+            return None;
+        }
+        dest_for_source[source] = col;
+    }
+    for (free_index, &col) in free_cols.iter().enumerate() {
+        let source = s + free_index;
+        if source >= width || dest_for_source[source] != usize::MAX {
+            return None;
+        }
+        dest_for_source[source] = col;
+    }
+    dest_for_source
+        .iter()
+        .all(|&dest| dest != usize::MAX)
+        .then(|| symbol_cycles_from_destinations(&dest_for_source))
+}
+
+#[cfg(feature = "std")]
+fn symbol_cycles_from_destinations(dest_for_source: &[usize]) -> Vec<Box<[usize]>> {
     let mut cycles = Vec::new();
-    let mut visited = vec![false; pivot_for_col.len()];
-    for start in 0..dest_for_pivot.len() {
+    let mut visited = vec![false; dest_for_source.len()];
+    for start in 0..dest_for_source.len() {
         if visited[start] {
             continue;
         }
@@ -1921,8 +1960,8 @@ fn pivot_symbol_cycles(pivot_for_col: &[usize]) -> Vec<Box<[usize]>> {
         loop {
             visited[current] = true;
             cycle.push(current);
-            let next = dest_for_pivot[current];
-            assert!(next < dest_for_pivot.len());
+            let next = dest_for_source[current];
+            assert!(next < dest_for_source.len());
             if next == start {
                 break;
             }
@@ -2112,6 +2151,24 @@ fn apply_cached_hybrid_systematic_plan_in_place(
             .0
             .expect("cached hybrid systematic free-column solve failed")
     };
+
+    if let Some(output_symbol_cycles) = &plan.output_symbol_cycles {
+        for (free_index, _) in plan.free_cols.iter().enumerate() {
+            symbols
+                .get_mut(plan.s + free_index)
+                .copy_from_slice(free_values.get(free_index));
+        }
+        move_pivot_symbols_to_columns(symbols, output_symbol_cycles);
+        for src in (0..plan.width).rev() {
+            fused_addassign_cached_symbol_batch(
+                symbols,
+                src,
+                plan.back_substitution.slice(src),
+                true,
+            );
+        }
+        return;
+    }
 
     let mut decoded = SymbolSlab::with_zeros(plan.width, symbol_size);
     for (free_index, &col) in plan.free_cols.iter().enumerate() {
@@ -2359,7 +2416,12 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
         return None;
     }
 
-    let mut rows = matrix.packed_rows();
+    let use_weighted_buckets = width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH;
+    let (mut rows, mut row_weights) = if use_weighted_buckets {
+        matrix.packed_rows_with_row_weights()
+    } else {
+        (matrix.packed_rows(), Vec::new())
+    };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for row in 0..binary_height {
@@ -2375,9 +2437,17 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
     let mut binary_forward_entries = Vec::new();
     let mut binary_forward_unit_only = Vec::with_capacity(width);
     for col in 0..width {
-        let Some(pivot) =
+        let pivot = if use_weighted_buckets {
+            pop_lightest_weighted_binary_row_bucket(
+                &row_weights,
+                &mut bucket_heads,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
             pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
-        else {
+        };
+        let Some(pivot) = pivot else {
             continue;
         };
         pivot_for_col[col] = Some(pivot);
@@ -2386,7 +2456,11 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
 
         let dest_start = binary_forward_entries.len();
         while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
-            rows.xor_suffix(row, pivot, col);
+            if use_weighted_buckets {
+                row_weights[row] = rows.xor_suffix_count_ones(row, pivot, col);
+            } else {
+                rows.xor_suffix(row, pivot, col);
+            }
             binary_forward_entries.push((coefficient_col(row), Octet::one()));
 
             if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
@@ -2430,6 +2504,9 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
 
     let free_rows = hybrid_hdpc_free_rows(&hdpc_coefficients, &free_cols, width)?;
     let back_substitution = prepare_binary_flat_back_substitution_batches(&rows, &pivots, width);
+    let output_symbol_cycles = (width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH)
+        .then(|| hybrid_output_symbol_cycles(&pivots, &free_cols, s, h, width))
+        .flatten();
 
     Some(CachedHybridSystematicPlan {
         binary_forward_dests: CachedSystematicSlices {
@@ -2442,6 +2519,7 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
         free_rows,
         pivots: pivots.into_boxed_slice(),
         back_substitution,
+        output_symbol_cycles,
         s,
         h,
         width,
@@ -3851,6 +3929,57 @@ fn pop_lightest_binary_row_bucket(
     Some(best)
 }
 
+#[cfg(feature = "std")]
+fn pop_lightest_weighted_binary_row_bucket(
+    row_weights: &[u32],
+    bucket_heads: &mut [usize],
+    next_in_bucket: &mut [usize],
+    col: usize,
+) -> Option<usize> {
+    let head = bucket_heads[col];
+    if head == NO_BUCKET_ROW {
+        return None;
+    }
+    if next_in_bucket[head] == NO_BUCKET_ROW {
+        bucket_heads[col] = NO_BUCKET_ROW;
+        return Some(head);
+    }
+
+    let mut best = head;
+    let mut best_previous = NO_BUCKET_ROW;
+    let mut best_weight = row_weights[head];
+    if best_weight == 1 {
+        bucket_heads[col] = next_in_bucket[head];
+        next_in_bucket[head] = NO_BUCKET_ROW;
+        return Some(head);
+    }
+    let mut previous = head;
+    let mut current = next_in_bucket[head];
+
+    while current != NO_BUCKET_ROW {
+        let row = current;
+        let weight = row_weights[row];
+        if weight < best_weight {
+            best = row;
+            best_previous = previous;
+            best_weight = weight;
+            if weight == 1 {
+                break;
+            }
+        }
+        previous = row;
+        current = next_in_bucket[row];
+    }
+
+    if best_previous == NO_BUCKET_ROW {
+        bucket_heads[col] = next_in_bucket[best];
+    } else {
+        next_in_bucket[best_previous] = next_in_bucket[best];
+    }
+    next_in_bucket[best] = NO_BUCKET_ROW;
+    Some(best)
+}
+
 fn symbol_is_zero(symbol: &[u8]) -> bool {
     bytes_are_zero(symbol)
 }
@@ -4812,6 +4941,25 @@ mod tests {
             ),
             Some((1, Octet::one()))
         );
+    }
+
+    #[test]
+    fn weighted_binary_bucket_returns_head_singleton_without_scan() {
+        let row_weights = vec![1, 3];
+        let mut bucket_heads = vec![0];
+        let mut next_in_bucket = vec![1, NO_BUCKET_ROW];
+
+        assert_eq!(
+            pop_lightest_weighted_binary_row_bucket(
+                &row_weights,
+                &mut bucket_heads,
+                &mut next_in_bucket,
+                0,
+            ),
+            Some(0)
+        );
+        assert_eq!(bucket_heads[0], 1);
+        assert_eq!(next_in_bucket[0], NO_BUCKET_ROW);
     }
 
     fn prepared_plan_test_system() -> (Vec<CoefficientRow>, SymbolSlab) {
