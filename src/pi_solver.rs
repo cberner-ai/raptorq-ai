@@ -231,6 +231,29 @@ fn fused_inverse_mul_symbols_impl<M: BinaryMatrix>(
     let square_hybrid_candidate = total_rows == width && width <= SQUARE_HYBRID_MAX_WIDTH;
     let overdetermined_hybrid_candidate =
         total_rows > width && width <= OVERDETERMINED_HYBRID_MAX_WIDTH;
+
+    #[cfg(feature = "std")]
+    let mut symbols = symbols;
+
+    #[cfg(feature = "std")]
+    if recording == OperationRecording::Skip
+        && square_hybrid_candidate
+        && width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH
+    {
+        match try_square_hybrid_binary_hdpc_solve_owned(
+            source_block_symbols,
+            &matrix,
+            &hdpc_rows,
+            symbols,
+        ) {
+            SquareHybridDecodeResult::Decoded(decoded) => return (Some(decoded), None),
+            SquareHybridDecodeResult::Failed => return (None, None),
+            SquareHybridDecodeResult::Fallback(returned_symbols) => {
+                symbols = returned_symbols;
+            }
+        }
+    }
+
     if recording == OperationRecording::Skip
         && (square_hybrid_candidate || overdetermined_hybrid_candidate)
         && let Some(decoded) =
@@ -284,6 +307,13 @@ struct HybridHdpcSymbolStep {
     row: usize,
     pivot: usize,
     factor: Octet,
+}
+
+#[cfg(feature = "std")]
+enum SquareHybridDecodeResult {
+    Decoded(SymbolSlab),
+    Failed,
+    Fallback(SymbolSlab),
 }
 
 struct CachedSystematicForwardStep {
@@ -2347,6 +2377,17 @@ fn apply_cached_hybrid_systematic_plan_in_place(
     plan: &CachedHybridSystematicPlan,
     symbols: &mut SymbolSlab,
 ) {
+    assert!(
+        try_apply_cached_hybrid_systematic_plan_in_place(plan, symbols),
+        "cached hybrid systematic in-place solve failed"
+    );
+}
+
+#[cfg(feature = "std")]
+fn try_apply_cached_hybrid_systematic_plan_in_place(
+    plan: &CachedHybridSystematicPlan,
+    symbols: &mut SymbolSlab,
+) -> bool {
     assert_eq!(symbols.len(), plan.width);
 
     let symbol_size = symbols.symbol_size();
@@ -2368,10 +2409,9 @@ fn apply_cached_hybrid_systematic_plan_in_place(
     }
 
     let free_values = if plan.free_cols.is_empty() {
-        assert!(
-            (0..plan.h).all(|row| symbol_is_zero(symbols.get(plan.s + row))),
-            "cached hybrid systematic solve has inconsistent HDPC rows"
-        );
+        if !(0..plan.h).all(|row| symbol_is_zero(symbols.get(plan.s + row))) {
+            return false;
+        }
         SymbolSlab::with_zeros(0, symbol_size)
     } else {
         let mut hdpc_symbols = SymbolSlab::with_zeros(plan.h, symbol_size);
@@ -2380,9 +2420,12 @@ fn apply_cached_hybrid_systematic_plan_in_place(
                 .get_mut(row)
                 .copy_from_slice(symbols.get(plan.s + row));
         }
-        solve_without_recording(plan.free_rows.clone(), plan.free_cols.len(), hdpc_symbols)
-            .0
-            .expect("cached hybrid systematic free-column solve failed")
+        let Some(free_values) =
+            solve_without_recording(plan.free_rows.clone(), plan.free_cols.len(), hdpc_symbols).0
+        else {
+            return false;
+        };
+        free_values
     };
 
     if let Some(output_symbol_cycles) = &plan.output_symbol_cycles {
@@ -2399,7 +2442,7 @@ fn apply_cached_hybrid_systematic_plan_in_place(
                 plan.back_substitution.slice(src),
             );
         }
-        return;
+        return true;
     }
 
     let mut decoded = SymbolSlab::with_zeros(plan.width, symbol_size);
@@ -2421,6 +2464,7 @@ fn apply_cached_hybrid_systematic_plan_in_place(
     }
 
     symbols.copy_block_from(0, decoded.as_bytes());
+    true
 }
 
 #[cfg(feature = "std")]
@@ -3137,6 +3181,30 @@ fn solve_hdpc_free_variables_dense(
     }
 
     solve_without_recording(free_rows, free_cols.len(), hdpc_symbols).0
+}
+
+#[cfg(feature = "std")]
+fn try_square_hybrid_binary_hdpc_solve_owned<M: BinaryMatrix>(
+    source_block_symbols: u32,
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    mut symbols: SymbolSlab,
+) -> SquareHybridDecodeResult {
+    let width = matrix.width();
+    if matrix.height() + hdpc_rows.height() != width || symbols.len() != width {
+        return SquareHybridDecodeResult::Fallback(symbols);
+    }
+
+    let Some(plan) = prepare_cached_hybrid_systematic_plan(source_block_symbols, matrix, hdpc_rows)
+    else {
+        return SquareHybridDecodeResult::Fallback(symbols);
+    };
+
+    if try_apply_cached_hybrid_systematic_plan_in_place(&plan, &mut symbols) {
+        SquareHybridDecodeResult::Decoded(symbols)
+    } else {
+        SquareHybridDecodeResult::Failed
+    }
 }
 
 fn copy_binary_row<M: BinaryMatrix>(matrix: &M, row: usize) -> CoefficientRow {
@@ -4510,7 +4578,6 @@ fn pop_lightest_binary_row_bucket(
     Some(best)
 }
 
-#[cfg(feature = "std")]
 fn pop_lightest_weighted_binary_row_bucket(
     row_weights: &[u32],
     bucket_heads: &mut [usize],
@@ -6154,6 +6221,47 @@ mod tests {
 
         assert_eq!(decoded.unwrap(), SymbolSlab::with_zeros(width, symbol_size));
         assert!(ops.is_none());
+    }
+
+    #[test]
+    fn square_hybrid_owned_decode_solves_nonzero_free_dependency() {
+        let width = IN_PLACE_HYBRID_REPLAY_MIN_WIDTH + 1;
+        let source_block_symbols = 10;
+        let s = num_ldpc_symbols(source_block_symbols) as usize;
+        let h = 1;
+        let symbol_size = 2;
+        let free_col = width - 1;
+        let binary_height = width - h;
+        let mut rows = PackedBinaryRows::new(binary_height, width);
+        rows.set(0, 0);
+        rows.set(0, free_col);
+        for col in 1..free_col {
+            rows.set(col, col);
+        }
+        let matrix = PackedOnlyMatrix::new(rows);
+        let mut hdpc_rows = DenseOctetMatrix::new(h, width);
+        hdpc_rows.set(0, free_col, Octet::one());
+        let mut symbols = SymbolSlab::with_zeros(width, symbol_size);
+        for row in 0..binary_height {
+            symbols
+                .get_mut(mapped_binary_symbol_row(row, s, h))
+                .copy_from_slice(&[row as u8, row.wrapping_mul(3) as u8]);
+        }
+        symbols.get_mut(0).copy_from_slice(&[0x11, 0x22]);
+        symbols.get_mut(s).copy_from_slice(&[0x5a, 0xa5]);
+
+        let (decoded, ops) =
+            fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_block_symbols);
+        let decoded = decoded.expect("square owned hybrid solve should succeed");
+
+        assert!(ops.is_none());
+        assert_eq!(decoded.get(0), &[0x4b, 0x87]);
+        assert_eq!(decoded.get(1), &[1, 3]);
+        assert_eq!(
+            decoded.get(free_col - 1),
+            &[(free_col - 1) as u8, (free_col - 1).wrapping_mul(3) as u8]
+        );
+        assert_eq!(decoded.get(free_col), &[0x5a, 0xa5]);
     }
 
     #[test]
