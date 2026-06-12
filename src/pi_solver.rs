@@ -3202,6 +3202,20 @@ fn try_square_hybrid_binary_hdpc_solve_owned<M: BinaryMatrix>(
         return SquareHybridDecodeResult::Fallback(symbols);
     }
 
+    if width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH {
+        match try_square_hybrid_binary_hdpc_solve_one_shot(
+            source_block_symbols,
+            matrix,
+            hdpc_rows,
+            symbols,
+        ) {
+            SquareHybridDecodeResult::Fallback(returned_symbols) => {
+                symbols = returned_symbols;
+            }
+            result => return result,
+        }
+    }
+
     let Some(plan) = prepare_cached_hybrid_systematic_plan(source_block_symbols, matrix, hdpc_rows)
     else {
         return SquareHybridDecodeResult::Fallback(symbols);
@@ -3212,6 +3226,236 @@ fn try_square_hybrid_binary_hdpc_solve_owned<M: BinaryMatrix>(
     } else {
         SquareHybridDecodeResult::Failed
     }
+}
+
+#[cfg(feature = "std")]
+fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
+    source_block_symbols: u32,
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    mut symbols: SymbolSlab,
+) -> SquareHybridDecodeResult {
+    let s = num_ldpc_symbols(source_block_symbols) as usize;
+    let h = hdpc_rows.height();
+    let width = matrix.width();
+    let binary_height = matrix.height();
+    if binary_height + h != width
+        || hdpc_rows.width() != width
+        || binary_height < s
+        || width >= NO_COEFFICIENT_COLUMN as usize
+    {
+        return SquareHybridDecodeResult::Fallback(symbols);
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let add_assign_path = AddAssignFastPath::new(symbol_size);
+    let use_weighted_buckets = width >= LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH;
+    let (mut rows, mut row_weights, first_ones) = if use_weighted_buckets {
+        matrix.packed_rows_with_row_weights_and_first_ones()
+    } else {
+        let (rows, first_ones) = matrix.packed_rows_with_first_ones();
+        (rows, Vec::new(), first_ones)
+    };
+    let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut small_weight_buckets =
+        SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
+    let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
+    for (row, first_one) in first_ones.into_iter().enumerate() {
+        if let Some(col) = first_one {
+            if use_weighted_buckets {
+                push_weighted_binary_row_bucket(
+                    &row_weights,
+                    &mut bucket_heads,
+                    &mut small_weight_buckets,
+                    &mut next_in_bucket,
+                    col,
+                    row,
+                );
+            } else {
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            }
+        }
+    }
+
+    let mut pivot_for_col = vec![None; width];
+    let mut is_pivot_row = vec![false; binary_height];
+    let mut pivots = Vec::with_capacity(binary_height);
+    for col in 0..width {
+        let pivot = if use_weighted_buckets {
+            pop_lightest_weighted_binary_row_bucket(
+                &row_weights,
+                &mut bucket_heads,
+                &mut small_weight_buckets,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
+            pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
+        };
+        let Some(pivot) = pivot else {
+            continue;
+        };
+        pivot_for_col[col] = Some(pivot);
+        is_pivot_row[pivot] = true;
+        pivots.push((col, pivot));
+
+        let pivot_symbol = mapped_binary_symbol_row(pivot, s, h);
+        let pivot_symbol_is_zero = bytes_are_zero(symbols.get(pivot_symbol));
+        while let Some(row) = if use_weighted_buckets {
+            pop_weighted_binary_row_bucket(
+                &mut bucket_heads,
+                &mut small_weight_buckets,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
+            pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
+        } {
+            if use_weighted_buckets {
+                let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
+                row_weights[row] = weight;
+                if let Some(next_col) = next_col {
+                    push_weighted_binary_row_bucket(
+                        &row_weights,
+                        &mut bucket_heads,
+                        &mut small_weight_buckets,
+                        &mut next_in_bucket,
+                        next_col,
+                        row,
+                    );
+                }
+            } else {
+                rows.xor_suffix(row, pivot, col);
+                if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
+                    push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                }
+            }
+            if !pivot_symbol_is_zero {
+                let dest_symbol = mapped_binary_symbol_row(row, s, h);
+                let (src, dest) = symbols.get_disjoint_mut(pivot_symbol, dest_symbol);
+                add_assign_path.apply(dest, src);
+            }
+        }
+    }
+
+    for (row, is_pivot) in is_pivot_row.into_iter().enumerate() {
+        if !is_pivot
+            && (!rows.is_zero(row)
+                || !symbol_is_zero(symbols.get(mapped_binary_symbol_row(row, s, h))))
+        {
+            return SquareHybridDecodeResult::Failed;
+        }
+    }
+
+    let free_cols = pivot_for_col
+        .iter()
+        .enumerate()
+        .filter_map(|(col, pivot)| pivot.is_none().then_some(col))
+        .collect::<Vec<_>>();
+    if free_cols.len() > h {
+        return SquareHybridDecodeResult::Failed;
+    }
+
+    let mut hdpc_coefficients = dense_hdpc_coefficients(hdpc_rows);
+    let mut hdpc_projection_rows = Vec::with_capacity(h);
+    let mut pivot_entries = Vec::new();
+    let mut back_substitution_counts = vec![0usize; width];
+    let mut back_substitution_entries = Vec::new();
+    for &(col, pivot) in &pivots {
+        pivot_entries.clear();
+        rows.visit_ones_at_or_after(pivot, col + 1, |entry_col| {
+            pivot_entries.push(entry_col);
+        });
+        for &dependent_col in &pivot_entries {
+            back_substitution_counts[dependent_col] += 1;
+            back_substitution_entries.push((coefficient_col(dependent_col), coefficient_col(col)));
+        }
+
+        hdpc_projection_rows.clear();
+        let pivot_symbol = mapped_binary_symbol_row(pivot, s, h);
+        let pivot_symbol_is_zero = bytes_are_zero(symbols.get(pivot_symbol));
+        for row in 0..h {
+            let row_start = row * width;
+            let factor = hdpc_coefficients[row_start + col];
+            if factor.is_zero() {
+                continue;
+            }
+            hdpc_coefficients[row_start + col] = Octet::zero();
+            hdpc_projection_rows.push((row_start, factor));
+            if !pivot_symbol_is_zero {
+                let hdpc_symbol = s + row;
+                let (src, dest) = symbols.get_disjoint_mut(pivot_symbol, hdpc_symbol);
+                fused_addassign_mul_scalar(dest, src, &factor);
+            }
+        }
+        if hdpc_projection_rows.is_empty() {
+            continue;
+        }
+        for &entry_col in &pivot_entries {
+            for &(row_start, factor) in &hdpc_projection_rows {
+                hdpc_coefficients[row_start + entry_col] += factor;
+            }
+        }
+    }
+
+    let Some(free_rows) = hybrid_hdpc_free_rows(&hdpc_coefficients, &free_cols, width) else {
+        return SquareHybridDecodeResult::Failed;
+    };
+    let mut hdpc_symbols = SymbolSlab::with_zeros(h, symbol_size);
+    for row in 0..h {
+        hdpc_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(s + row));
+    }
+    let Some(free_values) = solve_without_recording(free_rows, free_cols.len(), hdpc_symbols).0
+    else {
+        return SquareHybridDecodeResult::Failed;
+    };
+
+    let back_substitution = prepare_direct_back_substitution_batches(
+        back_substitution_counts,
+        back_substitution_entries,
+    );
+    if let Some(output_symbol_cycles) =
+        hybrid_output_symbol_cycles(&pivots, &free_cols, s, h, width)
+    {
+        for (free_index, _) in free_cols.iter().enumerate() {
+            symbols
+                .get_mut(s + free_index)
+                .copy_from_slice(free_values.get(free_index));
+        }
+        move_pivot_symbols_to_columns(&mut symbols, &output_symbol_cycles);
+        for src in (0..width).rev() {
+            addassign_direct_symbol_batch(
+                &mut symbols,
+                src,
+                back_substitution.slice(src),
+                add_assign_path,
+            );
+        }
+        return SquareHybridDecodeResult::Decoded(symbols);
+    }
+
+    let mut decoded = SymbolSlab::with_zeros(width, symbol_size);
+    for (free_index, &col) in free_cols.iter().enumerate() {
+        decoded
+            .get_mut(col)
+            .copy_from_slice(free_values.get(free_index));
+    }
+    for &(col, pivot) in &pivots {
+        let pivot = mapped_binary_symbol_row(pivot, s, h);
+        decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
+    }
+    for src in (0..width).rev() {
+        addassign_direct_symbol_batch(
+            &mut decoded,
+            src,
+            back_substitution.slice(src),
+            add_assign_path,
+        );
+    }
+
+    SquareHybridDecodeResult::Decoded(decoded)
 }
 
 fn copy_binary_row<M: BinaryMatrix>(matrix: &M, row: usize) -> CoefficientRow {
