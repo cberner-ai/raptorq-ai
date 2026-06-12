@@ -22,9 +22,14 @@ ENCODE_DEFAULT_SYMBOL_COUNTS = (
     50000,
 )
 DECODE_DEFAULT_SYMBOL_COUNTS = (10, 100, 250, 500, 1000)
-CI_SYMBOL_COUNTS = (10, 100, 250, 500, 1000, 2000, 5000, 10000, 20000)
+CI_SYMBOL_COUNTS = (10, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000)
 CI_DECODE_SYMBOL_COUNTS = (10, 100, 250, 500, 1000)
 CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS = (20000,)
+EXPECTED_CUSTOM_THROUGHPUT_ROWS = (
+    2 * len(CI_SYMBOL_COUNTS)
+    + 2 * len(CI_DECODE_SYMBOL_COUNTS)
+    + len(CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS)
+)
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "ci_benchmarks.py"
 SPEC = importlib.util.spec_from_file_location("ci_benchmarks", SCRIPT_PATH)
 ci_benchmarks = importlib.util.module_from_spec(SPEC)
@@ -145,13 +150,12 @@ class CiBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(counts, tuple(sorted(counts)))
         self.assertEqual(decode_counts, tuple(sorted(decode_counts)))
-        self.assertEqual(counts[:-1], (10, 100, 250, 500, 1000, 2000, 5000, 10000))
-        self.assertEqual(counts[-1], 20000)
+        self.assertEqual(counts[:-2], (10, 100, 250, 500, 1000, 2000, 5000, 10000))
+        self.assertEqual(counts[-2:], (20000, 50000))
         self.assertEqual(decode_counts, counts[:5])
-        self.assertTrue(set(counts).issubset(ENCODE_DEFAULT_SYMBOL_COUNTS))
         self.assertEqual(decode_counts, DECODE_DEFAULT_SYMBOL_COUNTS)
-        self.assertEqual(mixed_one_repair_counts, (counts[-1],))
-        self.assertLess(len(counts), len(ENCODE_DEFAULT_SYMBOL_COUNTS))
+        self.assertEqual(mixed_one_repair_counts, (counts[-2],))
+        self.assertEqual(counts, ENCODE_DEFAULT_SYMBOL_COUNTS)
         self.assertLess(len(decode_counts), len(counts))
 
     def test_ci_benchmark_sources_use_shared_symbol_counts(self):
@@ -309,6 +313,10 @@ class CiBenchmarkTests(unittest.TestCase):
             "encode_benchmark/encoded/without pre-built plan/symbols=20000",
             metrics,
         )
+        self.assertIn(
+            "encode_benchmark/encoded/without pre-built plan/symbols=50000",
+            metrics,
+        )
         self.assertNotIn(
             "decode_benchmark/decoded/1280 bytes/symbols=20000/overhead=5.0%",
             metrics,
@@ -391,7 +399,7 @@ symbol count = 10, decoded 127 MB in 0.456secs using 0.0% overhead, throughput: 
         table = ci_benchmarks.render_custom_table(metrics, metrics, "master", "PR")
 
         rows = [row for row in table.splitlines() if row.startswith("| `")]
-        self.assertEqual(len(rows), 29)
+        self.assertEqual(len(rows), EXPECTED_CUSTOM_THROUGHPUT_ROWS)
         self.assertNotIn("additional throughput rows omitted", table)
         self.assertNotIn(
             "decode_benchmark/decoded/1280 bytes/symbols=20000/overhead=5.0%",
@@ -399,6 +407,10 @@ symbol count = 10, decoded 127 MB in 0.456secs using 0.0% overhead, throughput: 
         )
         self.assertIn(
             "encode_benchmark/encoded/without pre-built plan/symbols=20000",
+            table,
+        )
+        self.assertIn(
+            "encode_benchmark/encoded/without pre-built plan/symbols=50000",
             table,
         )
         self.assertIn(
@@ -485,7 +497,7 @@ symbol count = 10, decoded 127 MB in 0.456secs using 0.0% overhead, throughput: 
         self.assertIn(ENCODE_OUTPUT, run.output)
         self.assertIn(DECODE_OUTPUT, run.output)
         self.assertEqual([call[0] for call in calls[1:]], ci_benchmarks.QUICK_BENCH_COMMANDS)
-        self.assertEqual(len(run.throughput), 29)
+        self.assertEqual(len(run.throughput), EXPECTED_CUSTOM_THROUGHPUT_ROWS)
         for _, env in calls[1:]:
             self.assertEqual(env["CARGO_TARGET_DIR"], str(target_dir))
 
