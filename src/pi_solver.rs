@@ -3300,7 +3300,6 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
         pivots.push((col, pivot));
 
         let pivot_symbol = mapped_binary_symbol_row(pivot, s, h);
-        let pivot_symbol_is_zero = bytes_are_zero(symbols.get(pivot_symbol));
         while let Some(row) = if use_weighted_buckets {
             pop_weighted_binary_row_bucket(
                 &mut bucket_heads,
@@ -3330,11 +3329,9 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
                     push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
                 }
             }
-            if !pivot_symbol_is_zero {
-                let dest_symbol = mapped_binary_symbol_row(row, s, h);
-                let (src, dest) = symbols.get_disjoint_mut(pivot_symbol, dest_symbol);
-                add_assign_path.apply(dest, src);
-            }
+            let dest_symbol = mapped_binary_symbol_row(row, s, h);
+            let (src, dest) = symbols.get_disjoint_mut(pivot_symbol, dest_symbol);
+            add_assign_path.apply(dest, src);
         }
     }
 
@@ -3373,7 +3370,6 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
 
         hdpc_projection_rows.clear();
         let pivot_symbol = mapped_binary_symbol_row(pivot, s, h);
-        let pivot_symbol_is_zero = bytes_are_zero(symbols.get(pivot_symbol));
         for row in 0..h {
             let row_start = row * width;
             let factor = hdpc_coefficients[row_start + col];
@@ -3382,11 +3378,9 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
             }
             hdpc_coefficients[row_start + col] = Octet::zero();
             hdpc_projection_rows.push((row_start, factor));
-            if !pivot_symbol_is_zero {
-                let hdpc_symbol = s + row;
-                let (src, dest) = symbols.get_disjoint_mut(pivot_symbol, hdpc_symbol);
-                fused_addassign_mul_scalar(dest, src, &factor);
-            }
+            let hdpc_symbol = s + row;
+            let (src, dest) = symbols.get_disjoint_mut(pivot_symbol, hdpc_symbol);
+            fused_addassign_mul_scalar(dest, src, &factor);
         }
         if hdpc_projection_rows.is_empty() {
             continue;
