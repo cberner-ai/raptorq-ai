@@ -256,12 +256,12 @@ struct CachedSystematicPlan {
 
 #[cfg(feature = "std")]
 struct CachedHybridSystematicPlan {
-    binary_forward_dests: CachedSystematicSlices,
+    binary_forward_dests: CachedBinarySlices,
     hdpc_symbol_steps: Vec<HybridHdpcSymbolStep>,
     free_cols: Box<[usize]>,
     free_rows: Vec<CoefficientRow>,
     pivots: Box<[(usize, usize)]>,
-    back_substitution: CachedSystematicSlices,
+    back_substitution: CachedBinarySlices,
     output_symbol_cycles: Option<Vec<Box<[usize]>>>,
     s: usize,
     h: usize,
@@ -299,6 +299,14 @@ type CachedSystematicSliceParts = (
     Vec<(usize, usize)>,
     Vec<usize>,
     Vec<(CoefficientColumn, Octet)>,
+    usize,
+);
+
+#[cfg(feature = "std")]
+type CachedBinarySliceParts = (
+    Vec<(usize, usize)>,
+    Vec<usize>,
+    Vec<CoefficientColumn>,
     usize,
 );
 
@@ -341,6 +349,12 @@ struct DirectSystematicSlices {
 }
 
 #[cfg(feature = "std")]
+struct CachedBinarySlices {
+    ranges: Vec<(usize, usize)>,
+    entries: Vec<CoefficientColumn>,
+}
+
+#[cfg(feature = "std")]
 type DirectSystematicSliceParts = (
     Vec<(usize, usize)>,
     Vec<usize>,
@@ -349,7 +363,23 @@ type DirectSystematicSliceParts = (
 );
 
 #[cfg(feature = "std")]
+type CachedBinarySliceParts = (
+    Vec<(usize, usize)>,
+    Vec<usize>,
+    Vec<CoefficientColumn>,
+    usize,
+);
+
+#[cfg(feature = "std")]
 impl DirectSystematicSlices {
+    fn slice(&self, index: usize) -> &[CoefficientColumn] {
+        let (start, end) = self.ranges[index];
+        &self.entries[start..end]
+    }
+}
+
+#[cfg(feature = "std")]
+impl CachedBinarySlices {
     fn slice(&self, index: usize) -> &[CoefficientColumn] {
         let (start, end) = self.ranges[index];
         &self.entries[start..end]
@@ -1622,6 +1652,20 @@ fn direct_slices_from_counts(counts: Vec<usize>) -> DirectSystematicSliceParts {
 }
 
 #[cfg(feature = "std")]
+fn binary_slices_from_counts(counts: Vec<usize>) -> CachedBinarySliceParts {
+    let mut ranges = Vec::with_capacity(counts.len());
+    let mut next_start = 0usize;
+    for count in counts {
+        let start = next_start;
+        next_start += count;
+        ranges.push((start, next_start));
+    }
+    let offsets = ranges.iter().map(|&(start, _)| start).collect::<Vec<_>>();
+    let entries = Vec::with_capacity(next_start);
+    (ranges, offsets, entries, next_start)
+}
+
+#[cfg(feature = "std")]
 fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut SymbolSlab) {
     assert_eq!(symbols.len(), plan.width);
 
@@ -1902,6 +1946,40 @@ fn addassign_direct_symbol_batch(
 }
 
 #[cfg(feature = "std")]
+fn fused_addassign_cached_binary_symbol_batch(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    dests: &[CoefficientColumn],
+) {
+    if dests.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let bytes = symbols.as_mut_bytes();
+    let src_start = src * symbol_size;
+    assert!(src_start + symbol_size <= bytes.len());
+    let src_ptr = unsafe { bytes.as_ptr().add(src_start) };
+    let src_symbol = unsafe { core::slice::from_raw_parts(src_ptr, symbol_size) };
+    if bytes_are_zero(src_symbol) {
+        return;
+    }
+    let bytes_ptr = bytes.as_mut_ptr();
+
+    for &dest in dests {
+        let dest = coefficient_col_index(dest);
+        assert_ne!(dest, src);
+        let dest_start = dest * symbol_size;
+        assert!(dest_start + symbol_size <= bytes.len());
+        unsafe {
+            let dest_symbol =
+                core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
+            add_assign(dest_symbol, src_symbol);
+        }
+    }
+}
+
+#[cfg(feature = "std")]
 fn pivot_symbol_cycles(pivot_for_col: &[usize]) -> Vec<Box<[usize]>> {
     let mut dest_for_pivot = vec![usize::MAX; pivot_for_col.len()];
     for (col, &pivot) in pivot_for_col.iter().enumerate() {
@@ -2054,11 +2132,10 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
     binary_symbols.copy_block_from(plan.s, &symbol_bytes[high_binary_start..]);
 
     for (step_index, &(_, pivot)) in plan.pivots.iter().enumerate() {
-        fused_addassign_cached_symbol_batch(
+        fused_addassign_cached_binary_symbol_batch(
             &mut binary_symbols,
             pivot,
             plan.binary_forward_dests.slice(step_index),
-            true,
         );
     }
 
@@ -2098,11 +2175,10 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
             .copy_from_slice(binary_symbols.get(pivot));
     }
     for src in (0..plan.width).rev() {
-        fused_addassign_cached_symbol_batch(
+        fused_addassign_cached_binary_symbol_batch(
             &mut decoded,
             src,
             plan.back_substitution.slice(src),
-            true,
         );
     }
 
@@ -2160,11 +2236,10 @@ fn apply_cached_hybrid_systematic_plan_in_place(
         }
         move_pivot_symbols_to_columns(symbols, output_symbol_cycles);
         for src in (0..plan.width).rev() {
-            fused_addassign_cached_symbol_batch(
+            fused_addassign_cached_binary_symbol_batch(
                 symbols,
                 src,
                 plan.back_substitution.slice(src),
-                true,
             );
         }
         return;
@@ -2181,11 +2256,10 @@ fn apply_cached_hybrid_systematic_plan_in_place(
         decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
     }
     for src in (0..plan.width).rev() {
-        fused_addassign_cached_symbol_batch(
+        fused_addassign_cached_binary_symbol_batch(
             &mut decoded,
             src,
             plan.back_substitution.slice(src),
-            true,
         );
     }
 
@@ -2201,7 +2275,7 @@ fn mapped_binary_symbol_row(row: usize, s: usize, h: usize) -> usize {
 fn addassign_mapped_binary_symbol_batch(
     symbols: &mut SymbolSlab,
     src: usize,
-    dests: &[(CoefficientColumn, Octet)],
+    dests: &[CoefficientColumn],
     s: usize,
     h: usize,
 ) {
@@ -2221,7 +2295,7 @@ fn addassign_mapped_binary_symbol_batch(
     }
     let bytes_ptr = bytes.as_mut_ptr();
 
-    for &(dest, _) in dests {
+    for &dest in dests {
         let dest = mapped_binary_symbol_row(coefficient_col_index(dest), s, h);
         assert_ne!(dest, src);
         let dest_start = dest * symbol_size;
@@ -2435,7 +2509,6 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
     let mut pivots = Vec::with_capacity(width);
     let mut binary_forward_ranges = Vec::with_capacity(width);
     let mut binary_forward_entries = Vec::new();
-    let mut binary_forward_unit_only = Vec::with_capacity(width);
     for col in 0..width {
         let pivot = if use_weighted_buckets {
             pop_lightest_weighted_binary_row_bucket(
@@ -2461,14 +2534,13 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
             } else {
                 rows.xor_suffix(row, pivot, col);
             }
-            binary_forward_entries.push((coefficient_col(row), Octet::one()));
+            binary_forward_entries.push(coefficient_col(row));
 
             if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
                 push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
             }
         }
         binary_forward_ranges.push((dest_start, binary_forward_entries.len()));
-        binary_forward_unit_only.push(true);
     }
 
     for (row, is_pivot) in is_pivot_row.into_iter().enumerate() {
@@ -2488,7 +2560,9 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
 
     let mut hdpc_coefficients = dense_hdpc_coefficients(hdpc_rows);
     let mut hdpc_symbol_steps = Vec::new();
+    let mut hdpc_projection_rows = Vec::with_capacity(h);
     for &(col, pivot) in &pivots {
+        hdpc_projection_rows.clear();
         for row in 0..h {
             let row_start = row * width;
             let factor = hdpc_coefficients[row_start + col];
@@ -2496,10 +2570,16 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
                 continue;
             }
             hdpc_symbol_steps.push(HybridHdpcSymbolStep { row, pivot, factor });
-            rows.visit_ones_at_or_after(pivot, col, |entry_col| {
-                hdpc_coefficients[row_start + entry_col] += factor;
-            });
+            hdpc_projection_rows.push((row_start, factor));
         }
+        if hdpc_projection_rows.is_empty() {
+            continue;
+        }
+        rows.visit_ones_at_or_after(pivot, col, |entry_col| {
+            for &(row_start, factor) in &hdpc_projection_rows {
+                hdpc_coefficients[row_start + entry_col] += factor;
+            }
+        });
     }
 
     let free_rows = hybrid_hdpc_free_rows(&hdpc_coefficients, &free_cols, width)?;
@@ -2509,10 +2589,9 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
         .flatten();
 
     Some(CachedHybridSystematicPlan {
-        binary_forward_dests: CachedSystematicSlices {
+        binary_forward_dests: CachedBinarySlices {
             ranges: binary_forward_ranges,
             entries: binary_forward_entries,
-            unit_only: binary_forward_unit_only,
         },
         hdpc_symbol_steps,
         free_cols: free_cols.into_boxed_slice(),
@@ -2531,7 +2610,7 @@ fn prepare_binary_flat_back_substitution_batches(
     rows: &PackedBinaryRows,
     pivots: &[(usize, usize)],
     width: usize,
-) -> CachedSystematicSlices {
+) -> CachedBinarySlices {
     let mut counts = vec![0usize; width];
     for &(col, pivot) in pivots {
         rows.visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
@@ -2539,8 +2618,7 @@ fn prepare_binary_flat_back_substitution_batches(
         });
     }
 
-    let (ranges, mut offsets, mut entries, entries_len) = slices_from_counts(counts);
-    let unit_only = vec![true; width];
+    let (ranges, mut offsets, mut entries, entries_len) = binary_slices_from_counts(counts);
     for &(col, pivot) in pivots {
         rows.visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
             let offset = offsets[dependent_col];
@@ -2548,10 +2626,7 @@ fn prepare_binary_flat_back_substitution_batches(
             // The first pass counted this slot, and each dependent column advances
             // monotonically inside its assigned range.
             unsafe {
-                entries
-                    .as_mut_ptr()
-                    .add(offset)
-                    .write((coefficient_col(col), Octet::one()));
+                entries.as_mut_ptr().add(offset).write(coefficient_col(col));
             }
             offsets[dependent_col] += 1;
         });
@@ -2565,11 +2640,7 @@ fn prepare_binary_flat_back_substitution_batches(
         entries.set_len(entries_len);
     }
 
-    CachedSystematicSlices {
-        ranges,
-        entries,
-        unit_only,
-    }
+    CachedBinarySlices { ranges, entries }
 }
 
 #[cfg(feature = "std")]
@@ -2691,27 +2762,35 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
             .copy_from_slice(symbols.get(s + row));
     }
     let mut hdpc_coefficients = dense_hdpc_coefficients(hdpc_rows);
+    let mut hdpc_projection_rows = Vec::with_capacity(h);
 
     for (col, pivot) in pivot_for_col.iter().copied().enumerate() {
         let Some(pivot) = pivot else {
             continue;
         };
 
+        hdpc_projection_rows.clear();
         for row in 0..h {
             let row_start = row * width;
             let factor = hdpc_coefficients[row_start + col];
             if factor.is_zero() {
                 continue;
             }
-            rows.visit_ones_at_or_after(pivot, col, |entry_col| {
-                hdpc_coefficients[row_start + entry_col] += factor;
-            });
+            hdpc_projection_rows.push((row_start, factor));
             fused_addassign_mul_scalar(
                 hdpc_symbols.get_mut(row),
                 binary_symbols.get(pivot),
                 &factor,
             );
         }
+        if hdpc_projection_rows.is_empty() {
+            continue;
+        }
+        rows.visit_ones_at_or_after(pivot, col, |entry_col| {
+            for &(row_start, factor) in &hdpc_projection_rows {
+                hdpc_coefficients[row_start + entry_col] += factor;
+            }
+        });
     }
 
     let free_values = solve_hdpc_free_variables_dense(
