@@ -6,10 +6,10 @@ use alloc::boxed::Box;
 
 use crate::octet::Octet;
 use crate::octets::{add_assign, bytes_are_zero, fused_addassign_mul_scalar, mulassign_scalar};
-#[cfg(feature = "std")]
-use crate::pi_solver::apply_cached_systematic_plan;
 #[cfg(not(feature = "std"))]
 use crate::pi_solver::apply_direct_systematic_solve;
+#[cfg(feature = "std")]
+use crate::pi_solver::{apply_cached_systematic_plan, apply_direct_systematic_solve};
 use crate::symbol_slab::SymbolSlab;
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,10 @@ pub enum SymbolOps {
     },
     #[cfg(feature = "std")]
     ApplyCachedSystematicPlan {
+        source_block_symbols: u32,
+    },
+    #[cfg(feature = "std")]
+    ApplyDirectSystematicSolve {
         source_block_symbols: u32,
     },
     #[cfg(not(feature = "std"))]
@@ -57,6 +61,12 @@ pub fn perform_op(op: &SymbolOps, symbols: &mut SymbolSlab) {
             source_block_symbols,
         } => {
             apply_cached_systematic_plan(source_block_symbols, symbols);
+        }
+        #[cfg(feature = "std")]
+        SymbolOps::ApplyDirectSystematicSolve {
+            source_block_symbols,
+        } => {
+            apply_direct_systematic_solve(source_block_symbols, symbols);
         }
         #[cfg(not(feature = "std"))]
         SymbolOps::DirectSystematicSolve {

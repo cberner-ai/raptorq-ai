@@ -41,8 +41,8 @@ const SPARSE_SOURCE_MERGE_MAX_SOURCE_LEN: usize = 512;
 const SPARSE_SOURCE_LINEAR_SCAN_LIMIT: usize = 24;
 const SHORT_ROW_LINEAR_SCAN_LIMIT: usize = 8;
 const TRIANGULAR_RECORDING_MIN_WIDTH: usize = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
-const SQUARE_HYBRID_MAX_WIDTH: usize = 16_384;
-const OVERDETERMINED_HYBRID_MAX_WIDTH: usize = 16_384;
+const SQUARE_HYBRID_MAX_WIDTH: usize = 32_768;
+const OVERDETERMINED_HYBRID_MAX_WIDTH: usize = 32_768;
 #[cfg(not(test))]
 const SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 4096;
 #[cfg(test)]
@@ -108,10 +108,31 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
         #[cfg(feature = "std")]
         {
             let source_block_symbols = extended_source_block_symbols(source_block_symbols);
-            cached_systematic_plan_from_matrix(source_block_symbols, matrix, &hdpc_rows);
+            if matrix.width() > SQUARE_HYBRID_MAX_WIDTH {
+                cached_systematic_plan_from_matrix(source_block_symbols, matrix, &hdpc_rows);
+                return (
+                    None,
+                    Some(vec![SymbolOps::ApplyCachedSystematicPlan {
+                        source_block_symbols,
+                    }]),
+                );
+            }
+
+            if cached_hybrid_systematic_plan_from_matrix(source_block_symbols, &matrix, &hdpc_rows)
+                .is_none()
+            {
+                cached_systematic_plan_from_matrix(source_block_symbols, matrix, &hdpc_rows);
+                return (
+                    None,
+                    Some(vec![SymbolOps::ApplyCachedSystematicPlan {
+                        source_block_symbols,
+                    }]),
+                );
+            }
+
             return (
                 None,
-                Some(vec![SymbolOps::ApplyCachedSystematicPlan {
+                Some(vec![SymbolOps::ApplyDirectSystematicSolve {
                     source_block_symbols,
                 }]),
             );
@@ -203,6 +224,33 @@ struct CachedSystematicPlan {
 }
 
 #[cfg(feature = "std")]
+struct CachedHybridSystematicPlan {
+    rows: PackedBinaryRows,
+    binary_elimination_steps: Vec<HybridBinaryEliminationStep>,
+    hdpc_symbol_steps: Vec<HybridHdpcSymbolStep>,
+    free_cols: Box<[usize]>,
+    free_rows: Vec<CoefficientRow>,
+    pivots: Box<[(usize, usize)]>,
+    s: usize,
+    h: usize,
+    binary_height: usize,
+    width: usize,
+}
+
+#[cfg(feature = "std")]
+struct HybridBinaryEliminationStep {
+    dest: usize,
+    src: usize,
+}
+
+#[cfg(feature = "std")]
+struct HybridHdpcSymbolStep {
+    row: usize,
+    pivot: usize,
+    factor: Octet,
+}
+
+#[cfg(feature = "std")]
 struct CachedSystematicForwardStep {
     pivot: usize,
     scale: Option<Octet>,
@@ -250,12 +298,28 @@ struct SystematicPlanCache {
 }
 
 #[cfg(feature = "std")]
+#[derive(Default)]
+struct HybridSystematicPlanCache {
+    plans: HashMap<u32, Arc<CachedHybridSystematicPlan>>,
+    insertion_order: VecDeque<u32>,
+}
+
+#[cfg(feature = "std")]
 type SystematicPlanCacheLock = Mutex<SystematicPlanCache>;
+
+#[cfg(feature = "std")]
+type HybridSystematicPlanCacheLock = Mutex<HybridSystematicPlanCache>;
 
 #[cfg(feature = "std")]
 fn systematic_plan_cache() -> &'static SystematicPlanCacheLock {
     static CACHE: OnceLock<SystematicPlanCacheLock> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(SystematicPlanCache::default()))
+}
+
+#[cfg(feature = "std")]
+fn hybrid_systematic_plan_cache() -> &'static HybridSystematicPlanCacheLock {
+    static CACHE: OnceLock<HybridSystematicPlanCacheLock> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HybridSystematicPlanCache::default()))
 }
 
 #[cfg(feature = "std")]
@@ -375,11 +439,88 @@ fn cached_systematic_plan_from_matrix<M: BinaryMatrix>(
 }
 
 #[cfg(feature = "std")]
+fn cached_hybrid_systematic_plan(
+    source_block_symbols: u32,
+) -> Option<Arc<CachedHybridSystematicPlan>> {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    {
+        let cache = hybrid_systematic_plan_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(plan) = guard.plans.get(&source_block_symbols) {
+            return Some(Arc::clone(plan));
+        }
+    }
+
+    let indices: Vec<u32> = (0..source_block_symbols).collect();
+    let (matrix, hdpc_rows) =
+        generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
+    cached_hybrid_systematic_plan_from_matrix(source_block_symbols, &matrix, &hdpc_rows)
+}
+
+#[cfg(feature = "std")]
+fn cached_hybrid_systematic_plan_from_matrix<M: BinaryMatrix>(
+    source_block_symbols: u32,
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+) -> Option<Arc<CachedHybridSystematicPlan>> {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    {
+        let cache = hybrid_systematic_plan_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(plan) = guard.plans.get(&source_block_symbols) {
+            return Some(Arc::clone(plan));
+        }
+    }
+
+    let generated = Arc::new(prepare_cached_hybrid_systematic_plan(
+        source_block_symbols,
+        matrix,
+        hdpc_rows,
+    )?);
+    let cache = hybrid_systematic_plan_cache();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Some(insert_hybrid_systematic_plan(
+        &mut guard,
+        source_block_symbols,
+        generated,
+    ))
+}
+
+#[cfg(feature = "std")]
 fn insert_systematic_plan(
     cache: &mut SystematicPlanCache,
     source_block_symbols: u32,
     generated: Arc<CachedSystematicPlan>,
 ) -> Arc<CachedSystematicPlan> {
+    if let Some(plan) = cache.plans.get(&source_block_symbols) {
+        return Arc::clone(plan);
+    }
+
+    if cache.plans.len() >= SYSTEMATIC_PLAN_CACHE_CAPACITY
+        && let Some(evicted_source_block_symbols) = cache.insertion_order.pop_front()
+    {
+        cache.plans.remove(&evicted_source_block_symbols);
+    }
+
+    cache.insertion_order.push_back(source_block_symbols);
+    cache
+        .plans
+        .insert(source_block_symbols, Arc::clone(&generated));
+    generated
+}
+
+#[cfg(feature = "std")]
+fn insert_hybrid_systematic_plan(
+    cache: &mut HybridSystematicPlanCache,
+    source_block_symbols: u32,
+    generated: Arc<CachedHybridSystematicPlan>,
+) -> Arc<CachedHybridSystematicPlan> {
     if let Some(plan) = cache.plans.get(&source_block_symbols) {
         return Arc::clone(plan);
     }
@@ -1258,9 +1399,14 @@ fn move_pivot_symbols_to_columns(symbols: &mut SymbolSlab, cycles: &[Box<[usize]
     }
 }
 
-#[cfg(not(feature = "std"))]
 pub(crate) fn apply_direct_systematic_solve(source_block_symbols: u32, symbols: &mut SymbolSlab) {
     let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    #[cfg(feature = "std")]
+    if let Some(plan) = cached_hybrid_systematic_plan(source_block_symbols) {
+        apply_cached_hybrid_systematic_plan(&plan, symbols);
+        return;
+    }
+
     let indices: Vec<u32> = (0..source_block_symbols).collect();
     let (matrix, hdpc_rows) =
         generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
@@ -1272,6 +1418,81 @@ pub(crate) fn apply_direct_systematic_solve(source_block_symbols: u32, symbols: 
         OperationRecording::Skip,
     );
     let decoded = decoded.expect("direct systematic solve failed");
+    for row in 0..decoded.len() {
+        symbols.get_mut(row).copy_from_slice(decoded.get(row));
+    }
+}
+
+#[cfg(feature = "std")]
+fn apply_cached_hybrid_systematic_plan(
+    plan: &CachedHybridSystematicPlan,
+    symbols: &mut SymbolSlab,
+) {
+    assert_eq!(symbols.len(), plan.width);
+    assert_eq!(plan.rows.width(), plan.width);
+    assert_eq!(plan.rows.height(), plan.binary_height);
+
+    let symbol_size = symbols.symbol_size();
+    let mut binary_symbols = SymbolSlab::with_zeros(plan.binary_height, symbol_size);
+    for row in 0..plan.s {
+        binary_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(row));
+    }
+    for row in plan.s..plan.binary_height {
+        binary_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(row + plan.h));
+    }
+
+    for step in &plan.binary_elimination_steps {
+        let (src_symbol, dest_symbol) = binary_symbols.get_disjoint_mut(step.src, step.dest);
+        add_assign(dest_symbol, src_symbol);
+    }
+
+    let mut hdpc_symbols = SymbolSlab::with_zeros(plan.h, symbol_size);
+    for row in 0..plan.h {
+        hdpc_symbols
+            .get_mut(row)
+            .copy_from_slice(symbols.get(plan.s + row));
+    }
+    for step in &plan.hdpc_symbol_steps {
+        fused_addassign_mul_scalar(
+            hdpc_symbols.get_mut(step.row),
+            binary_symbols.get(step.pivot),
+            &step.factor,
+        );
+    }
+
+    let free_values = if plan.free_cols.is_empty() {
+        assert!(
+            (0..plan.h).all(|row| symbol_is_zero(hdpc_symbols.get(row))),
+            "cached hybrid systematic solve has inconsistent HDPC rows"
+        );
+        SymbolSlab::with_zeros(0, symbol_size)
+    } else {
+        solve_without_recording(plan.free_rows.clone(), plan.free_cols.len(), hdpc_symbols)
+            .0
+            .expect("cached hybrid systematic free-column solve failed")
+    };
+
+    let mut decoded = SymbolSlab::with_zeros(plan.width, symbol_size);
+    for (free_index, &col) in plan.free_cols.iter().enumerate() {
+        decoded
+            .get_mut(col)
+            .copy_from_slice(free_values.get(free_index));
+    }
+    for &(col, pivot) in plan.pivots.iter().rev() {
+        decoded
+            .get_mut(col)
+            .copy_from_slice(binary_symbols.get(pivot));
+        plan.rows
+            .visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
+                let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
+                add_assign(dest_symbol, dependent_symbol);
+            });
+    }
+
     for row in 0..decoded.len() {
         symbols.get_mut(row).copy_from_slice(decoded.get(row));
     }
@@ -1441,6 +1662,142 @@ fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bo
 
 // Repair systems with at least L rows can often be reduced mostly over GF(2).
 // Any remaining free columns form a small GF(256) system for the HDPC rows.
+#[cfg(feature = "std")]
+fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
+    source_block_symbols: u32,
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+) -> Option<CachedHybridSystematicPlan> {
+    let s = num_ldpc_symbols(source_block_symbols) as usize;
+    let h = hdpc_rows.height();
+    let width = matrix.width();
+    let binary_height = matrix.height();
+    if binary_height + h != width
+        || hdpc_rows.width() != width
+        || binary_height < s
+        || width > SQUARE_HYBRID_MAX_WIDTH
+    {
+        return None;
+    }
+
+    let mut rows = matrix.packed_rows();
+    let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
+    for row in 0..binary_height {
+        if let Some(col) = rows.first_one_at_or_after(row, 0) {
+            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+        }
+    }
+
+    let mut pivot_for_col = vec![None; width];
+    let mut is_pivot_row = vec![false; binary_height];
+    let mut pivots = Vec::with_capacity(width);
+    let mut binary_elimination_steps = Vec::new();
+    for col in 0..width {
+        let Some(pivot) =
+            pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
+        else {
+            continue;
+        };
+        pivot_for_col[col] = Some(pivot);
+        is_pivot_row[pivot] = true;
+        pivots.push((col, pivot));
+
+        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
+            rows.xor_suffix(row, pivot, col);
+            binary_elimination_steps.push(HybridBinaryEliminationStep {
+                dest: row,
+                src: pivot,
+            });
+
+            if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+            }
+        }
+    }
+
+    for (row, is_pivot) in is_pivot_row.into_iter().enumerate() {
+        if !is_pivot && !rows.is_zero(row) {
+            return None;
+        }
+    }
+
+    let free_cols = pivot_for_col
+        .iter()
+        .enumerate()
+        .filter_map(|(col, pivot)| pivot.is_none().then_some(col))
+        .collect::<Vec<_>>();
+    if free_cols.len() > h {
+        return None;
+    }
+
+    let mut hdpc_coefficients = dense_hdpc_coefficients(hdpc_rows);
+    let mut hdpc_symbol_steps = Vec::new();
+    for &(col, pivot) in &pivots {
+        for row in 0..h {
+            let row_start = row * width;
+            let factor = hdpc_coefficients[row_start + col];
+            if factor.is_zero() {
+                continue;
+            }
+            hdpc_symbol_steps.push(HybridHdpcSymbolStep { row, pivot, factor });
+            rows.visit_ones_at_or_after(pivot, col, |entry_col| {
+                hdpc_coefficients[row_start + entry_col] += factor;
+            });
+        }
+    }
+
+    let free_rows = hybrid_hdpc_free_rows(&hdpc_coefficients, &free_cols, width)?;
+
+    Some(CachedHybridSystematicPlan {
+        rows,
+        binary_elimination_steps,
+        hdpc_symbol_steps,
+        free_cols: free_cols.into_boxed_slice(),
+        free_rows,
+        pivots: pivots.into_boxed_slice(),
+        s,
+        h,
+        binary_height,
+        width,
+    })
+}
+
+#[cfg(feature = "std")]
+fn hybrid_hdpc_free_rows(
+    hdpc_coefficients: &[Octet],
+    free_cols: &[usize],
+    width: usize,
+) -> Option<Vec<CoefficientRow>> {
+    let h = hdpc_coefficients.len() / width;
+    assert_eq!(hdpc_coefficients.len(), h * width);
+
+    let mut free_index_by_col = vec![usize::MAX; width];
+    for (index, &col) in free_cols.iter().enumerate() {
+        free_index_by_col[col] = index;
+    }
+
+    let mut free_rows = Vec::with_capacity(h);
+    for row in 0..h {
+        let row_start = row * width;
+        let mut free_row = Vec::with_capacity(free_cols.len());
+        for col in 0..width {
+            let value = hdpc_coefficients[row_start + col];
+            if value.is_zero() {
+                continue;
+            }
+            let free_index = free_index_by_col[col];
+            if free_index == usize::MAX {
+                return None;
+            }
+            free_row.push((coefficient_col(free_index), value));
+        }
+        free_rows.push(free_row);
+    }
+
+    Some(free_rows)
+}
+
 fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     matrix: &M,
     hdpc_rows: &DenseOctetMatrix,
@@ -4237,7 +4594,7 @@ mod tests {
     }
 
     #[test]
-    fn large_systematic_plan_uses_cached_systematic_plan() {
+    fn large_systematic_plan_uses_direct_systematic_solve() {
         let source_symbols = 5_000;
         let k_prime = extended_source_block_symbols(source_symbols);
         let symbols = SymbolSlab::with_zeros(num_intermediate_symbols(source_symbols) as usize, 1);
@@ -4250,10 +4607,34 @@ mod tests {
         assert!(decoded.is_none());
         assert!(matches!(
             ops.as_deref(),
-            Some([SymbolOps::ApplyCachedSystematicPlan {
+            Some([SymbolOps::ApplyDirectSystematicSolve {
                 source_block_symbols
             }]) if *source_block_symbols == k_prime
         ));
+    }
+
+    #[test]
+    fn cached_hybrid_systematic_plan_replays_direct_hybrid_solve() {
+        let source_block_symbols = extended_source_block_symbols(128);
+        let symbol_size = 3;
+        let indices: Vec<u32> = (0..source_block_symbols).collect();
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
+        let mut symbols = SymbolSlab::with_zeros(matrix.height() + hdpc_rows.height(), symbol_size);
+        for (index, byte) in symbols.as_mut_bytes().iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(37).wrapping_add(11);
+        }
+
+        let direct =
+            try_hybrid_binary_hdpc_solve(&matrix, &hdpc_rows, &symbols, source_block_symbols)
+                .unwrap();
+        let plan = prepare_cached_hybrid_systematic_plan(source_block_symbols, &matrix, &hdpc_rows)
+            .unwrap();
+
+        let mut replayed = symbols;
+        apply_cached_hybrid_systematic_plan(&plan, &mut replayed);
+
+        assert_eq!(replayed, direct);
     }
 
     #[test]
