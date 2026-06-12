@@ -56,7 +56,9 @@ const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
-const SHORT_PIVOT_MERGE_MAX_LEN: usize = 48;
+const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 16_384;
+#[cfg(feature = "std")]
+const SHORT_PIVOT_MERGE_MAX_LEN: usize = 64;
 #[cfg(feature = "std")]
 const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
 #[cfg(all(test, feature = "std"))]
@@ -105,60 +107,38 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
     let recording = OperationRecording::for_matrix(&matrix, source_block_symbols);
     if recording == OperationRecording::Record && matrix.width() > MAX_INLINE_RECORDED_SOLVER_WIDTH
     {
+        let source_block_symbols = extended_source_block_symbols(source_block_symbols);
         #[cfg(feature = "std")]
+        if matrix.width() < DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH
+            || matrix.width() > SQUARE_HYBRID_MAX_WIDTH
         {
-            let source_block_symbols = extended_source_block_symbols(source_block_symbols);
-            if matrix.width() > SQUARE_HYBRID_MAX_WIDTH {
-                cached_systematic_plan_from_matrix(source_block_symbols, matrix, &hdpc_rows);
-                return (
-                    None,
-                    Some(vec![SymbolOps::ApplyCachedSystematicPlan {
-                        source_block_symbols,
-                    }]),
-                );
-            }
-
-            if cached_hybrid_systematic_plan_from_matrix(source_block_symbols, &matrix, &hdpc_rows)
-                .is_none()
-            {
-                cached_systematic_plan_from_matrix(source_block_symbols, matrix, &hdpc_rows);
-                return (
-                    None,
-                    Some(vec![SymbolOps::ApplyCachedSystematicPlan {
-                        source_block_symbols,
-                    }]),
-                );
-            }
-
+            cached_systematic_plan_from_matrix(source_block_symbols, matrix, &hdpc_rows);
             return (
                 None,
-                Some(vec![SymbolOps::ApplyDirectSystematicSolve {
+                Some(vec![SymbolOps::ApplyCachedSystematicPlan {
                     source_block_symbols,
                 }]),
             );
         }
 
-        #[cfg(not(feature = "std"))]
-        {
-            // no_std cannot keep the global large-plan cache, so replay performs the solve.
-            let source_block_symbols = extended_source_block_symbols(source_block_symbols);
-            let op = SymbolOps::DirectSystematicSolve {
-                source_block_symbols,
-            };
-            if symbol_is_zero(symbols.as_bytes()) {
-                let decoded = SymbolSlab::with_zeros(matrix.width(), symbols.symbol_size());
-                return (Some(decoded), Some(vec![op]));
-            }
-
-            let (decoded, _) = fused_inverse_mul_symbols_impl(
-                matrix,
-                hdpc_rows,
-                symbols,
-                source_block_symbols,
-                OperationRecording::Skip,
-            );
-            return (decoded, Some(vec![op]));
+        // Very wide systematic plans are better represented by a semantic operation. Replay can
+        // use the binary+HDPC hybrid solver directly instead of caching a large coefficient plan.
+        let op = SymbolOps::DirectSystematicSolve {
+            source_block_symbols,
+        };
+        if symbol_is_zero(symbols.as_bytes()) {
+            let decoded = SymbolSlab::with_zeros(matrix.width(), symbols.symbol_size());
+            return (Some(decoded), Some(vec![op]));
         }
+
+        let (decoded, _) = fused_inverse_mul_symbols_impl(
+            matrix,
+            hdpc_rows,
+            symbols,
+            source_block_symbols,
+            OperationRecording::Skip,
+        );
+        return (decoded, Some(vec![op]));
     }
 
     fused_inverse_mul_symbols_impl(matrix, hdpc_rows, symbols, source_block_symbols, recording)
@@ -3989,6 +3969,30 @@ mod tests {
         apply_prepared_systematic_plan(&plan, &mut replayed);
 
         assert_eq!(replayed, expected.unwrap());
+    }
+
+    #[test]
+    fn direct_systematic_solve_matches_cached_plan_replay() {
+        let source_symbols = 10;
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        let s = num_ldpc_symbols(source_symbols) as usize;
+        let h = num_hdpc_symbols(source_symbols) as usize;
+        let symbol_size = 3;
+
+        let mut cached = SymbolSlab::with_zeros(width, symbol_size);
+        for isi in 0..source_symbols as usize {
+            cached.get_mut(s + h + isi).copy_from_slice(&[
+                isi as u8,
+                (isi as u8).wrapping_mul(17).wrapping_add(3),
+                (isi as u8) ^ 0x5a,
+            ]);
+        }
+        let mut direct = cached.clone();
+
+        apply_cached_systematic_plan(source_symbols, &mut cached);
+        apply_direct_systematic_solve(source_symbols, &mut direct);
+
+        assert_eq!(direct, cached);
     }
 
     #[test]
