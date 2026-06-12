@@ -80,9 +80,9 @@ const DIRECT_SINGLE_REPAIR_COEFFICIENT_CACHE_CAPACITY: usize = 32;
 const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 32_768;
 #[cfg(all(feature = "std", test))]
 const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 64;
-#[cfg(all(feature = "std", not(test)))]
+#[cfg(not(test))]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 32_768;
-#[cfg(all(feature = "std", test))]
+#[cfg(test)]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
@@ -2883,6 +2883,7 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     let width = matrix.width();
     let binary_height = matrix.height();
     let symbol_size = symbols.symbol_size();
+    let add_assign_path = AddAssignFastPath::new(symbol_size);
     let overdetermined = binary_height + h > width;
 
     let mut binary_symbols = SymbolSlab::with_zeros(binary_height, symbol_size);
@@ -2897,34 +2898,87 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
             .copy_from_slice(symbols.get(row + h));
     }
 
-    let mut rows = matrix.packed_rows();
+    let use_weighted_buckets = width >= LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH;
+    let (mut rows, mut row_weights) = if use_weighted_buckets {
+        matrix.packed_rows_with_row_weights()
+    } else {
+        (matrix.packed_rows(), Vec::new())
+    };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut singleton_bucket_heads = if use_weighted_buckets {
+        vec![NO_BUCKET_ROW; width]
+    } else {
+        Vec::new()
+    };
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for row in 0..binary_height {
         if let Some(col) = rows.first_one_at_or_after(row, 0) {
-            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            if use_weighted_buckets {
+                push_weighted_binary_row_bucket(
+                    &row_weights,
+                    &mut bucket_heads,
+                    &mut singleton_bucket_heads,
+                    &mut next_in_bucket,
+                    col,
+                    row,
+                );
+            } else {
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            }
         }
     }
 
     let mut pivot_for_col = vec![None; width];
     let mut is_pivot_row = vec![false; binary_height];
     for col in 0..width {
-        let Some(pivot) =
+        let pivot = if use_weighted_buckets {
+            pop_lightest_weighted_binary_row_bucket(
+                &row_weights,
+                &mut bucket_heads,
+                &mut singleton_bucket_heads,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
             pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
-        else {
+        };
+        let Some(pivot) = pivot else {
             continue;
         };
         pivot_for_col[col] = Some(pivot);
         is_pivot_row[pivot] = true;
 
-        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
-            rows.xor_suffix(row, pivot, col);
-            let (pivot_symbol, dest_symbol) = binary_symbols.get_disjoint_mut(pivot, row);
-            add_assign(dest_symbol, pivot_symbol);
-
-            if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
-                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+        while let Some(row) = if use_weighted_buckets {
+            pop_weighted_binary_row_bucket(
+                &mut bucket_heads,
+                &mut singleton_bucket_heads,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
+            pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
+        } {
+            if use_weighted_buckets {
+                let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
+                row_weights[row] = weight;
+                if let Some(next_col) = next_col {
+                    push_weighted_binary_row_bucket(
+                        &row_weights,
+                        &mut bucket_heads,
+                        &mut singleton_bucket_heads,
+                        &mut next_in_bucket,
+                        next_col,
+                        row,
+                    );
+                }
+            } else {
+                rows.xor_suffix(row, pivot, col);
+                if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
+                    push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                }
             }
+            let (pivot_symbol, dest_symbol) = binary_symbols.get_disjoint_mut(pivot, row);
+            add_assign_path.apply(dest_symbol, pivot_symbol);
         }
     }
 
@@ -3008,7 +3062,7 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
                 .copy_from_slice(binary_symbols.get(pivot));
             rows.visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
                 let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
-                add_assign(dest_symbol, dependent_symbol);
+                add_assign_path.apply(dest_symbol, dependent_symbol);
             });
         }
     }
@@ -3023,6 +3077,7 @@ fn binary_decoded_solution(
     width: usize,
     symbol_size: usize,
 ) -> SymbolSlab {
+    let add_assign_path = AddAssignFastPath::new(symbol_size);
     let mut decoded = SymbolSlab::with_zeros(width, symbol_size);
     for col in (0..width).rev() {
         let pivot = pivot_for_col[col].expect("full-rank binary solve has every pivot");
@@ -3031,7 +3086,7 @@ fn binary_decoded_solution(
             .copy_from_slice(binary_symbols.get(pivot));
         rows.visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
             let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
-            add_assign(dest_symbol, dependent_symbol);
+            add_assign_path.apply(dest_symbol, dependent_symbol);
         });
     }
     decoded
@@ -4023,11 +4078,36 @@ fn solve_binary(
 
     let height = rows.height();
     assert_eq!(height, symbols.len());
+    let add_assign_path = AddAssignFastPath::new(symbols.symbol_size());
+    let use_weighted_buckets = width >= LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH;
+    let mut row_weights = if use_weighted_buckets {
+        (0..height)
+            .map(|row| rows.weight_at_or_after(row, 0))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut singleton_bucket_heads = if use_weighted_buckets {
+        vec![NO_BUCKET_ROW; width]
+    } else {
+        Vec::new()
+    };
     let mut next_in_bucket = vec![NO_BUCKET_ROW; height];
     for row in 0..height {
         if let Some(col) = rows.first_one_at_or_after(row, 0) {
-            push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            if use_weighted_buckets {
+                push_weighted_binary_row_bucket(
+                    &row_weights,
+                    &mut bucket_heads,
+                    &mut singleton_bucket_heads,
+                    &mut next_in_bucket,
+                    col,
+                    row,
+                );
+            } else {
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            }
         }
     }
 
@@ -4035,22 +4115,54 @@ fn solve_binary(
     let mut is_pivot_row = vec![false; height];
 
     for col in 0..width {
-        let Some(pivot) =
+        let pivot = if use_weighted_buckets {
+            pop_lightest_weighted_binary_row_bucket(
+                &row_weights,
+                &mut bucket_heads,
+                &mut singleton_bucket_heads,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
             pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
-        else {
+        };
+        let Some(pivot) = pivot else {
             return (None, None);
         };
         pivot_for_col[col] = Some(pivot);
         is_pivot_row[pivot] = true;
 
-        while let Some(row) = pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col) {
-            rows.xor_suffix(row, pivot, col);
-            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot, row);
-            add_assign(dest_symbol, pivot_symbol);
-
-            if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
-                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+        while let Some(row) = if use_weighted_buckets {
+            pop_weighted_binary_row_bucket(
+                &mut bucket_heads,
+                &mut singleton_bucket_heads,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
+            pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
+        } {
+            if use_weighted_buckets {
+                let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
+                row_weights[row] = weight;
+                if let Some(next_col) = next_col {
+                    push_weighted_binary_row_bucket(
+                        &row_weights,
+                        &mut bucket_heads,
+                        &mut singleton_bucket_heads,
+                        &mut next_in_bucket,
+                        next_col,
+                        row,
+                    );
+                }
+            } else {
+                rows.xor_suffix(row, pivot, col);
+                if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
+                    push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                }
             }
+            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot, row);
+            add_assign_path.apply(dest_symbol, pivot_symbol);
         }
     }
 
@@ -4066,7 +4178,7 @@ fn solve_binary(
         decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
         rows.visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
             let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
-            add_assign(dest_symbol, dependent_symbol);
+            add_assign_path.apply(dest_symbol, dependent_symbol);
         });
     }
 
@@ -4123,7 +4235,6 @@ fn pop_row_bucket(
     Some(row)
 }
 
-#[cfg(feature = "std")]
 fn push_weighted_binary_row_bucket(
     row_weights: &[u32],
     bucket_heads: &mut [usize],
@@ -4139,7 +4250,6 @@ fn push_weighted_binary_row_bucket(
     }
 }
 
-#[cfg(feature = "std")]
 fn pop_weighted_binary_row_bucket(
     bucket_heads: &mut [usize],
     singleton_bucket_heads: &mut [usize],
@@ -5802,6 +5912,14 @@ mod tests {
 
         fn packed_rows(&self) -> PackedBinaryRows {
             self.rows.clone()
+        }
+
+        fn packed_rows_with_row_weights(&self) -> (PackedBinaryRows, Vec<u32>) {
+            let rows = self.rows.clone();
+            let row_weights = (0..rows.height())
+                .map(|row| rows.weight_at_or_after(row, 0))
+                .collect();
+            (rows, row_weights)
         }
 
         fn visit_row_entries<F>(&self, row: usize, _visit: F)
