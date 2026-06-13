@@ -86,7 +86,7 @@ const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 32_768;
 #[cfg(all(feature = "std", test))]
 const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 64;
 #[cfg(not(test))]
-const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 32_768;
+const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 4_096;
 #[cfg(test)]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
 const SMALL_WEIGHT_BINARY_BUCKET_MAX: u32 = 16;
@@ -1621,7 +1621,7 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
         0
     };
 
-    let mut hdpc_coefficients = dense_hdpc_coefficients(hdpc_rows);
+    let mut hdpc_coefficients = dense_hdpc_coefficient_values(hdpc_rows);
     let mut hdpc_update_pivots = Vec::with_capacity(pivot_count);
     let mut hdpc_update_ranges = Vec::with_capacity(pivot_count);
     let mut hdpc_update_entries = Vec::with_capacity(pivot_count.saturating_mul(h));
@@ -1648,17 +1648,17 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
         for row in 0..h {
             let row_start = row * width;
             let factor = hdpc_coefficients[row_start + col];
-            if factor.is_zero() {
+            if factor == 0 {
                 continue;
             }
-            hdpc_coefficients[row_start + col] = Octet::zero();
+            hdpc_coefficients[row_start + col] = 0;
             for &entry_col in &pivot_entries {
-                hdpc_coefficients[row_start + entry_col] += factor;
+                hdpc_coefficients[row_start + entry_col] ^= factor;
             }
-            if factor != Octet::one() {
+            if factor != 1 {
                 update_unit_only = false;
             }
-            hdpc_update_entries.push((coefficient_col(row), factor));
+            hdpc_update_entries.push((coefficient_col(row), Octet::new(factor)));
         }
         if update_start != hdpc_update_entries.len() {
             hdpc_update_pivots.push(coefficient_col(direct_binary_symbol_index(pivot, s, h)));
@@ -1816,7 +1816,7 @@ fn prepare_direct_back_substitution_batches(
 
 #[cfg(feature = "std")]
 fn direct_hdpc_free_rows(
-    hdpc_coefficients: Vec<Octet>,
+    hdpc_coefficients: Vec<u8>,
     free_cols: &[CoefficientColumn],
     width: usize,
 ) -> Option<DirectSystematicFreeRows> {
@@ -1833,14 +1833,14 @@ fn direct_hdpc_free_rows(
         let mut free_row = Vec::with_capacity(free_cols.len());
         for col in 0..width {
             let value = hdpc_coefficients[row_start + col];
-            if value.is_zero() {
+            if value == 0 {
                 continue;
             }
             let free_index = free_index_by_col[col];
             if free_index == usize::MAX {
                 return None;
             }
-            free_row.push((coefficient_col(free_index), value));
+            free_row.push((coefficient_col(free_index), Octet::new(value)));
         }
         free_rows.push(free_row.into_boxed_slice());
     }
@@ -3222,7 +3222,7 @@ fn eliminate_weighted_binary_row(
         debug_assert_ne!(row_weights[row], 0);
         let pivot_entries = small_row_cache.entries(rows, pivot, col);
         let (weight, next_col) =
-            rows.xor_columns_update_weight_and_first_one(row, pivot_entries, row_weights[row]);
+            rows.xor_u16_columns_update_weight_and_first_one(row, pivot_entries, row_weights[row]);
         row_weights[row] = weight;
         small_row_cache.invalidate(row);
         return next_col;
@@ -3236,6 +3236,15 @@ fn eliminate_weighted_binary_row(
 
 fn dense_hdpc_coefficients(matrix: &DenseOctetMatrix) -> Vec<Octet> {
     matrix.as_slice().to_vec()
+}
+
+#[cfg(feature = "std")]
+fn dense_hdpc_coefficient_values(matrix: &DenseOctetMatrix) -> Vec<u8> {
+    matrix
+        .as_slice()
+        .iter()
+        .map(|coefficient| coefficient.value())
+        .collect()
 }
 
 fn solve_hdpc_free_variables_dense(
@@ -4773,14 +4782,31 @@ impl SmallWeightBinaryBuckets {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SmallBinaryRowEntries {
+    cols: [CoefficientColumn; SMALL_WEIGHT_BINARY_BUCKET_MAX as usize],
+    len: u8,
+    valid: bool,
+}
+
+impl Default for SmallBinaryRowEntries {
+    fn default() -> SmallBinaryRowEntries {
+        SmallBinaryRowEntries {
+            cols: [0; SMALL_WEIGHT_BINARY_BUCKET_MAX as usize],
+            len: 0,
+            valid: false,
+        }
+    }
+}
+
 struct SmallBinaryRowCache {
-    entries: Vec<Option<Box<[usize]>>>,
+    entries: Vec<SmallBinaryRowEntries>,
 }
 
 impl SmallBinaryRowCache {
     fn new(height: usize) -> SmallBinaryRowCache {
         SmallBinaryRowCache {
-            entries: vec![None; height],
+            entries: vec![SmallBinaryRowEntries::default(); height],
         }
     }
 
@@ -4789,17 +4815,24 @@ impl SmallBinaryRowCache {
         rows: &PackedBinaryRows,
         row: usize,
         start_col: usize,
-    ) -> &'a [usize] {
-        if self.entries[row].is_none() {
-            let mut entries = Vec::new();
-            rows.visit_ones_at_or_after(row, start_col, |col| entries.push(col));
-            self.entries[row] = Some(entries.into_boxed_slice());
+    ) -> &'a [CoefficientColumn] {
+        if !self.entries[row].valid {
+            let entry = &mut self.entries[row];
+            entry.len = 0;
+            rows.visit_ones_at_or_after(row, start_col, |col| {
+                let index = entry.len as usize;
+                debug_assert!(index < entry.cols.len());
+                entry.cols[index] = coefficient_col(col);
+                entry.len += 1;
+            });
+            entry.valid = true;
         }
-        self.entries[row].as_deref().expect("small row is cached")
+        let entry = &self.entries[row];
+        &entry.cols[..entry.len as usize]
     }
 
     fn invalidate(&mut self, row: usize) {
-        self.entries[row] = None;
+        self.entries[row].valid = false;
     }
 }
 
