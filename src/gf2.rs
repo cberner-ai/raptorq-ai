@@ -4,7 +4,16 @@ use std::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+use core::arch::x86_64::{
+    __m256i, _mm256_add_epi8, _mm256_and_si256, _mm256_extract_epi64, _mm256_loadu_si256,
+    _mm256_sad_epu8, _mm256_set1_epi8, _mm256_setr_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8,
+    _mm256_srli_epi16, _mm256_storeu_si256, _mm256_xor_si256,
+};
+
 use crate::matrix::BinaryMatrix;
+
+const WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedBinaryRows {
@@ -109,6 +118,214 @@ impl PackedBinaryRows {
     }
 
     pub(crate) fn xor_suffix_count_ones_and_first_one(
+        &mut self,
+        dest: usize,
+        src: usize,
+        start_col: usize,
+    ) -> (u32, Option<usize>) {
+        if self.words_per_row >= WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS {
+            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                unsafe {
+                    return self.xor_suffix_count_ones_and_first_one_avx2(dest, src, start_col);
+                }
+            }
+
+            #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+            if std::arch::is_x86_feature_detected!("popcnt") {
+                unsafe {
+                    return self.xor_suffix_count_ones_and_first_one_popcnt(dest, src, start_col);
+                }
+            }
+        }
+
+        self.xor_suffix_count_ones_and_first_one_fallback(dest, src, start_col)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn xor_suffix_count_ones_and_first_one_avx2(
+        &mut self,
+        dest: usize,
+        src: usize,
+        start_col: usize,
+    ) -> (u32, Option<usize>) {
+        debug_assert!(self.contains(dest, start_col));
+        debug_assert_ne!(dest, src);
+
+        let first_word = start_col / u64::BITS as usize;
+        let first_mask = u64::MAX << (start_col % u64::BITS as usize);
+        let width = self.width;
+        let words_per_row = self.words_per_row;
+        let dest_start = self.row_start(dest);
+        let src_start = self.row_start(src);
+        let dest_ptr = unsafe { self.words.as_mut_ptr().add(dest_start) };
+        let src_ptr = unsafe { self.words.as_ptr().add(src_start) };
+
+        let first_suffix_word = unsafe {
+            let first_ptr = dest_ptr.add(first_word);
+            *first_ptr ^= *src_ptr.add(first_word) & first_mask;
+            *first_ptr & first_mask
+        };
+        let mut weight = first_suffix_word.count_ones();
+        let mut first_one = if first_suffix_word == 0 {
+            None
+        } else {
+            let col = first_word * u64::BITS as usize + first_suffix_word.trailing_zeros() as usize;
+            (col < width).then_some(col)
+        };
+
+        let mut offset = first_word + 1;
+        while first_one.is_none() && offset < words_per_row {
+            let word = unsafe {
+                let dest_word = dest_ptr.add(offset);
+                let word = *dest_word ^ *src_ptr.add(offset);
+                *dest_word = word;
+                word
+            };
+            weight += word.count_ones();
+            if word != 0 {
+                let col = offset * u64::BITS as usize + word.trailing_zeros() as usize;
+                if col < width {
+                    first_one = Some(col);
+                }
+            }
+            offset += 1;
+        }
+
+        let lookup = unsafe { avx2_nibble_popcount_table() };
+        let low_mask = _mm256_set1_epi8(0x0f);
+        let zero = _mm256_setzero_si256();
+        while offset + 16 <= words_per_row {
+            unsafe {
+                weight += xor_store_popcount_4(dest_ptr, src_ptr, offset, lookup, low_mask, zero)
+                    + xor_store_popcount_4(dest_ptr, src_ptr, offset + 4, lookup, low_mask, zero)
+                    + xor_store_popcount_4(dest_ptr, src_ptr, offset + 8, lookup, low_mask, zero)
+                    + xor_store_popcount_4(dest_ptr, src_ptr, offset + 12, lookup, low_mask, zero);
+            }
+            offset += 16;
+        }
+        while offset + 4 <= words_per_row {
+            unsafe {
+                weight += xor_store_popcount_4(dest_ptr, src_ptr, offset, lookup, low_mask, zero);
+            }
+            offset += 4;
+        }
+        while offset < words_per_row {
+            let word = unsafe {
+                let dest_word = dest_ptr.add(offset);
+                let word = *dest_word ^ *src_ptr.add(offset);
+                *dest_word = word;
+                word
+            };
+            weight += word.count_ones();
+            offset += 1;
+        }
+        (weight, first_one)
+    }
+
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[target_feature(enable = "popcnt")]
+    unsafe fn xor_suffix_count_ones_and_first_one_popcnt(
+        &mut self,
+        dest: usize,
+        src: usize,
+        start_col: usize,
+    ) -> (u32, Option<usize>) {
+        debug_assert!(self.contains(dest, start_col));
+        debug_assert_ne!(dest, src);
+
+        let first_word = start_col / u64::BITS as usize;
+        let first_mask = u64::MAX << (start_col % u64::BITS as usize);
+        let width = self.width;
+        let words_per_row = self.words_per_row;
+        let dest_start = self.row_start(dest);
+        let src_start = self.row_start(src);
+        let dest_ptr = unsafe { self.words.as_mut_ptr().add(dest_start) };
+        let src_ptr = unsafe { self.words.as_ptr().add(src_start) };
+
+        let first_suffix_word = unsafe {
+            let first_ptr = dest_ptr.add(first_word);
+            *first_ptr ^= *src_ptr.add(first_word) & first_mask;
+            *first_ptr & first_mask
+        };
+        let mut weight = first_suffix_word.count_ones();
+        let mut first_one = if first_suffix_word == 0 {
+            None
+        } else {
+            let col = first_word * u64::BITS as usize + first_suffix_word.trailing_zeros() as usize;
+            (col < width).then_some(col)
+        };
+
+        let mut offset = first_word + 1;
+        while first_one.is_none() && offset < words_per_row {
+            let word = unsafe {
+                let dest_word = dest_ptr.add(offset);
+                let word = *dest_word ^ *src_ptr.add(offset);
+                *dest_word = word;
+                word
+            };
+            weight += word.count_ones();
+            if word != 0 {
+                let col = offset * u64::BITS as usize + word.trailing_zeros() as usize;
+                if col < width {
+                    first_one = Some(col);
+                }
+            }
+            offset += 1;
+        }
+
+        while offset + 8 <= words_per_row {
+            let word0;
+            let word1;
+            let word2;
+            let word3;
+            let word4;
+            let word5;
+            let word6;
+            let word7;
+            unsafe {
+                word0 = *dest_ptr.add(offset) ^ *src_ptr.add(offset);
+                word1 = *dest_ptr.add(offset + 1) ^ *src_ptr.add(offset + 1);
+                word2 = *dest_ptr.add(offset + 2) ^ *src_ptr.add(offset + 2);
+                word3 = *dest_ptr.add(offset + 3) ^ *src_ptr.add(offset + 3);
+                word4 = *dest_ptr.add(offset + 4) ^ *src_ptr.add(offset + 4);
+                word5 = *dest_ptr.add(offset + 5) ^ *src_ptr.add(offset + 5);
+                word6 = *dest_ptr.add(offset + 6) ^ *src_ptr.add(offset + 6);
+                word7 = *dest_ptr.add(offset + 7) ^ *src_ptr.add(offset + 7);
+                *dest_ptr.add(offset) = word0;
+                *dest_ptr.add(offset + 1) = word1;
+                *dest_ptr.add(offset + 2) = word2;
+                *dest_ptr.add(offset + 3) = word3;
+                *dest_ptr.add(offset + 4) = word4;
+                *dest_ptr.add(offset + 5) = word5;
+                *dest_ptr.add(offset + 6) = word6;
+                *dest_ptr.add(offset + 7) = word7;
+            }
+            weight += word0.count_ones()
+                + word1.count_ones()
+                + word2.count_ones()
+                + word3.count_ones()
+                + word4.count_ones()
+                + word5.count_ones()
+                + word6.count_ones()
+                + word7.count_ones();
+            offset += 8;
+        }
+        while offset < words_per_row {
+            let word = unsafe {
+                let dest_word = dest_ptr.add(offset);
+                let word = *dest_word ^ *src_ptr.add(offset);
+                *dest_word = word;
+                word
+            };
+            weight += word.count_ones();
+            offset += 1;
+        }
+        (weight, first_one)
+    }
+
+    fn xor_suffix_count_ones_and_first_one_fallback(
         &mut self,
         dest: usize,
         src: usize,
@@ -302,6 +519,38 @@ impl PackedBinaryRows {
     }
 
     pub(crate) fn weight_at_or_after(&self, row: usize, start_col: usize) -> u32 {
+        if self.words_per_row >= WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS {
+            #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+            if std::arch::is_x86_feature_detected!("popcnt") {
+                unsafe {
+                    return self.weight_at_or_after_popcnt(row, start_col);
+                }
+            }
+        }
+
+        self.weight_at_or_after_fallback(row, start_col)
+    }
+
+    fn weight_at_or_after_fallback(&self, row: usize, start_col: usize) -> u32 {
+        assert!(row < self.height);
+        if start_col >= self.width {
+            return 0;
+        }
+
+        let row_start = self.row_start(row);
+        let first_word = start_col / u64::BITS as usize;
+        let bit_offset = start_col % u64::BITS as usize;
+        let mut weight =
+            (self.words[row_start + first_word] & (u64::MAX << bit_offset)).count_ones();
+        for offset in (first_word + 1)..self.words_per_row {
+            weight += self.words[row_start + offset].count_ones();
+        }
+        weight
+    }
+
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[target_feature(enable = "popcnt")]
+    unsafe fn weight_at_or_after_popcnt(&self, row: usize, start_col: usize) -> u32 {
         assert!(row < self.height);
         if start_col >= self.width {
             return 0;
@@ -386,6 +635,57 @@ fn bit_mask(col: usize) -> u64 {
     1u64 << (col % u64::BITS as usize)
 }
 
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_store_popcount_4(
+    dest_ptr: *mut u64,
+    src_ptr: *const u64,
+    offset: usize,
+    lookup: __m256i,
+    low_mask: __m256i,
+    zero: __m256i,
+) -> u32 {
+    let updated = unsafe {
+        let dest = _mm256_loadu_si256(dest_ptr.add(offset).cast::<__m256i>().cast_const());
+        let src = _mm256_loadu_si256(src_ptr.add(offset).cast::<__m256i>());
+        let updated = _mm256_xor_si256(dest, src);
+        _mm256_storeu_si256(dest_ptr.add(offset).cast::<__m256i>(), updated);
+        updated
+    };
+    unsafe { avx2_popcount_256(updated, lookup, low_mask, zero) }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_popcount_256(
+    value: __m256i,
+    lookup: __m256i,
+    low_mask: __m256i,
+    zero: __m256i,
+) -> u32 {
+    let low = _mm256_and_si256(value, low_mask);
+    let high = _mm256_and_si256(_mm256_srli_epi16(value, 4), low_mask);
+    let counts = _mm256_add_epi8(
+        _mm256_shuffle_epi8(lookup, low),
+        _mm256_shuffle_epi8(lookup, high),
+    );
+    let sums = _mm256_sad_epu8(counts, zero);
+    let sum0 = _mm256_extract_epi64(sums, 0) as u64;
+    let sum1 = _mm256_extract_epi64(sums, 1) as u64;
+    let sum2 = _mm256_extract_epi64(sums, 2) as u64;
+    let sum3 = _mm256_extract_epi64(sums, 3) as u64;
+    (sum0 + sum1 + sum2 + sum3) as u32
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_nibble_popcount_table() -> __m256i {
+    _mm256_setr_epi8(
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3,
+        3, 4,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +727,22 @@ mod tests {
 
         assert_eq!(weight, 2);
         assert_eq!(first_one, Some(64));
+    }
+
+    #[test]
+    fn wide_xor_suffix_count_matches_fallback() {
+        let rows = vec![
+            vec![5, 64, 511, 4096, 32760],
+            vec![1, 5, 64, 128, 4096, 16384, 32760, 32767],
+        ];
+        let mut expected = PackedBinaryRows::from_sparse(rows.clone(), 32768);
+        let mut packed = PackedBinaryRows::from_sparse(rows, 32768);
+
+        let expected_result = expected.xor_suffix_count_ones_and_first_one_fallback(1, 0, 5);
+        let actual_result = packed.xor_suffix_count_ones_and_first_one(1, 0, 5);
+
+        assert_eq!(actual_result, expected_result);
+        assert_eq!(packed, expected);
     }
 
     #[test]
