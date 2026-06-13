@@ -72,6 +72,33 @@ impl AddAssignFastPath {
             add_assign_scalar(dest, src);
         }
     }
+
+    /// Applies one source slice into eight disjoint destination slices.
+    ///
+    /// # Safety
+    ///
+    /// `src` and every destination pointer must be valid for `len` bytes. Destinations must be
+    /// writable and must not overlap each other or `src`.
+    pub(crate) unsafe fn apply_same_len_raw_8(
+        self,
+        dests: [*mut u8; 8],
+        src: *const u8,
+        len: usize,
+    ) {
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_avx2 {
+            unsafe {
+                add_assign_8_avx2(dests, src, len);
+            }
+            return;
+        }
+
+        for dest in dests {
+            let dest = unsafe { core::slice::from_raw_parts_mut(dest, len) };
+            let src = unsafe { core::slice::from_raw_parts(src, len) };
+            add_assign_scalar(dest, src);
+        }
+    }
 }
 
 impl FusedAddAssignMulScalarFastPath {
@@ -372,6 +399,35 @@ unsafe fn add_assign_4_avx2(dests: [*mut u8; 4], src: *const u8, len: usize) {
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
+unsafe fn add_assign_8_avx2(dests: [*mut u8; 8], src: *const u8, len: usize) {
+    let mut offset = 0usize;
+    while offset + 128 <= len {
+        unsafe {
+            xor_8_32(dests, src, offset);
+            xor_8_32(dests, src, offset + 32);
+            xor_8_32(dests, src, offset + 64);
+            xor_8_32(dests, src, offset + 96);
+        }
+        offset += 128;
+    }
+    while offset + 32 <= len {
+        unsafe {
+            xor_8_32(dests, src, offset);
+        }
+        offset += 32;
+    }
+
+    if offset < len {
+        let src = unsafe { core::slice::from_raw_parts(src.add(offset), len - offset) };
+        for dest in dests {
+            let dest = unsafe { core::slice::from_raw_parts_mut(dest.add(offset), len - offset) };
+            add_assign_scalar(dest, src);
+        }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
 unsafe fn bytes_are_zero_avx2(bytes: &[u8]) -> bool {
     let zero = _mm256_setzero_si256();
     let mut offset = 0usize;
@@ -422,6 +478,19 @@ unsafe fn xor_32(dest: &mut [u8], src: &[u8], offset: usize) {
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
 unsafe fn xor_4_32(dests: [*mut u8; 4], src: *const u8, offset: usize) {
+    let source = unsafe { _mm256_loadu_si256(src.add(offset).cast::<__m256i>()) };
+    for dest in dests {
+        let dest = unsafe { dest.add(offset).cast::<__m256i>() };
+        let updated = unsafe { _mm256_xor_si256(_mm256_loadu_si256(dest.cast_const()), source) };
+        unsafe {
+            _mm256_storeu_si256(dest, updated);
+        }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_8_32(dests: [*mut u8; 8], src: *const u8, offset: usize) {
     let source = unsafe { _mm256_loadu_si256(src.add(offset).cast::<__m256i>()) };
     for dest in dests {
         let dest = unsafe { dest.add(offset).cast::<__m256i>() };
@@ -696,6 +765,52 @@ mod tests {
             assert_eq!(
                 bytes, expected,
                 "raw 4-way add_assign failed for length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_assign_raw_8_matches_scalar_xor() {
+        for len in [31usize, 32, 64, 128, 129] {
+            let src = patterned_bytes(len)
+                .into_iter()
+                .map(|byte| byte.rotate_left(2) ^ 0x5a)
+                .collect::<Vec<_>>();
+            let mut bytes = vec![0u8; len * 9];
+            bytes[..len].copy_from_slice(&src);
+            let mut expected = bytes.clone();
+
+            for symbol in 1..9 {
+                let start = symbol * len;
+                let dest = patterned_bytes(len)
+                    .into_iter()
+                    .map(|byte| byte.wrapping_add(symbol as u8))
+                    .collect::<Vec<_>>();
+                bytes[start..start + len].copy_from_slice(&dest);
+                expected[start..start + len].copy_from_slice(&scalar_xor(dest, &src));
+            }
+
+            let ptr = bytes.as_mut_ptr();
+            unsafe {
+                AddAssignFastPath::new(len).apply_same_len_raw_8(
+                    [
+                        ptr.add(len),
+                        ptr.add(len * 2),
+                        ptr.add(len * 3),
+                        ptr.add(len * 4),
+                        ptr.add(len * 5),
+                        ptr.add(len * 6),
+                        ptr.add(len * 7),
+                        ptr.add(len * 8),
+                    ],
+                    ptr.cast_const(),
+                    len,
+                );
+            }
+
+            assert_eq!(
+                bytes, expected,
+                "raw 8-way add_assign failed for length {len}"
             );
         }
     }
