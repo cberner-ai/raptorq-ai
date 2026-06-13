@@ -6,11 +6,11 @@ use raptorq::{ObjectTransmissionInformation, SourceBlockDecoder, SourceBlockEnco
 use std::time::{Duration, Instant};
 
 const TARGET_TOTAL_BYTES: usize = 128 * 1024 * 1024;
-// Keep the default non-CI repair-only run bounded; CI uses a smaller byte target.
-const SYMBOL_COUNTS: [usize; 5] = [10, 100, 250, 500, 1000];
+const REPAIR_ONLY_SYMBOL_COUNTS: [usize; 10] =
+    [10, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000];
+const OVERHEAD_SYMBOL_COUNTS: [usize; 10] =
+    [10, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000];
 const CI_TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-// The next shared count exceeds the 5% overhead path's 2048-symbol solver cap.
-const MAX_CI_DECODE_5_PERCENT_SYMBOL_COUNT: usize = 1000;
 
 fn black_box(value: u64) {
     if value == rand::rng().random() {
@@ -24,12 +24,6 @@ fn ci_mode_enabled() -> bool {
 
 fn elapsed_seconds(elapsed: Duration) -> f64 {
     elapsed.as_nanos() as f64 / 1_000_000_000.0
-}
-
-fn ci_decode_5_percent_symbol_counts() -> &'static [usize] {
-    let end = CI_SYMBOL_COUNTS
-        .partition_point(|&symbol_count| symbol_count <= MAX_CI_DECODE_5_PERCENT_SYMBOL_COUNT);
-    &CI_SYMBOL_COUNTS[..end]
 }
 
 fn benchmark(
@@ -82,13 +76,13 @@ fn main() {
         (
             CI_TARGET_TOTAL_BYTES,
             CI_SYMBOL_COUNTS.as_slice(),
-            ci_decode_5_percent_symbol_counts(),
+            CI_SYMBOL_COUNTS.as_slice(),
         )
     } else {
         (
             TARGET_TOTAL_BYTES,
-            SYMBOL_COUNTS.as_slice(),
-            SYMBOL_COUNTS.as_slice(),
+            REPAIR_ONLY_SYMBOL_COUNTS.as_slice(),
+            OVERHEAD_SYMBOL_COUNTS.as_slice(),
         )
     };
 
