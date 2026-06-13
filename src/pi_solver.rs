@@ -3349,16 +3349,12 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     let overdetermined = binary_height + h > width;
 
     let mut binary_symbols = SymbolSlab::with_zeros(binary_height, symbol_size);
-    for row in 0..s {
-        binary_symbols
-            .get_mut(row)
-            .copy_from_slice(symbols.get(row));
-    }
-    for row in s..binary_height {
-        binary_symbols
-            .get_mut(row)
-            .copy_from_slice(symbols.get(row + h));
-    }
+    let symbol_bytes = symbols.as_bytes();
+    let low_binary_bytes = s * symbol_size;
+    binary_symbols.copy_block_from(0, &symbol_bytes[..low_binary_bytes]);
+    let high_binary_start = (s + h) * symbol_size;
+    let high_binary_end = high_binary_start + (binary_height - s) * symbol_size;
+    binary_symbols.copy_block_from(s, &symbol_bytes[high_binary_start..high_binary_end]);
 
     let use_weighted_buckets = width >= LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH;
     let (mut rows, mut row_weights, first_ones) = if use_weighted_buckets {
