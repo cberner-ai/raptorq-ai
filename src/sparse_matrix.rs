@@ -28,6 +28,13 @@ pub struct SparseBinaryMatrix {
     rows_normalized: bool,
 }
 
+impl SparseBinaryMatrix {
+    #[cfg(test)]
+    pub(crate) fn rows_normalized_for_test(&self) -> bool {
+        self.rows_normalized
+    }
+}
+
 impl PartialEq for SparseBinaryMatrix {
     fn eq(&self, other: &Self) -> bool {
         if self.width != other.width || self.rows.len() != other.rows.len() {
