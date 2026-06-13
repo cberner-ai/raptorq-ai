@@ -45,6 +45,16 @@ pub trait BinaryMatrix: Clone {
     fn packed_rows(&self) -> PackedBinaryRows {
         PackedBinaryRows::from_matrix(self)
     }
+
+    fn packed_row_prefix(&self, height: usize) -> PackedBinaryRows {
+        assert!(height <= self.height());
+        let mut rows = PackedBinaryRows::new(height, self.width());
+        for row in 0..height {
+            self.visit_row_entries(row, |col| rows.set(row, col));
+        }
+        rows
+    }
+
     fn packed_rows_with_first_ones(&self) -> (PackedBinaryRows, Vec<Option<usize>>) {
         let rows = self.packed_rows();
         let first_ones = (0..rows.height())

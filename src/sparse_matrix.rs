@@ -215,6 +215,15 @@ impl BinaryMatrix for SparseBinaryMatrix {
         packed
     }
 
+    fn packed_row_prefix(&self, height: usize) -> PackedBinaryRows {
+        assert!(height <= self.rows.len());
+        let mut packed = PackedBinaryRows::new(height, self.width);
+        for (row, entries) in self.rows[..height].iter().enumerate() {
+            packed.set_entries(row, entries);
+        }
+        packed
+    }
+
     fn packed_rows_with_first_ones(&self) -> (PackedBinaryRows, Vec<Option<usize>>) {
         let mut packed = PackedBinaryRows::new(self.rows.len(), self.width);
         let mut first_ones = Vec::with_capacity(self.rows.len());
