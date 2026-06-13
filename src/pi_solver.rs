@@ -17,7 +17,8 @@ use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
 use crate::octets::{
-    AddAssignFastPath, add_assign, bytes_are_zero, fused_addassign_mul_scalar, mulassign_scalar,
+    AddAssignFastPath, FusedAddAssignMulScalarFastPath, add_assign, bytes_are_zero,
+    fused_addassign_mul_scalar, mulassign_scalar,
 };
 use crate::operation_vector::SymbolOps;
 #[cfg(feature = "std")]
@@ -1907,6 +1908,7 @@ fn apply_prepared_direct_systematic_plan(plan: &DirectSystematicPlan, symbols: &
 
     let symbol_size = symbols.symbol_size();
     let add_assign_path = AddAssignFastPath::new(symbol_size);
+    let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
 
     for (step_index, step) in plan.forward_steps.iter().enumerate() {
         addassign_direct_symbol_batch(
@@ -1926,7 +1928,7 @@ fn apply_prepared_direct_systematic_plan(plan: &DirectSystematicPlan, symbols: &
     for (update_index, &pivot) in plan.hdpc_update_pivots.iter().enumerate() {
         let pivot_symbol = symbols.get(coefficient_col_index(pivot));
         for &(row, factor) in plan.hdpc_updates.slice(update_index) {
-            fused_addassign_mul_scalar(
+            fused_mul_path.apply(
                 hdpc_symbols.get_mut(coefficient_col_index(row)),
                 pivot_symbol,
                 &factor,
@@ -2317,6 +2319,7 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
     assert_eq!(symbols.len(), plan.width);
 
     let symbol_size = symbols.symbol_size();
+    let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
     let binary_height = plan.width - plan.h;
     let mut binary_symbols = SymbolSlab::with_zeros(binary_height, symbol_size);
     let symbol_bytes = symbols.as_bytes();
@@ -2338,7 +2341,7 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
     let hdpc_end = hdpc_start + plan.h * symbol_size;
     hdpc_symbols.copy_block_from(0, &symbol_bytes[hdpc_start..hdpc_end]);
     for step in &plan.hdpc_symbol_steps {
-        fused_addassign_mul_scalar(
+        fused_mul_path.apply(
             hdpc_symbols.get_mut(step.row),
             binary_symbols.get(step.pivot),
             &step.factor,
@@ -2398,6 +2401,7 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
     assert_eq!(symbols.len(), plan.width);
 
     let symbol_size = symbols.symbol_size();
+    let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
     for (step_index, &(_, pivot)) in plan.pivots.iter().enumerate() {
         addassign_mapped_binary_symbol_batch(
             symbols,
@@ -2412,7 +2416,7 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
         let src = mapped_binary_symbol_row(step.pivot, plan.s, plan.h);
         let dest = plan.s + step.row;
         let (src_symbol, dest_symbol) = symbols.get_disjoint_mut(src, dest);
-        fused_addassign_mul_scalar(dest_symbol, src_symbol, &step.factor);
+        fused_mul_path.apply(dest_symbol, src_symbol, &step.factor);
     }
 
     let free_values = if plan.free_cols.is_empty() {
@@ -2932,6 +2936,7 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     let binary_height = matrix.height();
     let symbol_size = symbols.symbol_size();
     let add_assign_path = AddAssignFastPath::new(symbol_size);
+    let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
     let overdetermined = binary_height + h > width;
 
     let mut binary_symbols = SymbolSlab::with_zeros(binary_height, symbol_size);
@@ -3071,7 +3076,7 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
                 continue;
             }
             hdpc_projection_rows.push((row_start, factor));
-            fused_addassign_mul_scalar(
+            fused_mul_path.apply(
                 hdpc_symbols.get_mut(row),
                 binary_symbols.get(pivot),
                 &factor,
@@ -3249,6 +3254,7 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
 
     let symbol_size = symbols.symbol_size();
     let add_assign_path = AddAssignFastPath::new(symbol_size);
+    let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
     let use_weighted_buckets = width >= LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH;
     let (mut rows, mut row_weights, first_ones) = if use_weighted_buckets {
         matrix.packed_rows_with_row_weights_and_first_ones()
@@ -3380,7 +3386,7 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
             hdpc_projection_rows.push((row_start, factor));
             let hdpc_symbol = s + row;
             let (src, dest) = symbols.get_disjoint_mut(pivot_symbol, hdpc_symbol);
-            fused_addassign_mul_scalar(dest, src, &factor);
+            fused_mul_path.apply(dest, src, &factor);
         }
         if hdpc_projection_rows.is_empty() {
             continue;

@@ -6,6 +6,12 @@ pub(crate) struct AddAssignFastPath {
     use_avx2: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct FusedAddAssignMulScalarFastPath {
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    use_avx2: bool,
+}
+
 impl AddAssignFastPath {
     pub(crate) fn new(symbol_len: usize) -> AddAssignFastPath {
         #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -24,7 +30,6 @@ impl AddAssignFastPath {
 
     pub(crate) fn apply(self, dest: &mut [u8], src: &[u8]) {
         assert_eq!(dest.len(), src.len());
-
         #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
         if self.use_avx2 {
             unsafe {
@@ -34,6 +39,49 @@ impl AddAssignFastPath {
         }
 
         add_assign_scalar(dest, src);
+    }
+}
+
+impl FusedAddAssignMulScalarFastPath {
+    pub(crate) fn new(symbol_len: usize) -> FusedAddAssignMulScalarFastPath {
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            return FusedAddAssignMulScalarFastPath {
+                use_avx2: symbol_len >= 32 && std::arch::is_x86_feature_detected!("avx2"),
+            };
+        }
+
+        #[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
+        {
+            let _ = symbol_len;
+            FusedAddAssignMulScalarFastPath {}
+        }
+    }
+
+    pub(crate) fn apply(self, dest: &mut [u8], src: &[u8], scalar: &Octet) {
+        assert_eq!(dest.len(), src.len());
+        if scalar.is_zero() {
+            return;
+        }
+        if *scalar == Octet::one() {
+            AddAssignFastPath {
+                #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+                use_avx2: self.use_avx2,
+            }
+            .apply(dest, src);
+            return;
+        }
+
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_avx2 {
+            unsafe {
+                fused_addassign_mul_scalar_avx2(dest, src, scalar.value());
+            }
+            return;
+        }
+
+        let table = scalar.mul_table();
+        fused_addassign_table(dest, src, table);
     }
 }
 
@@ -63,19 +111,7 @@ pub fn mulassign_scalar(dest: &mut [u8], scalar: &Octet) {
 }
 
 pub fn fused_addassign_mul_scalar(dest: &mut [u8], src: &[u8], scalar: &Octet) {
-    assert_eq!(dest.len(), src.len());
-    if scalar.is_zero() {
-        return;
-    }
-    if *scalar == Octet::one() {
-        add_assign(dest, src);
-        return;
-    }
-    if try_fused_addassign_mul_scalar_avx2(dest, src, scalar) {
-        return;
-    }
-    let table = scalar.mul_table();
-    fused_addassign_table(dest, src, table);
+    FusedAddAssignMulScalarFastPath::new(dest.len()).apply(dest, src, scalar);
 }
 
 pub(crate) fn bytes_are_zero(bytes: &[u8]) -> bool {
@@ -148,23 +184,6 @@ fn try_mulassign_scalar_avx2(dest: &mut [u8], scalar: &Octet) -> bool {
 
 #[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
 fn try_mulassign_scalar_avx2(_dest: &mut [u8], _scalar: &Octet) -> bool {
-    false
-}
-
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-fn try_fused_addassign_mul_scalar_avx2(dest: &mut [u8], src: &[u8], scalar: &Octet) -> bool {
-    if dest.len() < 32 || !std::arch::is_x86_feature_detected!("avx2") {
-        return false;
-    }
-
-    unsafe {
-        fused_addassign_mul_scalar_avx2(dest, src, scalar.value());
-    }
-    true
-}
-
-#[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
-fn try_fused_addassign_mul_scalar_avx2(_dest: &mut [u8], _src: &[u8], _scalar: &Octet) -> bool {
     false
 }
 
@@ -507,6 +526,10 @@ mod tests {
 
                 fused_addassign_mul_scalar(&mut dest, &src, &octet);
                 assert_eq!(dest, expected);
+
+                let mut fast_path_dest = patterned_bytes(len);
+                FusedAddAssignMulScalarFastPath::new(len).apply(&mut fast_path_dest, &src, &octet);
+                assert_eq!(fast_path_dest, expected);
             }
         }
     }
