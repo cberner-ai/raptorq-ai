@@ -64,17 +64,36 @@ impl PackedBinaryRows {
 
     pub(crate) fn xor_suffix(&mut self, dest: usize, src: usize, start_col: usize) {
         debug_assert!(self.contains(dest, start_col));
+        debug_assert_ne!(dest, src);
 
         let first_word = start_col / u64::BITS as usize;
         let first_mask = u64::MAX << (start_col % u64::BITS as usize);
+        let words_per_row = self.words_per_row;
         let dest_start = self.row_start(dest);
         let src_start = self.row_start(src);
+        // Elimination buckets only merge distinct rows; raw row pointers avoid per-word bounds
+        // checks in this packed GF(2) hot path.
+        let dest_ptr = unsafe { self.words.as_mut_ptr().add(dest_start) };
+        let src_ptr = unsafe { self.words.as_ptr().add(src_start) };
 
-        let first_index = dest_start + first_word;
-        self.words[first_index] ^= self.words[src_start + first_word] & first_mask;
-        for offset in (first_word + 1)..self.words_per_row {
-            let index = dest_start + offset;
-            self.words[index] ^= self.words[src_start + offset];
+        unsafe {
+            *dest_ptr.add(first_word) ^= *src_ptr.add(first_word) & first_mask;
+        }
+        let mut offset = first_word + 1;
+        while offset + 4 <= words_per_row {
+            unsafe {
+                *dest_ptr.add(offset) ^= *src_ptr.add(offset);
+                *dest_ptr.add(offset + 1) ^= *src_ptr.add(offset + 1);
+                *dest_ptr.add(offset + 2) ^= *src_ptr.add(offset + 2);
+                *dest_ptr.add(offset + 3) ^= *src_ptr.add(offset + 3);
+            }
+            offset += 4;
+        }
+        while offset < words_per_row {
+            unsafe {
+                *dest_ptr.add(offset) ^= *src_ptr.add(offset);
+            }
+            offset += 1;
         }
     }
 
@@ -96,42 +115,78 @@ impl PackedBinaryRows {
         start_col: usize,
     ) -> (u32, Option<usize>) {
         debug_assert!(self.contains(dest, start_col));
+        debug_assert_ne!(dest, src);
 
         let first_word = start_col / u64::BITS as usize;
         let first_mask = u64::MAX << (start_col % u64::BITS as usize);
+        let width = self.width;
+        let words_per_row = self.words_per_row;
         let dest_start = self.row_start(dest);
         let src_start = self.row_start(src);
+        // Elimination buckets only merge distinct rows; raw row pointers avoid per-word bounds
+        // checks in this packed GF(2) hot path.
+        let dest_ptr = unsafe { self.words.as_mut_ptr().add(dest_start) };
+        let src_ptr = unsafe { self.words.as_ptr().add(src_start) };
 
-        let first_index = dest_start + first_word;
-        self.words[first_index] ^= self.words[src_start + first_word] & first_mask;
-        let first_suffix_word = self.words[first_index] & first_mask;
+        let first_suffix_word = unsafe {
+            let first_ptr = dest_ptr.add(first_word);
+            *first_ptr ^= *src_ptr.add(first_word) & first_mask;
+            *first_ptr & first_mask
+        };
         let mut weight = first_suffix_word.count_ones();
         let mut first_one = if first_suffix_word == 0 {
             None
         } else {
             let col = first_word * u64::BITS as usize + first_suffix_word.trailing_zeros() as usize;
-            (col < self.width).then_some(col)
+            (col < width).then_some(col)
         };
 
         let mut offset = first_word + 1;
-        while first_one.is_none() && offset < self.words_per_row {
-            let index = dest_start + offset;
-            self.words[index] ^= self.words[src_start + offset];
-            let word = self.words[index];
+        while first_one.is_none() && offset < words_per_row {
+            let word = unsafe {
+                let dest_word = dest_ptr.add(offset);
+                let word = *dest_word ^ *src_ptr.add(offset);
+                *dest_word = word;
+                word
+            };
             weight += word.count_ones();
             if word != 0 {
                 let col = offset * u64::BITS as usize + word.trailing_zeros() as usize;
-                if col < self.width {
+                if col < width {
                     first_one = Some(col);
                 }
             }
             offset += 1;
         }
 
-        for offset in offset..self.words_per_row {
-            let index = dest_start + offset;
-            self.words[index] ^= self.words[src_start + offset];
-            weight += self.words[index].count_ones();
+        while offset + 4 <= words_per_row {
+            let word0;
+            let word1;
+            let word2;
+            let word3;
+            unsafe {
+                word0 = *dest_ptr.add(offset) ^ *src_ptr.add(offset);
+                word1 = *dest_ptr.add(offset + 1) ^ *src_ptr.add(offset + 1);
+                word2 = *dest_ptr.add(offset + 2) ^ *src_ptr.add(offset + 2);
+                word3 = *dest_ptr.add(offset + 3) ^ *src_ptr.add(offset + 3);
+                *dest_ptr.add(offset) = word0;
+                *dest_ptr.add(offset + 1) = word1;
+                *dest_ptr.add(offset + 2) = word2;
+                *dest_ptr.add(offset + 3) = word3;
+            }
+            weight +=
+                word0.count_ones() + word1.count_ones() + word2.count_ones() + word3.count_ones();
+            offset += 4;
+        }
+        while offset < words_per_row {
+            let word = unsafe {
+                let dest_word = dest_ptr.add(offset);
+                let word = *dest_word ^ *src_ptr.add(offset);
+                *dest_word = word;
+                word
+            };
+            weight += word.count_ones();
+            offset += 1;
         }
         (weight, first_one)
     }
