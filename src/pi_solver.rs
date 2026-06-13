@@ -3207,7 +3207,7 @@ fn try_square_hybrid_binary_hdpc_solve_owned<M: BinaryMatrix>(
         return SquareHybridDecodeResult::Fallback(symbols);
     }
 
-    if width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH {
+    if use_one_shot_square_hybrid_decode(width) {
         match try_square_hybrid_binary_hdpc_solve_one_shot(
             source_block_symbols,
             matrix,
@@ -3221,6 +3221,13 @@ fn try_square_hybrid_binary_hdpc_solve_owned<M: BinaryMatrix>(
         }
     }
 
+    if use_direct_square_hybrid_decode(width)
+        && let Some(plan) = prepare_direct_systematic_plan(matrix, hdpc_rows, source_block_symbols)
+    {
+        apply_prepared_direct_systematic_plan(&plan, &mut symbols);
+        return SquareHybridDecodeResult::Decoded(symbols);
+    }
+
     let Some(plan) = prepare_cached_hybrid_systematic_plan(source_block_symbols, matrix, hdpc_rows)
     else {
         return SquareHybridDecodeResult::Fallback(symbols);
@@ -3231,6 +3238,26 @@ fn try_square_hybrid_binary_hdpc_solve_owned<M: BinaryMatrix>(
     } else {
         SquareHybridDecodeResult::Failed
     }
+}
+
+#[cfg(all(feature = "std", not(test)))]
+fn use_one_shot_square_hybrid_decode(_width: usize) -> bool {
+    false
+}
+
+#[cfg(all(feature = "std", test))]
+fn use_one_shot_square_hybrid_decode(width: usize) -> bool {
+    width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH
+}
+
+#[cfg(all(feature = "std", not(test)))]
+fn use_direct_square_hybrid_decode(width: usize) -> bool {
+    width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH
+}
+
+#[cfg(all(feature = "std", test))]
+fn use_direct_square_hybrid_decode(_width: usize) -> bool {
+    false
 }
 
 #[cfg(feature = "std")]
