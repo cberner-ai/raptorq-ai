@@ -89,7 +89,8 @@ const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 64;
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 4_096;
 #[cfg(test)]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
-const SMALL_WEIGHT_BINARY_BUCKET_MAX: u32 = 16;
+const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
+const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 
@@ -1473,6 +1474,35 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
     hdpc_rows: &DenseOctetMatrix,
     source_block_symbols: u32,
 ) -> Option<DirectSystematicPlan> {
+    prepare_direct_systematic_plan_with_small_weight_max::<PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX, M>(
+        matrix,
+        hdpc_rows,
+        source_block_symbols,
+    )
+}
+
+#[cfg(feature = "std")]
+fn prepare_direct_systematic_plan_for_decode<M: BinaryMatrix>(
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    source_block_symbols: u32,
+) -> Option<DirectSystematicPlan> {
+    prepare_direct_systematic_plan_with_small_weight_max::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, M>(
+        matrix,
+        hdpc_rows,
+        source_block_symbols,
+    )
+}
+
+#[cfg(feature = "std")]
+fn prepare_direct_systematic_plan_with_small_weight_max<
+    const SMALL_WEIGHT_MAX: usize,
+    M: BinaryMatrix,
+>(
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    source_block_symbols: u32,
+) -> Option<DirectSystematicPlan> {
     let s = num_ldpc_symbols(source_block_symbols) as usize;
     let h = hdpc_rows.height();
     let width = matrix.width();
@@ -1490,13 +1520,16 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
         (rows, Vec::new(), first_ones)
     };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
-    let mut small_weight_buckets =
-        SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
-    let mut small_row_cache = SmallBinaryRowCache::new(if use_weighted_buckets {
-        binary_height
-    } else {
-        0
-    });
+    let mut small_weight_buckets = SmallWeightBinaryBuckets::<u32>::new(
+        if use_weighted_buckets { width } else { 0 },
+        SMALL_WEIGHT_MAX,
+    );
+    let mut small_row_cache =
+        SmallBinaryRowCache::<SMALL_WEIGHT_MAX>::new(if use_weighted_buckets {
+            binary_height
+        } else {
+            0
+        });
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for (row, first_one) in first_ones.into_iter().enumerate() {
         if let Some(col) = first_one {
@@ -1559,7 +1592,7 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let next_col = eliminate_weighted_binary_row(
+                let next_col = eliminate_weighted_binary_row::<SMALL_WEIGHT_MAX>(
                     &mut rows,
                     &mut row_weights,
                     &mut small_row_cache,
@@ -1936,6 +1969,17 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
 
 #[cfg(feature = "std")]
 fn apply_prepared_direct_systematic_plan(plan: &DirectSystematicPlan, symbols: &mut SymbolSlab) {
+    assert!(
+        try_apply_prepared_direct_systematic_plan(plan, symbols),
+        "prepared direct systematic HDPC solve failed"
+    );
+}
+
+#[cfg(feature = "std")]
+fn try_apply_prepared_direct_systematic_plan(
+    plan: &DirectSystematicPlan,
+    symbols: &mut SymbolSlab,
+) -> bool {
     assert_eq!(symbols.len(), plan.width);
 
     let symbol_size = symbols.symbol_size();
@@ -1973,8 +2017,10 @@ fn apply_prepared_direct_systematic_plan(plan: &DirectSystematicPlan, symbols: &
         hdpc_symbols,
         plan.free_cols.len(),
         symbol_size,
-    )
-    .expect("prepared direct systematic HDPC solve failed");
+    );
+    let Some(free_values) = free_values else {
+        return false;
+    };
 
     move_direct_pivot_symbols_to_columns(plan, symbols);
     for (free_index, &col) in plan.free_cols.iter().enumerate() {
@@ -1990,6 +2036,7 @@ fn apply_prepared_direct_systematic_plan(plan: &DirectSystematicPlan, symbols: &
             add_assign_path,
         );
     }
+    true
 }
 
 #[cfg(feature = "std")]
@@ -2722,6 +2769,33 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
     matrix: &M,
     hdpc_rows: &DenseOctetMatrix,
 ) -> Option<CachedHybridSystematicPlan> {
+    prepare_cached_hybrid_systematic_plan_with_small_weight_max::<
+        PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+        M,
+    >(source_block_symbols, matrix, hdpc_rows)
+}
+
+#[cfg(feature = "std")]
+fn prepare_cached_hybrid_systematic_plan_for_decode<M: BinaryMatrix>(
+    source_block_symbols: u32,
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+) -> Option<CachedHybridSystematicPlan> {
+    prepare_cached_hybrid_systematic_plan_with_small_weight_max::<
+        DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+        M,
+    >(source_block_symbols, matrix, hdpc_rows)
+}
+
+#[cfg(feature = "std")]
+fn prepare_cached_hybrid_systematic_plan_with_small_weight_max<
+    const SMALL_WEIGHT_MAX: usize,
+    M: BinaryMatrix,
+>(
+    source_block_symbols: u32,
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+) -> Option<CachedHybridSystematicPlan> {
     let s = num_ldpc_symbols(source_block_symbols) as usize;
     let h = hdpc_rows.height();
     let width = matrix.width();
@@ -2742,13 +2816,16 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
         (rows, Vec::new(), first_ones)
     };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
-    let mut small_weight_buckets =
-        SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
-    let mut small_row_cache = SmallBinaryRowCache::new(if use_weighted_buckets {
-        binary_height
-    } else {
-        0
-    });
+    let mut small_weight_buckets = SmallWeightBinaryBuckets::<u32>::new(
+        if use_weighted_buckets { width } else { 0 },
+        SMALL_WEIGHT_MAX,
+    );
+    let mut small_row_cache =
+        SmallBinaryRowCache::<SMALL_WEIGHT_MAX>::new(if use_weighted_buckets {
+            binary_height
+        } else {
+            0
+        });
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for (row, first_one) in first_ones.into_iter().enumerate() {
         if let Some(col) = first_one {
@@ -2808,7 +2885,7 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let next_col = eliminate_weighted_binary_row(
+                let next_col = eliminate_weighted_binary_row::<SMALL_WEIGHT_MAX>(
                     &mut rows,
                     &mut row_weights,
                     &mut small_row_cache,
@@ -3008,13 +3085,17 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
         (rows, Vec::new(), first_ones)
     };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
-    let mut small_weight_buckets =
-        SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
-    let mut small_row_cache = SmallBinaryRowCache::new(if use_weighted_buckets {
-        binary_height
-    } else {
-        0
-    });
+    let mut small_weight_buckets = SmallWeightBinaryBuckets::<u16>::new(
+        if use_weighted_buckets { width } else { 0 },
+        DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+    );
+    let mut small_row_cache = SmallBinaryRowCache::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX>::new(
+        if use_weighted_buckets {
+            binary_height
+        } else {
+            0
+        },
+    );
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for (row, first_one) in first_ones.into_iter().enumerate() {
         if let Some(col) = first_one {
@@ -3069,7 +3150,7 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let next_col = eliminate_weighted_binary_row(
+                let next_col = eliminate_weighted_binary_row::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX>(
                     &mut rows,
                     &mut row_weights,
                     &mut small_row_cache,
@@ -3209,16 +3290,16 @@ fn binary_decoded_solution(
     decoded
 }
 
-fn eliminate_weighted_binary_row(
+fn eliminate_weighted_binary_row<const SMALL_WEIGHT_MAX: usize>(
     rows: &mut PackedBinaryRows,
     row_weights: &mut [u32],
-    small_row_cache: &mut SmallBinaryRowCache,
+    small_row_cache: &mut SmallBinaryRowCache<SMALL_WEIGHT_MAX>,
     row: usize,
     pivot: usize,
     col: usize,
     pivot_weight: u32,
 ) -> Option<usize> {
-    if pivot_weight <= SMALL_WEIGHT_BINARY_BUCKET_MAX {
+    if (pivot_weight as usize) <= SMALL_WEIGHT_MAX {
         debug_assert_ne!(row_weights[row], 0);
         let pivot_entries = small_row_cache.entries(rows, pivot, col);
         let (weight, next_col) =
@@ -3321,19 +3402,42 @@ fn try_square_hybrid_binary_hdpc_solve_owned<M: BinaryMatrix>(
         }
     }
 
-    if use_direct_square_hybrid_decode(width)
-        && let Some(plan) = prepare_direct_systematic_plan(matrix, hdpc_rows, source_block_symbols)
-    {
-        apply_prepared_direct_systematic_plan(&plan, &mut symbols);
-        return SquareHybridDecodeResult::Decoded(symbols);
+    if use_direct_square_hybrid_decode(width) {
+        match try_direct_square_hybrid_decode(source_block_symbols, matrix, hdpc_rows, symbols) {
+            SquareHybridDecodeResult::Fallback(returned_symbols) => {
+                symbols = returned_symbols;
+            }
+            result => return result,
+        }
     }
 
-    let Some(plan) = prepare_cached_hybrid_systematic_plan(source_block_symbols, matrix, hdpc_rows)
+    let Some(plan) =
+        prepare_cached_hybrid_systematic_plan_for_decode(source_block_symbols, matrix, hdpc_rows)
     else {
         return SquareHybridDecodeResult::Fallback(symbols);
     };
 
     if try_apply_cached_hybrid_systematic_plan_in_place(&plan, &mut symbols) {
+        SquareHybridDecodeResult::Decoded(symbols)
+    } else {
+        SquareHybridDecodeResult::Failed
+    }
+}
+
+#[cfg(feature = "std")]
+fn try_direct_square_hybrid_decode<M: BinaryMatrix>(
+    source_block_symbols: u32,
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    mut symbols: SymbolSlab,
+) -> SquareHybridDecodeResult {
+    let Some(plan) =
+        prepare_direct_systematic_plan_for_decode(matrix, hdpc_rows, source_block_symbols)
+    else {
+        return SquareHybridDecodeResult::Fallback(symbols);
+    };
+
+    if try_apply_prepared_direct_systematic_plan(&plan, &mut symbols) {
         SquareHybridDecodeResult::Decoded(symbols)
     } else {
         SquareHybridDecodeResult::Failed
@@ -3390,13 +3494,17 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
         (rows, Vec::new(), first_ones)
     };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
-    let mut small_weight_buckets =
-        SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
-    let mut small_row_cache = SmallBinaryRowCache::new(if use_weighted_buckets {
-        binary_height
-    } else {
-        0
-    });
+    let mut small_weight_buckets = SmallWeightBinaryBuckets::<u16>::new(
+        if use_weighted_buckets { width } else { 0 },
+        DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+    );
+    let mut small_row_cache = SmallBinaryRowCache::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX>::new(
+        if use_weighted_buckets {
+            binary_height
+        } else {
+            0
+        },
+    );
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for (row, first_one) in first_ones.into_iter().enumerate() {
         if let Some(col) = first_one {
@@ -3454,7 +3562,7 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let next_col = eliminate_weighted_binary_row(
+                let next_col = eliminate_weighted_binary_row::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX>(
                     &mut rows,
                     &mut row_weights,
                     &mut small_row_cache,
@@ -4546,10 +4654,13 @@ fn solve_binary(
         Vec::new()
     };
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
-    let mut small_weight_buckets =
-        SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
-    let mut small_row_cache =
-        SmallBinaryRowCache::new(if use_weighted_buckets { height } else { 0 });
+    let mut small_weight_buckets = SmallWeightBinaryBuckets::<u16>::new(
+        if use_weighted_buckets { width } else { 0 },
+        DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+    );
+    let mut small_row_cache = SmallBinaryRowCache::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX>::new(
+        if use_weighted_buckets { height } else { 0 },
+    );
     let mut next_in_bucket = vec![NO_BUCKET_ROW; height];
     for row in 0..height {
         if let Some(col) = rows.first_one_at_or_after(row, 0) {
@@ -4605,7 +4716,7 @@ fn solve_binary(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let next_col = eliminate_weighted_binary_row(
+                let next_col = eliminate_weighted_binary_row::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX>(
                     &mut rows,
                     &mut row_weights,
                     &mut small_row_cache,
@@ -4704,23 +4815,75 @@ fn pop_row_bucket(
     Some(row)
 }
 
-struct SmallWeightBinaryBuckets {
-    heads: Vec<usize>,
-    nonempty_masks: Vec<u16>,
-    width: usize,
+trait SmallWeightBucketMask: Copy {
+    const BITS: usize;
+
+    fn zero() -> Self;
+    fn trailing_zeros(self) -> usize;
+    fn set_bit(&mut self, bucket: usize);
+    fn clear_bit(&mut self, bucket: usize);
 }
 
-impl SmallWeightBinaryBuckets {
-    fn new(width: usize) -> SmallWeightBinaryBuckets {
+impl SmallWeightBucketMask for u16 {
+    const BITS: usize = u16::BITS as usize;
+
+    fn zero() -> u16 {
+        0
+    }
+
+    fn trailing_zeros(self) -> usize {
+        u16::trailing_zeros(self) as usize
+    }
+
+    fn set_bit(&mut self, bucket: usize) {
+        *self |= 1u16 << bucket;
+    }
+
+    fn clear_bit(&mut self, bucket: usize) {
+        *self &= !(1u16 << bucket);
+    }
+}
+
+impl SmallWeightBucketMask for u32 {
+    const BITS: usize = u32::BITS as usize;
+
+    fn zero() -> u32 {
+        0
+    }
+
+    fn trailing_zeros(self) -> usize {
+        u32::trailing_zeros(self) as usize
+    }
+
+    fn set_bit(&mut self, bucket: usize) {
+        *self |= 1u32 << bucket;
+    }
+
+    fn clear_bit(&mut self, bucket: usize) {
+        *self &= !(1u32 << bucket);
+    }
+}
+
+struct SmallWeightBinaryBuckets<Mask: SmallWeightBucketMask> {
+    heads: Vec<usize>,
+    nonempty_masks: Vec<Mask>,
+    width: usize,
+    small_weight_max: usize,
+}
+
+impl<Mask: SmallWeightBucketMask> SmallWeightBinaryBuckets<Mask> {
+    fn new(width: usize, small_weight_max: usize) -> SmallWeightBinaryBuckets<Mask> {
+        debug_assert!(small_weight_max <= Mask::BITS);
         SmallWeightBinaryBuckets {
-            heads: vec![NO_BUCKET_ROW; width * SMALL_WEIGHT_BINARY_BUCKET_MAX as usize],
-            nonempty_masks: vec![0; width],
+            heads: vec![NO_BUCKET_ROW; width * small_weight_max],
+            nonempty_masks: vec![Mask::zero(); width],
             width,
+            small_weight_max,
         }
     }
 
     fn push(&mut self, next_in_bucket: &mut [usize], col: usize, row: usize, weight: u32) -> bool {
-        let Some(bucket) = small_weight_binary_bucket_index(weight) else {
+        let Some(bucket) = small_weight_binary_bucket_index(weight, self.small_weight_max) else {
             return false;
         };
         debug_assert!(col < self.width);
@@ -4729,7 +4892,7 @@ impl SmallWeightBinaryBuckets {
         let head_index = self.head_index(bucket, col);
         next_in_bucket[row] = self.heads[head_index];
         self.heads[head_index] = row;
-        self.nonempty_masks[col] |= 1u16 << bucket;
+        self.nonempty_masks[col].set_bit(bucket);
         true
     }
 
@@ -4739,8 +4902,8 @@ impl SmallWeightBinaryBuckets {
         col: usize,
         row_weights: &[u32],
     ) -> Option<usize> {
-        let bucket = self.nonempty_masks[col].trailing_zeros() as usize;
-        if bucket >= SMALL_WEIGHT_BINARY_BUCKET_MAX as usize {
+        let bucket = self.nonempty_masks[col].trailing_zeros();
+        if bucket >= self.small_weight_max {
             return None;
         }
         let row = self.pop_bucket(next_in_bucket, col, bucket)?;
@@ -4749,8 +4912,8 @@ impl SmallWeightBinaryBuckets {
     }
 
     fn pop_any(&mut self, next_in_bucket: &mut [usize], col: usize) -> Option<usize> {
-        let bucket = self.nonempty_masks[col].trailing_zeros() as usize;
-        if bucket >= SMALL_WEIGHT_BINARY_BUCKET_MAX as usize {
+        let bucket = self.nonempty_masks[col].trailing_zeros();
+        if bucket >= self.small_weight_max {
             return None;
         }
         self.pop_bucket(next_in_bucket, col, bucket)
@@ -4770,41 +4933,42 @@ impl SmallWeightBinaryBuckets {
 
         self.heads[head_index] = next_in_bucket[row];
         if self.heads[head_index] == NO_BUCKET_ROW {
-            self.nonempty_masks[col] &= !(1u16 << bucket);
+            self.nonempty_masks[col].clear_bit(bucket);
         }
         next_in_bucket[row] = NO_BUCKET_ROW;
         Some(row)
     }
 
     fn head_index(&self, bucket: usize, col: usize) -> usize {
-        debug_assert!(bucket < SMALL_WEIGHT_BINARY_BUCKET_MAX as usize);
+        debug_assert!(bucket < self.small_weight_max);
         bucket * self.width + col
     }
 }
 
 #[derive(Clone, Copy)]
-struct SmallBinaryRowEntries {
-    cols: [CoefficientColumn; SMALL_WEIGHT_BINARY_BUCKET_MAX as usize],
+struct SmallBinaryRowEntries<const CAPACITY: usize> {
+    cols: [CoefficientColumn; CAPACITY],
     len: u8,
     valid: bool,
 }
 
-impl Default for SmallBinaryRowEntries {
-    fn default() -> SmallBinaryRowEntries {
+impl<const CAPACITY: usize> Default for SmallBinaryRowEntries<CAPACITY> {
+    fn default() -> SmallBinaryRowEntries<CAPACITY> {
         SmallBinaryRowEntries {
-            cols: [0; SMALL_WEIGHT_BINARY_BUCKET_MAX as usize],
+            cols: [0; CAPACITY],
             len: 0,
             valid: false,
         }
     }
 }
 
-struct SmallBinaryRowCache {
-    entries: Vec<SmallBinaryRowEntries>,
+struct SmallBinaryRowCache<const CAPACITY: usize> {
+    entries: Vec<SmallBinaryRowEntries<CAPACITY>>,
 }
 
-impl SmallBinaryRowCache {
-    fn new(height: usize) -> SmallBinaryRowCache {
+impl<const CAPACITY: usize> SmallBinaryRowCache<CAPACITY> {
+    fn new(height: usize) -> SmallBinaryRowCache<CAPACITY> {
+        debug_assert!(CAPACITY <= u32::BITS as usize);
         SmallBinaryRowCache {
             entries: vec![SmallBinaryRowEntries::default(); height],
         }
@@ -4836,16 +5000,17 @@ impl SmallBinaryRowCache {
     }
 }
 
-fn small_weight_binary_bucket_index(weight: u32) -> Option<usize> {
-    (1..=SMALL_WEIGHT_BINARY_BUCKET_MAX)
+fn small_weight_binary_bucket_index(weight: u32, small_weight_max: usize) -> Option<usize> {
+    let weight = weight as usize;
+    (1..=small_weight_max)
         .contains(&weight)
-        .then_some(weight as usize - 1)
+        .then_some(weight - 1)
 }
 
 fn push_weighted_binary_row_bucket(
     row_weights: &[u32],
     bucket_heads: &mut [usize],
-    small_weight_buckets: &mut SmallWeightBinaryBuckets,
+    small_weight_buckets: &mut SmallWeightBinaryBuckets<impl SmallWeightBucketMask>,
     next_in_bucket: &mut [usize],
     col: usize,
     row: usize,
@@ -4858,7 +5023,7 @@ fn push_weighted_binary_row_bucket(
 
 fn pop_weighted_binary_row_bucket(
     bucket_heads: &mut [usize],
-    small_weight_buckets: &mut SmallWeightBinaryBuckets,
+    small_weight_buckets: &mut SmallWeightBinaryBuckets<impl SmallWeightBucketMask>,
     next_in_bucket: &mut [usize],
     col: usize,
 ) -> Option<usize> {
@@ -5044,7 +5209,7 @@ fn pop_lightest_binary_row_bucket(
 fn pop_lightest_weighted_binary_row_bucket(
     row_weights: &[u32],
     bucket_heads: &mut [usize],
-    small_weight_buckets: &mut SmallWeightBinaryBuckets,
+    small_weight_buckets: &mut SmallWeightBinaryBuckets<impl SmallWeightBucketMask>,
     next_in_bucket: &mut [usize],
     col: usize,
 ) -> Option<usize> {
@@ -5056,12 +5221,13 @@ fn pop_lightest_weighted_binary_row_bucket(
     if head == NO_BUCKET_ROW {
         return None;
     }
-    debug_assert!(row_weights[head] > SMALL_WEIGHT_BINARY_BUCKET_MAX);
+    let small_weight_max = small_weight_buckets.small_weight_max as u32;
+    debug_assert!(row_weights[head] > small_weight_max);
     if next_in_bucket[head] == NO_BUCKET_ROW {
         bucket_heads[col] = NO_BUCKET_ROW;
         return Some(head);
     }
-    let min_general_weight = SMALL_WEIGHT_BINARY_BUCKET_MAX + 1;
+    let min_general_weight = small_weight_max + 1;
     if row_weights[head] == min_general_weight {
         bucket_heads[col] = next_in_bucket[head];
         next_in_bucket[head] = NO_BUCKET_ROW;
@@ -5077,7 +5243,7 @@ fn pop_lightest_weighted_binary_row_bucket(
     while current != NO_BUCKET_ROW {
         let row = current;
         let weight = row_weights[row];
-        debug_assert!(weight > SMALL_WEIGHT_BINARY_BUCKET_MAX);
+        debug_assert!(weight > small_weight_max);
         if weight < best_weight {
             best = row;
             best_previous = previous;
@@ -6067,7 +6233,8 @@ mod tests {
         let row_weights = vec![1, 3];
         let mut bucket_heads = vec![1];
         let mut next_in_bucket = vec![NO_BUCKET_ROW, NO_BUCKET_ROW];
-        let mut small_weight_buckets = SmallWeightBinaryBuckets::new(1);
+        let mut small_weight_buckets =
+            SmallWeightBinaryBuckets::<u16>::new(1, DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX);
         assert!(small_weight_buckets.push(&mut next_in_bucket, 0, 0, row_weights[0]));
 
         assert_eq!(
@@ -6090,7 +6257,8 @@ mod tests {
         let row_weights = vec![12, 7, 9];
         let mut bucket_heads = vec![2];
         let mut next_in_bucket = vec![NO_BUCKET_ROW, NO_BUCKET_ROW, NO_BUCKET_ROW];
-        let mut small_weight_buckets = SmallWeightBinaryBuckets::new(1);
+        let mut small_weight_buckets =
+            SmallWeightBinaryBuckets::<u16>::new(1, DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX);
         assert!(small_weight_buckets.push(&mut next_in_bucket, 0, 1, row_weights[1]));
 
         assert_eq!(
@@ -6684,6 +6852,31 @@ mod tests {
 
         assert_eq!(decoded.unwrap(), SymbolSlab::with_zeros(width, symbol_size));
         assert!(ops.is_none());
+    }
+
+    #[test]
+    fn direct_square_decode_rejects_unsatisfied_hdpc_without_panicking() {
+        let width = IN_PLACE_HYBRID_REPLAY_MIN_WIDTH + 1;
+        let source_block_symbols = 10;
+        let s = num_ldpc_symbols(source_block_symbols) as usize;
+        let symbol_size = 1;
+        let matrix = PackedOnlyMatrix::new(packed_identity_with_free_last_column(width));
+        let hdpc_rows = DenseOctetMatrix::new(1, width);
+        let mut symbols = SymbolSlab::with_zeros(width, symbol_size);
+        symbols.get_mut(s)[0] = 0x5a;
+
+        let result =
+            try_direct_square_hybrid_decode(source_block_symbols, &matrix, &hdpc_rows, symbols);
+
+        match result {
+            SquareHybridDecodeResult::Failed => {}
+            SquareHybridDecodeResult::Decoded(_) => {
+                panic!("inconsistent direct square decode unexpectedly succeeded")
+            }
+            SquareHybridDecodeResult::Fallback(_) => {
+                panic!("direct square decode should build a plan for this fixture")
+            }
+        }
     }
 
     #[test]
