@@ -11,6 +11,7 @@ use crate::octet::Octet;
 use serde::{Deserialize, Serialize};
 
 const APPEND_BUILD_MIN_WIDTH: usize = 512;
+const PARALLEL_PACK_METADATA_MIN_ROWS: usize = 16_384;
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
@@ -233,6 +234,12 @@ impl BinaryMatrix for SparseBinaryMatrix {
     fn packed_rows_with_row_weights_and_first_ones(
         &self,
     ) -> (PackedBinaryRows, Vec<u32>, Vec<Option<usize>>) {
+        if !self.rows_normalized && self.rows.len() >= PARALLEL_PACK_METADATA_MIN_ROWS {
+            return PackedBinaryRows::from_sparse_entries_with_row_weights_and_first_ones(
+                self.width, &self.rows,
+            );
+        }
+
         let mut packed = PackedBinaryRows::new(self.rows.len(), self.width);
         let mut row_weights = Vec::with_capacity(self.rows.len());
         let mut first_ones = Vec::with_capacity(self.rows.len());
