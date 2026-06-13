@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "std")]
 const HDPC_ROWS_CACHE_CAPACITY: usize = 16;
-const UNSORTED_SYSTEMATIC_PACK_MIN_WIDTH: usize = 4_097;
+const UNSORTED_SPARSE_PACK_MIN_WIDTH: usize = 4_097;
 
 pub fn generate_constraint_matrix<M: BinaryMatrix>(
     source_block_symbols: u32,
@@ -38,7 +38,7 @@ pub fn generate_constraint_matrix_no_hdpc<M: BinaryMatrix>(
     fill_encoded_rows(&mut matrix, s as usize, k_prime, encoded_isis);
     let systematic = encoded_isis_are_systematic(k_prime, encoded_isis);
     if systematic {
-        if (l as usize) < UNSORTED_SYSTEMATIC_PACK_MIN_WIDTH {
+        if (l as usize) < UNSORTED_SPARSE_PACK_MIN_WIDTH {
             matrix.normalize_rows();
         }
         matrix.mark_systematic_source_block_symbols(k_prime);
@@ -54,7 +54,9 @@ pub fn generate_constraint_matrix_no_hdpc<M: BinaryMatrix>(
             repair_isi,
         );
     } else {
-        matrix.normalize_rows();
+        if (l as usize) < UNSORTED_SPARSE_PACK_MIN_WIDTH || encoded_isis.len() > k_prime as usize {
+            matrix.normalize_rows();
+        }
         matrix.mark_encoded_systematic_isis(s as usize, k_prime, encoded_isis);
     }
 
@@ -501,6 +503,36 @@ mod tests {
     }
 
     #[test]
+    fn large_non_systematic_sparse_matrix_uses_unsorted_pack_path() {
+        let source_symbols = 4096;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let indices = (k_prime..k_prime * 2).collect::<Vec<_>>();
+
+        let matrix =
+            generate_constraint_matrix_no_hdpc::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        assert!(matrix.width() >= UNSORTED_SPARSE_PACK_MIN_WIDTH);
+        assert!(!matrix.rows_normalized_for_test());
+        assert_eq!(matrix.systematic_source_block_symbols(), None);
+        assert!(matrix.systematic_row_isis().is_some());
+    }
+
+    #[test]
+    fn large_overdetermined_sparse_matrix_still_normalizes_for_verification() {
+        let source_symbols = 4096;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let indices = (k_prime..k_prime * 2 + 1).collect::<Vec<_>>();
+
+        let matrix =
+            generate_constraint_matrix_no_hdpc::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        assert!(matrix.width() >= UNSORTED_SPARSE_PACK_MIN_WIDTH);
+        assert!(matrix.rows_normalized_for_test());
+        assert_eq!(matrix.systematic_source_block_symbols(), None);
+        assert!(matrix.systematic_row_isis().is_some());
+    }
+
+    #[test]
     fn contiguous_single_repair_systematic_matrix_is_tagged() {
         let source_symbols = 10;
         let k_prime = extended_source_block_symbols(source_symbols);
@@ -573,5 +605,6 @@ mod tests {
             generate_constraint_matrix_no_hdpc::<SparseBinaryMatrix>(source_symbols, &indices);
 
         assert_eq!(matrix.systematic_source_block_symbols(), None);
+        assert!(matrix.rows_normalized_for_test());
     }
 }
