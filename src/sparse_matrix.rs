@@ -207,6 +207,14 @@ impl BinaryMatrix for SparseBinaryMatrix {
         self.rows_normalized = true;
     }
 
+    fn toggle_unique(&mut self, row: usize, col: usize) {
+        assert!(row < self.rows.len());
+        assert!(col < self.width);
+        debug_assert!(!self.rows[row].contains(&col));
+        self.rows[row].push(col);
+        self.rows_normalized = false;
+    }
+
     fn packed_rows(&self) -> PackedBinaryRows {
         let mut packed = PackedBinaryRows::new(self.rows.len(), self.width);
         for (row, entries) in self.rows.iter().enumerate() {
@@ -222,6 +230,28 @@ impl BinaryMatrix for SparseBinaryMatrix {
             packed.set_entries(row, entries);
         }
         packed
+    }
+
+    fn packed_row_prefix_with_row_weights_and_first_ones(
+        &self,
+        height: usize,
+    ) -> (PackedBinaryRows, Vec<u32>, Vec<Option<usize>>) {
+        assert!(height <= self.rows.len());
+        let mut packed = PackedBinaryRows::new(height, self.width);
+        let mut row_weights = Vec::with_capacity(height);
+        let mut first_ones = Vec::with_capacity(height);
+        for (row, entries) in self.rows[..height].iter().enumerate() {
+            row_weights.push(entries.len() as u32);
+            let mut first_one = entries.first().copied();
+            for &col in entries {
+                if !self.rows_normalized && first_one.is_some_and(|first| col < first) {
+                    first_one = Some(col);
+                }
+            }
+            packed.set_entries(row, entries);
+            first_ones.push(first_one);
+        }
+        (packed, row_weights, first_ones)
     }
 
     fn packed_rows_with_first_ones(&self) -> (PackedBinaryRows, Vec<Option<usize>>) {
@@ -358,6 +388,25 @@ mod tests {
 
         assert_eq!(row_weights, vec![2, 1, 0]);
         assert_eq!(first_ones, vec![Some(3), Some(64), None]);
+        assert!(packed.contains(0, 3));
+        assert!(packed.contains(0, 70));
+        assert!(packed.contains(1, 64));
+    }
+
+    #[test]
+    fn packed_row_prefix_with_metadata_omits_suffix_rows() {
+        let mut matrix = SparseBinaryMatrix::new(3, APPEND_BUILD_MIN_WIDTH);
+        matrix.toggle(0, 70);
+        matrix.toggle(0, 3);
+        matrix.toggle(1, 64);
+        matrix.toggle(2, 95);
+
+        let (packed, row_weights, first_ones) =
+            matrix.packed_row_prefix_with_row_weights_and_first_ones(2);
+
+        assert_eq!(packed.height(), 2);
+        assert_eq!(row_weights, vec![2, 1]);
+        assert_eq!(first_ones, vec![Some(3), Some(64)]);
         assert!(packed.contains(0, 3));
         assert!(packed.contains(0, 70));
         assert!(packed.contains(1, 64));
