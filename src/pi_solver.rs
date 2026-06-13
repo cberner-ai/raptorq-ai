@@ -3640,7 +3640,7 @@ fn use_one_shot_square_hybrid_decode(width: usize) -> bool {
 
 #[cfg(all(feature = "std", not(test)))]
 fn use_direct_square_hybrid_decode(width: usize) -> bool {
-    width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH
+    width >= DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH
 }
 
 #[cfg(all(feature = "std", test))]
