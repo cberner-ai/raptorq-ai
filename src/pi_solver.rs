@@ -4637,11 +4637,6 @@ fn solve_binary(
     mut symbols: SymbolSlab,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     let width = rows.width();
-    assert!(
-        width <= MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize,
-        "generic RaptorQ solver supports at most {MAX_SUPPORTED_INTERMEDIATE_SYMBOLS} intermediate symbols; optimized large-matrix PI solver is not implemented"
-    );
-
     let height = rows.height();
     assert_eq!(height, symbols.len());
     let add_assign_path = AddAssignFastPath::new(symbols.symbol_size());
@@ -7306,6 +7301,29 @@ mod tests {
         let (decoded, ops) = fused_inverse_mul_symbols_no_hdpc(matrix, symbols, 1);
 
         assert_eq!(decoded.unwrap().get(0), &[0x5a]);
+        assert!(ops.is_none());
+    }
+
+    #[test]
+    fn large_overdetermined_no_hdpc_system_decodes_above_legacy_cap() {
+        let width = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
+        let mut rows = PackedBinaryRows::new(width + 1, width);
+        for col in 0..width {
+            rows.set(col, col);
+        }
+        rows.set(width, 0);
+        let matrix = PackedOnlyMatrix::new(rows);
+
+        let mut bytes = (0..width)
+            .map(|col| (col as u8).wrapping_mul(17).wrapping_add(3))
+            .collect::<Vec<_>>();
+        bytes.push(bytes[0]);
+        let expected = bytes[..width].to_vec();
+        let symbols = SymbolSlab::from_bytes(bytes, 1);
+
+        let (decoded, ops) = fused_inverse_mul_symbols_no_hdpc(matrix, symbols, 1);
+
+        assert_eq!(decoded.unwrap().as_bytes(), expected.as_slice());
         assert!(ops.is_none());
     }
 
