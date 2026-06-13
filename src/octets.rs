@@ -30,6 +30,11 @@ impl AddAssignFastPath {
 
     pub(crate) fn apply(self, dest: &mut [u8], src: &[u8]) {
         assert_eq!(dest.len(), src.len());
+        self.apply_same_len(dest, src);
+    }
+
+    pub(crate) fn apply_same_len(self, dest: &mut [u8], src: &[u8]) {
+        debug_assert_eq!(dest.len(), src.len());
         #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
         if self.use_avx2 {
             unsafe {
@@ -63,6 +68,12 @@ impl FusedAddAssignMulScalarFastPath {
         if scalar.is_zero() {
             return;
         }
+        self.apply_nonzero(dest, src, scalar);
+    }
+
+    pub(crate) fn apply_nonzero(self, dest: &mut [u8], src: &[u8], scalar: &Octet) {
+        debug_assert!(!scalar.is_zero());
+        assert_eq!(dest.len(), src.len());
         if *scalar == Octet::one() {
             AddAssignFastPath {
                 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]

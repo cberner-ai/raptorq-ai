@@ -14,6 +14,7 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "std")]
 const HDPC_ROWS_CACHE_CAPACITY: usize = 16;
+const UNSORTED_SYSTEMATIC_PACK_MIN_WIDTH: usize = 4_097;
 
 pub fn generate_constraint_matrix<M: BinaryMatrix>(
     source_block_symbols: u32,
@@ -35,12 +36,16 @@ pub fn generate_constraint_matrix_no_hdpc<M: BinaryMatrix>(
 
     fill_ldpc_rows(&mut matrix, k_prime);
     fill_encoded_rows(&mut matrix, s as usize, k_prime, encoded_isis);
-    matrix.normalize_rows();
-    if encoded_isis_are_systematic(k_prime, encoded_isis) {
+    let systematic = encoded_isis_are_systematic(k_prime, encoded_isis);
+    if systematic {
+        if (l as usize) < UNSORTED_SYSTEMATIC_PACK_MIN_WIDTH {
+            matrix.normalize_rows();
+        }
         matrix.mark_systematic_source_block_symbols(k_prime);
     } else if let Some((missing_isi, repair_matrix_row, repair_isi)) =
         contiguous_single_repair_systematic_rows(k_prime, s as usize, encoded_isis)
     {
+        matrix.normalize_rows();
         matrix.mark_encoded_systematic_isis(s as usize, k_prime, encoded_isis);
         matrix.mark_contiguous_single_repair_systematic_rows(
             k_prime,
@@ -49,6 +54,7 @@ pub fn generate_constraint_matrix_no_hdpc<M: BinaryMatrix>(
             repair_isi,
         );
     } else {
+        matrix.normalize_rows();
         matrix.mark_encoded_systematic_isis(s as usize, k_prime, encoded_isis);
     }
 

@@ -1654,7 +1654,7 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
         0
     };
 
-    let mut hdpc_coefficients = dense_hdpc_coefficient_values(hdpc_rows);
+    let mut hdpc_coefficients = dense_hdpc_coefficient_values_column_major(hdpc_rows);
     let mut hdpc_update_pivots = Vec::with_capacity(pivot_count);
     let mut hdpc_update_ranges = Vec::with_capacity(pivot_count);
     let mut hdpc_update_entries = Vec::with_capacity(pivot_count.saturating_mul(h));
@@ -1676,23 +1676,13 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
             back_substitution_entries.push((coefficient_col(dependent_col), coefficient_col(col)));
         }
 
-        let update_start = hdpc_update_entries.len();
-        let mut update_unit_only = true;
-        for row in 0..h {
-            let row_start = row * width;
-            let factor = hdpc_coefficients[row_start + col];
-            if factor == 0 {
-                continue;
-            }
-            hdpc_coefficients[row_start + col] = 0;
-            for &entry_col in &pivot_entries {
-                hdpc_coefficients[row_start + entry_col] ^= factor;
-            }
-            if factor != 1 {
-                update_unit_only = false;
-            }
-            hdpc_update_entries.push((coefficient_col(row), Octet::new(factor)));
-        }
+        let (update_start, update_unit_only) = eliminate_direct_hdpc_column(
+            &mut hdpc_coefficients,
+            h,
+            col,
+            &pivot_entries,
+            &mut hdpc_update_entries,
+        );
         if update_start != hdpc_update_entries.len() {
             hdpc_update_pivots.push(coefficient_col(direct_binary_symbol_index(pivot, s, h)));
             hdpc_update_ranges.push((update_start, hdpc_update_entries.len()));
@@ -1705,7 +1695,7 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
         entries: hdpc_update_entries,
         unit_only: hdpc_update_unit_only,
     };
-    let hdpc_free_rows = direct_hdpc_free_rows(hdpc_coefficients, &free_cols, width)?;
+    let hdpc_free_rows = direct_hdpc_free_rows(hdpc_coefficients, &free_cols, width, h)?;
     let back_substitution = prepare_direct_back_substitution_batches(
         back_substitution_counts,
         back_substitution_entries,
@@ -1848,13 +1838,63 @@ fn prepare_direct_back_substitution_batches(
 }
 
 #[cfg(feature = "std")]
+fn eliminate_direct_hdpc_column(
+    hdpc_coefficients: &mut [u8],
+    h: usize,
+    col: usize,
+    pivot_entries: &[usize],
+    hdpc_update_entries: &mut Vec<(CoefficientColumn, Octet)>,
+) -> (usize, bool) {
+    debug_assert!(h <= 16);
+    let update_start = hdpc_update_entries.len();
+    let col_start = col * h;
+    let mut factors = [0u8; 16];
+    factors[..h].copy_from_slice(&hdpc_coefficients[col_start..col_start + h]);
+    hdpc_coefficients[col_start..col_start + h].fill(0);
+
+    if h == 16 {
+        let factor_block = u128::from_ne_bytes(factors);
+        if factor_block != 0 {
+            for (row, &factor) in factors.iter().enumerate() {
+                if factor != 0 {
+                    hdpc_update_entries.push((coefficient_col(row), Octet::new(factor)));
+                }
+            }
+            for &entry_col in pivot_entries {
+                let entry_start = entry_col * h;
+                let entry_ptr = unsafe { hdpc_coefficients.as_mut_ptr().add(entry_start) };
+                let updated = unsafe { entry_ptr.cast::<u128>().read_unaligned() ^ factor_block };
+                unsafe {
+                    entry_ptr.cast::<u128>().write_unaligned(updated);
+                }
+            }
+        }
+    } else {
+        for (row, &factor) in factors[..h].iter().enumerate() {
+            if factor == 0 {
+                continue;
+            }
+            hdpc_update_entries.push((coefficient_col(row), Octet::new(factor)));
+            for &entry_col in pivot_entries {
+                hdpc_coefficients[entry_col * h + row] ^= factor;
+            }
+        }
+    }
+
+    let update_unit_only = hdpc_update_entries[update_start..]
+        .iter()
+        .all(|&(_, factor)| factor == Octet::one());
+    (update_start, update_unit_only)
+}
+
+#[cfg(feature = "std")]
 fn direct_hdpc_free_rows(
     hdpc_coefficients: Vec<u8>,
     free_cols: &[CoefficientColumn],
     width: usize,
+    h: usize,
 ) -> Option<DirectSystematicFreeRows> {
-    assert_eq!(hdpc_coefficients.len() % width, 0);
-    let h = hdpc_coefficients.len() / width;
+    assert_eq!(hdpc_coefficients.len(), width * h);
     let mut free_index_by_col = vec![usize::MAX; width];
     for (index, &col) in free_cols.iter().enumerate() {
         free_index_by_col[coefficient_col_index(col)] = index;
@@ -1862,10 +1902,9 @@ fn direct_hdpc_free_rows(
 
     let mut free_rows = Vec::with_capacity(h);
     for row in 0..h {
-        let row_start = row * width;
         let mut free_row = Vec::with_capacity(free_cols.len());
         for col in 0..width {
-            let value = hdpc_coefficients[row_start + col];
+            let value = hdpc_coefficients[col * h + row];
             if value == 0 {
                 continue;
             }
@@ -2004,7 +2043,7 @@ fn try_apply_prepared_direct_systematic_plan(
     for (update_index, &pivot) in plan.hdpc_update_pivots.iter().enumerate() {
         let pivot_symbol = symbols.get(coefficient_col_index(pivot));
         for &(row, factor) in plan.hdpc_updates.slice(update_index) {
-            fused_mul_path.apply(
+            fused_mul_path.apply_nonzero(
                 hdpc_symbols.get_mut(coefficient_col_index(row)),
                 pivot_symbol,
                 &factor,
@@ -2215,7 +2254,7 @@ fn addassign_direct_symbol_batch(
         unsafe {
             let dest_symbol =
                 core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
-            add_assign_path.apply(dest_symbol, src_symbol);
+            add_assign_path.apply_same_len(dest_symbol, src_symbol);
         }
     }
 }
@@ -2420,7 +2459,7 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
     let hdpc_end = hdpc_start + plan.h * symbol_size;
     hdpc_symbols.copy_block_from(0, &symbol_bytes[hdpc_start..hdpc_end]);
     for step in &plan.hdpc_symbol_steps {
-        fused_mul_path.apply(
+        fused_mul_path.apply_nonzero(
             hdpc_symbols.get_mut(step.row),
             binary_symbols.get(step.pivot),
             &step.factor,
@@ -2495,7 +2534,7 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
         let src = mapped_binary_symbol_row(step.pivot, plan.s, plan.h);
         let dest = plan.s + step.row;
         let (src_symbol, dest_symbol) = symbols.get_disjoint_mut(src, dest);
-        fused_mul_path.apply(dest_symbol, src_symbol, &step.factor);
+        fused_mul_path.apply_nonzero(dest_symbol, src_symbol, &step.factor);
     }
 
     let free_values = if plan.free_cols.is_empty() {
@@ -2747,11 +2786,12 @@ fn verify_no_hdpc_solution(decoded: SymbolSlab, source_block_symbols: u32) -> Op
 
 fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bool {
     let mut check = vec![0u8; decoded.symbol_size()];
+    let fused_mul_path = FusedAddAssignMulScalarFastPath::new(decoded.symbol_size());
     for row in 0..hdpc_rows.height() {
         check.fill(0);
         for (col, &coefficient) in hdpc_rows.row(row).iter().enumerate() {
             if !coefficient.is_zero() {
-                fused_addassign_mul_scalar(&mut check, decoded.get(col), &coefficient);
+                fused_mul_path.apply_nonzero(&mut check, decoded.get(col), &coefficient);
             }
         }
         if !symbol_is_zero(&check) {
@@ -3223,7 +3263,7 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
                 continue;
             }
             hdpc_projection_rows.push((row_start, factor));
-            fused_mul_path.apply(
+            fused_mul_path.apply_nonzero(
                 hdpc_symbols.get_mut(row),
                 binary_symbols.get(pivot),
                 &factor,
@@ -3320,12 +3360,14 @@ fn dense_hdpc_coefficients(matrix: &DenseOctetMatrix) -> Vec<Octet> {
 }
 
 #[cfg(feature = "std")]
-fn dense_hdpc_coefficient_values(matrix: &DenseOctetMatrix) -> Vec<u8> {
-    matrix
-        .as_slice()
-        .iter()
-        .map(|coefficient| coefficient.value())
-        .collect()
+fn dense_hdpc_coefficient_values_column_major(matrix: &DenseOctetMatrix) -> Vec<u8> {
+    let mut coefficients = vec![0u8; matrix.width() * matrix.height()];
+    for row in 0..matrix.height() {
+        for (col, coefficient) in matrix.row(row).iter().enumerate() {
+            coefficients[col * matrix.height() + row] = coefficient.value();
+        }
+    }
+    coefficients
 }
 
 fn solve_hdpc_free_variables_dense(
@@ -3638,7 +3680,7 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
             hdpc_projection_rows.push((row_start, factor));
             let hdpc_symbol = s + row;
             let (src, dest) = symbols.get_disjoint_mut(pivot_symbol, hdpc_symbol);
-            fused_mul_path.apply(dest, src, &factor);
+            fused_mul_path.apply_nonzero(dest, src, &factor);
         }
         if hdpc_projection_rows.is_empty() {
             continue;
