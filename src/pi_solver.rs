@@ -89,6 +89,7 @@ const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 64;
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 4_096;
 #[cfg(test)]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
+const OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH: usize = 10_000;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 #[cfg(all(test, feature = "std"))]
@@ -2923,6 +2924,14 @@ pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
     source_block_symbols: u32,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     assert_eq!(symbols.len(), matrix.height());
+    if matrix.width() >= OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH
+        && matrix.height() > matrix.width()
+        && let Some(decoded) =
+            try_overdetermined_no_hdpc_prefix_solve(&matrix, &symbols, source_block_symbols)
+    {
+        return (Some(decoded), None);
+    }
+
     let rows = matrix.packed_rows();
 
     let (decoded, ops) = solve_binary(rows, symbols);
@@ -2930,6 +2939,59 @@ pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
         Some(decoded) => (verify_no_hdpc_solution(decoded, source_block_symbols), ops),
         None => (None, ops),
     }
+}
+
+fn try_overdetermined_no_hdpc_prefix_solve<M: BinaryMatrix>(
+    matrix: &M,
+    symbols: &SymbolSlab,
+    source_block_symbols: u32,
+) -> Option<SymbolSlab> {
+    let width = matrix.width();
+    let prefix_height = (width
+        + crate::systematic_constants::num_hdpc_symbols(source_block_symbols) as usize)
+        .min(matrix.height());
+    if prefix_height == matrix.height() {
+        return None;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let prefix_symbols = SymbolSlab::from_bytes(
+        symbols.as_bytes()[..prefix_height * symbol_size].to_vec(),
+        symbol_size,
+    );
+    let prefix_rows = packed_binary_row_prefix(matrix, prefix_height);
+    let (decoded, _) = solve_binary(prefix_rows, prefix_symbols);
+    let decoded = verify_no_hdpc_solution(decoded?, source_block_symbols)?;
+    binary_rows_satisfied(matrix, &decoded, symbols, prefix_height).then_some(decoded)
+}
+
+fn packed_binary_row_prefix<M: BinaryMatrix>(matrix: &M, height: usize) -> PackedBinaryRows {
+    debug_assert!(height <= matrix.height());
+    let mut rows = PackedBinaryRows::new(height, matrix.width());
+    for row in 0..height {
+        matrix.visit_row_entries(row, |col| rows.set(row, col));
+    }
+    rows
+}
+
+fn binary_rows_satisfied<M: BinaryMatrix>(
+    matrix: &M,
+    decoded: &SymbolSlab,
+    symbols: &SymbolSlab,
+    start_row: usize,
+) -> bool {
+    let mut check = vec![0u8; decoded.symbol_size()];
+    let add_assign_path = AddAssignFastPath::new(decoded.symbol_size());
+    for row in start_row..matrix.height() {
+        check.fill(0);
+        matrix.visit_row_entries(row, |col| {
+            add_assign_path.apply_same_len(&mut check, decoded.get(col));
+        });
+        if check.as_slice() != symbols.get(row) {
+            return false;
+        }
+    }
+    true
 }
 
 fn verify_no_hdpc_solution(decoded: SymbolSlab, source_block_symbols: u32) -> Option<SymbolSlab> {
@@ -7524,6 +7586,41 @@ mod tests {
 
         assert_eq!(decoded.unwrap().as_bytes(), expected.as_slice());
         assert!(ops.is_none());
+    }
+
+    #[test]
+    fn overdetermined_no_hdpc_prefix_accepts_verified_extra_rows() {
+        let source_symbols = 1;
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        let h = num_hdpc_symbols(source_symbols) as usize;
+        let mut matrix = DenseBinaryMatrix::new(width + h + 1, width);
+        for col in 0..width {
+            matrix.set(col, col, true);
+        }
+        let symbols = SymbolSlab::with_zeros(matrix.height(), 1);
+
+        let decoded =
+            try_overdetermined_no_hdpc_prefix_solve(&matrix, &symbols, source_symbols).unwrap();
+
+        assert_eq!(decoded, SymbolSlab::with_zeros(width, 1));
+    }
+
+    #[test]
+    fn overdetermined_no_hdpc_prefix_rejects_unverified_extra_rows() {
+        let source_symbols = 1;
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        let h = num_hdpc_symbols(source_symbols) as usize;
+        let mut matrix = DenseBinaryMatrix::new(width + h + 1, width);
+        for col in 0..width {
+            matrix.set(col, col, true);
+        }
+        matrix.set(width + h, 0, true);
+        let mut symbols = SymbolSlab::with_zeros(matrix.height(), 1);
+        symbols.get_mut(width + h)[0] = 0x5a;
+
+        let decoded = try_overdetermined_no_hdpc_prefix_solve(&matrix, &symbols, source_symbols);
+
+        assert!(decoded.is_none());
     }
 
     #[test]
