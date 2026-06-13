@@ -119,19 +119,19 @@ fn fill_ldpc_rows<M: BinaryMatrix>(matrix: &mut M, k_prime: u32) {
     for i in 0..b {
         let a = 1 + i / s;
         let mut row = i % s;
-        xor_one(matrix, row as usize, i as usize);
+        xor_one_unique(matrix, row as usize, i as usize);
         row = (row + a) % s;
-        xor_one(matrix, row as usize, i as usize);
+        xor_one_unique(matrix, row as usize, i as usize);
         row = (row + a) % s;
-        xor_one(matrix, row as usize, i as usize);
+        xor_one_unique(matrix, row as usize, i as usize);
     }
 
     for i in 0..s {
         let a = i % p;
         let b = (i + 1) % p;
-        xor_one(matrix, i as usize, (w + a) as usize);
-        xor_one(matrix, i as usize, (w + b) as usize);
-        xor_one(matrix, i as usize, (w - s + i) as usize);
+        xor_one_unique(matrix, i as usize, (w + a) as usize);
+        xor_one_unique(matrix, i as usize, (w + b) as usize);
+        xor_one_unique(matrix, i as usize, (w - s + i) as usize);
     }
 }
 
@@ -377,6 +377,10 @@ fn generate_hdpc_rows_uncached(k_prime: u32) -> DenseOctetMatrix {
 
 fn xor_one<M: BinaryMatrix>(matrix: &mut M, row: usize, col: usize) {
     matrix.toggle(row, col);
+}
+
+fn xor_one_unique<M: BinaryMatrix>(matrix: &mut M, row: usize, col: usize) {
+    matrix.toggle_unique(row, col);
 }
 
 #[cfg(test)]

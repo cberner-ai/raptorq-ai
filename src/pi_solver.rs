@@ -90,6 +90,7 @@ const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 4_096;
 #[cfg(test)]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
 const OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH: usize = 10_000;
+const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 40_000;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 #[cfg(all(test, feature = "std"))]
@@ -2992,8 +2993,14 @@ fn try_overdetermined_no_hdpc_prefix_solve<M: BinaryMatrix>(
         symbols.as_bytes()[..prefix_height * symbol_size].to_vec(),
         symbol_size,
     );
-    let prefix_rows = matrix.packed_row_prefix(prefix_height);
-    let (decoded, _) = solve_binary(prefix_rows, prefix_symbols);
+    let (decoded, _) = if width >= OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH {
+        let (prefix_rows, row_weights, first_ones) =
+            matrix.packed_row_prefix_with_row_weights_and_first_ones(prefix_height);
+        solve_binary_with_weighted_metadata(prefix_rows, prefix_symbols, row_weights, first_ones)
+    } else {
+        let prefix_rows = matrix.packed_row_prefix(prefix_height);
+        solve_binary(prefix_rows, prefix_symbols)
+    };
     let decoded = verify_no_hdpc_solution(decoded?, source_block_symbols)?;
     binary_rows_satisfied(matrix, &decoded, symbols, prefix_height).then_some(decoded)
 }
@@ -4914,21 +4921,53 @@ fn pivot_value_and_suffix_len(row: &CoefficientRow, col: usize) -> Option<(Octet
 }
 
 fn solve_binary(
-    mut rows: PackedBinaryRows,
-    mut symbols: SymbolSlab,
+    rows: PackedBinaryRows,
+    symbols: SymbolSlab,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     let width = rows.width();
     let height = rows.height();
-    assert_eq!(height, symbols.len());
-    let add_assign_path = AddAssignFastPath::new(symbols.symbol_size());
     let use_weighted_buckets = width >= LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH;
-    let mut row_weights = if use_weighted_buckets {
+    let row_weights = if use_weighted_buckets {
         (0..height)
             .map(|row| rows.weight_at_or_after(row, 0))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
+    let first_ones = (0..height)
+        .map(|row| rows.first_one_at_or_after(row, 0))
+        .collect::<Vec<_>>();
+    solve_binary_with_initial_metadata(rows, symbols, row_weights, first_ones, use_weighted_buckets)
+}
+
+fn solve_binary_with_weighted_metadata(
+    rows: PackedBinaryRows,
+    symbols: SymbolSlab,
+    row_weights: Vec<u32>,
+    first_ones: Vec<Option<usize>>,
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    debug_assert!(rows.width() >= LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH);
+    solve_binary_with_initial_metadata(rows, symbols, row_weights, first_ones, true)
+}
+
+fn solve_binary_with_initial_metadata(
+    mut rows: PackedBinaryRows,
+    mut symbols: SymbolSlab,
+    mut row_weights: Vec<u32>,
+    first_ones: Vec<Option<usize>>,
+    use_weighted_buckets: bool,
+) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
+    let width = rows.width();
+    let height = rows.height();
+    assert_eq!(height, symbols.len());
+    debug_assert_eq!(first_ones.len(), height);
+    if use_weighted_buckets {
+        debug_assert_eq!(row_weights.len(), height);
+    } else {
+        debug_assert!(row_weights.is_empty());
+    }
+
+    let add_assign_path = AddAssignFastPath::new(symbols.symbol_size());
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut small_weight_buckets = SmallWeightBinaryBuckets::<u16>::new(
         if use_weighted_buckets { width } else { 0 },
@@ -4938,8 +4977,8 @@ fn solve_binary(
         if use_weighted_buckets { height } else { 0 },
     );
     let mut next_in_bucket = vec![NO_BUCKET_ROW; height];
-    for row in 0..height {
-        if let Some(col) = rows.first_one_at_or_after(row, 0) {
+    for (row, first_one) in first_ones.into_iter().enumerate() {
+        if let Some(col) = first_one {
             if use_weighted_buckets {
                 push_weighted_binary_row_bucket(
                     &row_weights,
@@ -7603,6 +7642,29 @@ mod tests {
         let symbols = SymbolSlab::from_bytes(bytes, 1);
 
         let (decoded, ops) = fused_inverse_mul_symbols_no_hdpc(matrix, symbols, 1);
+
+        assert_eq!(decoded.unwrap().as_bytes(), expected.as_slice());
+        assert!(ops.is_none());
+    }
+
+    #[test]
+    fn binary_solve_accepts_precomputed_weight_metadata() {
+        let width = LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH;
+        let mut rows = PackedBinaryRows::new(width, width);
+        let mut row_weights = Vec::with_capacity(width);
+        let mut first_ones = Vec::with_capacity(width);
+        for col in 0..width {
+            rows.set(col, col);
+            row_weights.push(1);
+            first_ones.push(Some(col));
+        }
+        let expected = (0..width)
+            .map(|col| (col as u8).wrapping_mul(19).wrapping_add(7))
+            .collect::<Vec<_>>();
+        let symbols = SymbolSlab::from_bytes(expected.clone(), 1);
+
+        let (decoded, ops) =
+            solve_binary_with_weighted_metadata(rows, symbols, row_weights, first_ones);
 
         assert_eq!(decoded.unwrap().as_bytes(), expected.as_slice());
         assert!(ops.is_none());
