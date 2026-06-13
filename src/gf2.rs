@@ -234,6 +234,7 @@ impl PackedBinaryRows {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn xor_columns_update_weight_and_first_one(
         &mut self,
         dest: usize,
@@ -246,6 +247,40 @@ impl PackedBinaryRows {
         debug_assert!(self.contains(dest, start_col));
 
         for &col in cols {
+            debug_assert!(col < self.width);
+            let word = self.word_index(dest, col);
+            let mask = bit_mask(col);
+            if (self.words[word] & mask) == 0 {
+                self.words[word] |= mask;
+                weight += 1;
+            } else {
+                self.words[word] &= !mask;
+                weight -= 1;
+            }
+        }
+
+        let first_one = if weight == 0 {
+            None
+        } else {
+            self.first_one_at_or_after(dest, start_col)
+        };
+        (weight, first_one)
+    }
+
+    pub(crate) fn xor_u16_columns_update_weight_and_first_one(
+        &mut self,
+        dest: usize,
+        cols: &[u16],
+        mut weight: u32,
+    ) -> (u32, Option<usize>) {
+        let Some(&start_col) = cols.first() else {
+            return (weight, None);
+        };
+        let start_col = start_col as usize;
+        debug_assert!(self.contains(dest, start_col));
+
+        for &col in cols {
+            let col = col as usize;
             debug_assert!(col < self.width);
             let word = self.word_index(dest, col);
             let mask = bit_mask(col);
@@ -435,6 +470,24 @@ mod tests {
         let cols = [3, 64, 70];
 
         let (weight, first_one) = packed.xor_columns_update_weight_and_first_one(0, &cols, 4);
+
+        assert_eq!(weight, 3);
+        assert_eq!(first_one, Some(64));
+        assert!(packed.contains(0, 0));
+        assert!(!packed.contains(0, 3));
+        assert!(packed.contains(0, 64));
+        assert!(packed.contains(0, 65));
+        assert!(!packed.contains(0, 70));
+        assert!(packed.contains(0, 95));
+    }
+
+    #[test]
+    fn u16_column_xor_updates_weight_and_first_one() {
+        let rows = vec![vec![0, 3, 65, 70, 95]];
+        let mut packed = PackedBinaryRows::from_sparse(rows, 96);
+        let cols = [3u16, 64, 70];
+
+        let (weight, first_one) = packed.xor_u16_columns_update_weight_and_first_one(0, &cols, 4);
 
         assert_eq!(weight, 3);
         assert_eq!(first_one, Some(64));
