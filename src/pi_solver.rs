@@ -2422,6 +2422,7 @@ fn fused_addassign_cached_binary_symbol_batch(
     symbols: &mut SymbolSlab,
     src: usize,
     dests: &[CoefficientColumn],
+    add_assign_path: AddAssignFastPath,
 ) {
     if dests.is_empty() {
         return;
@@ -2446,7 +2447,7 @@ fn fused_addassign_cached_binary_symbol_batch(
         unsafe {
             let dest_symbol =
                 core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
-            add_assign(dest_symbol, src_symbol);
+            add_assign_path.apply_same_len(dest_symbol, src_symbol);
         }
     }
 }
@@ -2595,6 +2596,7 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
     assert_eq!(symbols.len(), plan.width);
 
     let symbol_size = symbols.symbol_size();
+    let add_assign_path = AddAssignFastPath::new(symbol_size);
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
     let binary_height = plan.width - plan.h;
     let mut binary_symbols = SymbolSlab::with_zeros(binary_height, symbol_size);
@@ -2609,6 +2611,7 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
             &mut binary_symbols,
             pivot,
             plan.binary_forward_dests.slice(step_index),
+            add_assign_path,
         );
     }
 
@@ -2652,6 +2655,7 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
             &mut decoded,
             src,
             plan.back_substitution.slice(src),
+            add_assign_path,
         );
     }
 
@@ -2677,6 +2681,7 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
     assert_eq!(symbols.len(), plan.width);
 
     let symbol_size = symbols.symbol_size();
+    let add_assign_path = AddAssignFastPath::new(symbol_size);
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
     for (step_index, &(_, pivot)) in plan.pivots.iter().enumerate() {
         addassign_mapped_binary_symbol_batch(
@@ -2685,6 +2690,7 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
             plan.binary_forward_dests.slice(step_index),
             plan.s,
             plan.h,
+            add_assign_path,
         );
     }
 
@@ -2727,6 +2733,7 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
                 symbols,
                 src,
                 plan.back_substitution.slice(src),
+                add_assign_path,
             );
         }
         return true;
@@ -2747,6 +2754,7 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
             &mut decoded,
             src,
             plan.back_substitution.slice(src),
+            add_assign_path,
         );
     }
 
@@ -2766,6 +2774,7 @@ fn addassign_mapped_binary_symbol_batch(
     dests: &[CoefficientColumn],
     s: usize,
     h: usize,
+    add_assign_path: AddAssignFastPath,
 ) {
     let src = mapped_binary_symbol_row(src, s, h);
     if dests.is_empty() {
@@ -2791,7 +2800,7 @@ fn addassign_mapped_binary_symbol_batch(
         unsafe {
             let dest_symbol =
                 core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
-            add_assign(dest_symbol, src_symbol);
+            add_assign_path.apply_same_len(dest_symbol, src_symbol);
         }
     }
 }
@@ -2959,19 +2968,10 @@ fn try_overdetermined_no_hdpc_prefix_solve<M: BinaryMatrix>(
         symbols.as_bytes()[..prefix_height * symbol_size].to_vec(),
         symbol_size,
     );
-    let prefix_rows = packed_binary_row_prefix(matrix, prefix_height);
+    let prefix_rows = matrix.packed_row_prefix(prefix_height);
     let (decoded, _) = solve_binary(prefix_rows, prefix_symbols);
     let decoded = verify_no_hdpc_solution(decoded?, source_block_symbols)?;
     binary_rows_satisfied(matrix, &decoded, symbols, prefix_height).then_some(decoded)
-}
-
-fn packed_binary_row_prefix<M: BinaryMatrix>(matrix: &M, height: usize) -> PackedBinaryRows {
-    debug_assert!(height <= matrix.height());
-    let mut rows = PackedBinaryRows::new(height, matrix.width());
-    for row in 0..height {
-        matrix.visit_row_entries(row, |col| rows.set(row, col));
-    }
-    rows
 }
 
 fn binary_rows_satisfied<M: BinaryMatrix>(
