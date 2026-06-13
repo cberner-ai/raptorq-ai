@@ -13,7 +13,7 @@ use core::arch::x86_64::{
 
 use crate::matrix::BinaryMatrix;
 
-const WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS: usize = 512;
+const WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS: usize = 256;
 #[cfg(feature = "std")]
 const PARALLEL_SPARSE_PACK_MIN_ROWS: usize = 16_384;
 #[cfg(feature = "std")]
