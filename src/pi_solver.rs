@@ -1998,10 +1998,6 @@ fn direct_hdpc_free_rows(
     h: usize,
 ) -> Option<DirectSystematicFreeRows> {
     assert_eq!(hdpc_coefficients.len(), width * h);
-    let mut free_index_by_col = vec![usize::MAX; width];
-    for (index, &col) in free_cols.iter().enumerate() {
-        free_index_by_col[coefficient_col_index(col)] = index;
-    }
 
     let mut free_rows = Vec::with_capacity(h);
     for row in 0..h {
@@ -2011,10 +2007,9 @@ fn direct_hdpc_free_rows(
             if value == 0 {
                 continue;
             }
-            let free_index = free_index_by_col[col];
-            if free_index == usize::MAX {
-                return None;
-            }
+            let free_index = free_cols
+                .iter()
+                .position(|&free_col| coefficient_col_index(free_col) == col)?;
             free_row.push((coefficient_col(free_index), Octet::new(value)));
         }
         free_rows.push(free_row.into_boxed_slice());
@@ -2172,7 +2167,7 @@ fn try_apply_prepared_direct_systematic_plan(
             .copy_from_slice(free_values.get(free_index));
     }
     for src in (0..plan.width).rev() {
-        addassign_direct_symbol_batch(
+        addassign_direct_symbol_batch_nonzero_source(
             symbols,
             src,
             plan.back_substitution.slice(src),
@@ -2335,6 +2330,26 @@ fn addassign_direct_symbol_batch(
     dests: &[CoefficientColumn],
     add_assign_path: AddAssignFastPath,
 ) {
+    addassign_direct_symbol_batch_impl::<true>(symbols, src, dests, add_assign_path);
+}
+
+#[cfg(feature = "std")]
+fn addassign_direct_symbol_batch_nonzero_source(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    dests: &[CoefficientColumn],
+    add_assign_path: AddAssignFastPath,
+) {
+    addassign_direct_symbol_batch_impl::<false>(symbols, src, dests, add_assign_path);
+}
+
+#[cfg(feature = "std")]
+fn addassign_direct_symbol_batch_impl<const CHECK_ZERO_SOURCE: bool>(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    dests: &[CoefficientColumn],
+    add_assign_path: AddAssignFastPath,
+) {
     if dests.is_empty() {
         return;
     }
@@ -2345,7 +2360,7 @@ fn addassign_direct_symbol_batch(
     assert!(src_start + symbol_size <= bytes.len());
     let src_ptr = unsafe { bytes.as_ptr().add(src_start) };
     let src_symbol = unsafe { core::slice::from_raw_parts(src_ptr, symbol_size) };
-    if bytes_are_zero(src_symbol) {
+    if CHECK_ZERO_SOURCE && bytes_are_zero(src_symbol) {
         return;
     }
     let bytes_ptr = bytes.as_mut_ptr();
@@ -3862,7 +3877,7 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
         }
         move_pivot_symbols_to_columns(&mut symbols, &output_symbol_cycles);
         for src in (0..width).rev() {
-            addassign_direct_symbol_batch(
+            addassign_direct_symbol_batch_nonzero_source(
                 &mut symbols,
                 src,
                 back_substitution.slice(src),
@@ -3883,7 +3898,7 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
         decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
     }
     for src in (0..width).rev() {
-        addassign_direct_symbol_batch(
+        addassign_direct_symbol_batch_nonzero_source(
             &mut decoded,
             src,
             back_substitution.slice(src),
