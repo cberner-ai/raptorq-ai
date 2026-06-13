@@ -1662,18 +1662,33 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
         let pivot = coefficient_col_index(pivot);
 
         let (update_start, update_unit_only) =
-            eliminate_direct_hdpc_column_and_collect_back_substitution(
-                &rows,
-                &mut hdpc_coefficients,
-                h,
-                col,
-                pivot,
-                DirectBackSubstitutionWork {
-                    counts: &mut back_substitution_counts,
-                    entries: &mut back_substitution_entries,
-                },
-                &mut hdpc_update_entries,
-            );
+            if use_weighted_buckets && (row_weights[pivot] as usize) <= SMALL_WEIGHT_MAX {
+                let pivot_entries = small_row_cache.entries(&rows, pivot, col);
+                eliminate_direct_hdpc_column_entries_and_collect_back_substitution(
+                    pivot_entries,
+                    &mut hdpc_coefficients,
+                    h,
+                    col,
+                    DirectBackSubstitutionWork {
+                        counts: &mut back_substitution_counts,
+                        entries: &mut back_substitution_entries,
+                    },
+                    &mut hdpc_update_entries,
+                )
+            } else {
+                eliminate_direct_hdpc_column_and_collect_back_substitution(
+                    &rows,
+                    &mut hdpc_coefficients,
+                    h,
+                    col,
+                    pivot,
+                    DirectBackSubstitutionWork {
+                        counts: &mut back_substitution_counts,
+                        entries: &mut back_substitution_entries,
+                    },
+                    &mut hdpc_update_entries,
+                )
+            };
         if update_start != hdpc_update_entries.len() {
             hdpc_update_pivots.push(coefficient_col(direct_binary_symbol_index(pivot, s, h)));
             hdpc_update_ranges.push((update_start, hdpc_update_entries.len()));
@@ -1896,6 +1911,77 @@ fn eliminate_direct_hdpc_column_and_collect_back_substitution(
                 hdpc_coefficients[entry_col * h + row] ^= factor;
             }
         });
+    }
+
+    let update_unit_only = hdpc_update_entries[update_start..]
+        .iter()
+        .all(|&(_, factor)| factor == Octet::one());
+    (update_start, update_unit_only)
+}
+
+#[cfg(feature = "std")]
+fn eliminate_direct_hdpc_column_entries_and_collect_back_substitution(
+    pivot_entries: &[CoefficientColumn],
+    hdpc_coefficients: &mut [u8],
+    h: usize,
+    col: usize,
+    back_substitution: DirectBackSubstitutionWork<'_>,
+    hdpc_update_entries: &mut Vec<(CoefficientColumn, Octet)>,
+) -> (usize, bool) {
+    debug_assert!(h <= 16);
+    debug_assert_eq!(pivot_entries.first().copied(), Some(coefficient_col(col)));
+    let update_start = hdpc_update_entries.len();
+    let col_start = col * h;
+    let mut factors = [0u8; 16];
+    factors[..h].copy_from_slice(&hdpc_coefficients[col_start..col_start + h]);
+    hdpc_coefficients[col_start..col_start + h].fill(0);
+    let source_col = coefficient_col(col);
+
+    if h == 16 {
+        let factor_block = u128::from_ne_bytes(factors);
+        if factor_block != 0 {
+            for (row, &factor) in factors.iter().enumerate() {
+                if factor != 0 {
+                    hdpc_update_entries.push((coefficient_col(row), Octet::new(factor)));
+                }
+            }
+        }
+        for &entry_col in &pivot_entries[1..] {
+            let entry_col = coefficient_col_index(entry_col);
+            back_substitution.counts[entry_col] += 1;
+            back_substitution
+                .entries
+                .push((coefficient_col(entry_col), source_col));
+            if factor_block != 0 {
+                let entry_start = entry_col * h;
+                let entry_ptr = unsafe { hdpc_coefficients.as_mut_ptr().add(entry_start) };
+                let updated = unsafe { entry_ptr.cast::<u128>().read_unaligned() ^ factor_block };
+                unsafe {
+                    entry_ptr.cast::<u128>().write_unaligned(updated);
+                }
+            }
+        }
+    } else {
+        let mut nonzero_factors = [(0usize, 0u8); 16];
+        let mut nonzero_factor_count = 0usize;
+        for (row, &factor) in factors[..h].iter().enumerate() {
+            if factor == 0 {
+                continue;
+            }
+            hdpc_update_entries.push((coefficient_col(row), Octet::new(factor)));
+            nonzero_factors[nonzero_factor_count] = (row, factor);
+            nonzero_factor_count += 1;
+        }
+        for &entry_col in &pivot_entries[1..] {
+            let entry_col = coefficient_col_index(entry_col);
+            back_substitution.counts[entry_col] += 1;
+            back_substitution
+                .entries
+                .push((coefficient_col(entry_col), source_col));
+            for &(row, factor) in &nonzero_factors[..nonzero_factor_count] {
+                hdpc_coefficients[entry_col * h + row] ^= factor;
+            }
+        }
     }
 
     let update_unit_only = hdpc_update_entries[update_start..]
