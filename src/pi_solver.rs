@@ -89,7 +89,7 @@ const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 64;
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 32_768;
 #[cfg(test)]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
-const SMALL_WEIGHT_BINARY_BUCKET_MAX: u32 = 12;
+const SMALL_WEIGHT_BINARY_BUCKET_MAX: u32 = 16;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 
@@ -1492,6 +1492,11 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut small_weight_buckets =
         SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
+    let mut small_row_cache = SmallBinaryRowCache::new(if use_weighted_buckets {
+        binary_height
+    } else {
+        0
+    });
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for (row, first_one) in first_ones.into_iter().enumerate() {
         if let Some(col) = first_one {
@@ -1514,7 +1519,11 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
     let mut is_pivot_row = vec![false; binary_height];
     let mut forward_steps = Vec::with_capacity(width);
     let mut forward_ranges = Vec::with_capacity(width);
-    let mut forward_entries = Vec::new();
+    let mut forward_entries = if use_weighted_buckets {
+        Vec::with_capacity(width.saturating_mul(SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT))
+    } else {
+        Vec::new()
+    };
     for col in 0..width {
         let pivot = if use_weighted_buckets {
             pop_lightest_weighted_binary_row_bucket(
@@ -1532,6 +1541,11 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
         };
         pivot_for_col[col] = coefficient_col(pivot);
         is_pivot_row[pivot] = true;
+        let pivot_weight = if use_weighted_buckets {
+            row_weights[pivot]
+        } else {
+            0
+        };
 
         let dest_start = forward_entries.len();
         while let Some(row) = if use_weighted_buckets {
@@ -1545,8 +1559,15 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
-                row_weights[row] = weight;
+                let next_col = eliminate_weighted_binary_row(
+                    &mut rows,
+                    &mut row_weights,
+                    &mut small_row_cache,
+                    row,
+                    pivot,
+                    col,
+                    pivot_weight,
+                );
                 if let Some(next_col) = next_col {
                     push_weighted_binary_row_bucket(
                         &row_weights,
@@ -1589,13 +1610,24 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
         return None;
     }
 
+    let pivot_count = width - free_cols.len();
+    let back_substitution_capacity = if use_weighted_buckets {
+        pivot_for_col
+            .iter()
+            .filter(|&&pivot| pivot != NO_COEFFICIENT_COLUMN)
+            .map(|&pivot| row_weights[coefficient_col_index(pivot)].saturating_sub(1) as usize)
+            .sum()
+    } else {
+        0
+    };
+
     let mut hdpc_coefficients = dense_hdpc_coefficients(hdpc_rows);
-    let mut hdpc_update_pivots = Vec::new();
-    let mut hdpc_update_ranges = Vec::new();
-    let mut hdpc_update_entries = Vec::new();
-    let mut hdpc_update_unit_only = Vec::new();
+    let mut hdpc_update_pivots = Vec::with_capacity(pivot_count);
+    let mut hdpc_update_ranges = Vec::with_capacity(pivot_count);
+    let mut hdpc_update_entries = Vec::with_capacity(pivot_count.saturating_mul(h));
+    let mut hdpc_update_unit_only = Vec::with_capacity(pivot_count);
     let mut back_substitution_counts = vec![0usize; width];
-    let mut back_substitution_entries = Vec::new();
+    let mut back_substitution_entries = Vec::with_capacity(back_substitution_capacity);
     let mut pivot_entries = Vec::new();
     for (col, &pivot) in pivot_for_col.iter().enumerate() {
         if pivot == NO_COEFFICIENT_COLUMN {
@@ -2712,6 +2744,11 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut small_weight_buckets =
         SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
+    let mut small_row_cache = SmallBinaryRowCache::new(if use_weighted_buckets {
+        binary_height
+    } else {
+        0
+    });
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for (row, first_one) in first_ones.into_iter().enumerate() {
         if let Some(col) = first_one {
@@ -2753,6 +2790,11 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
         pivot_for_col[col] = Some(pivot);
         is_pivot_row[pivot] = true;
         pivots.push((col, pivot));
+        let pivot_weight = if use_weighted_buckets {
+            row_weights[pivot]
+        } else {
+            0
+        };
 
         let dest_start = binary_forward_entries.len();
         while let Some(row) = if use_weighted_buckets {
@@ -2766,8 +2808,15 @@ fn prepare_cached_hybrid_systematic_plan<M: BinaryMatrix>(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
-                row_weights[row] = weight;
+                let next_col = eliminate_weighted_binary_row(
+                    &mut rows,
+                    &mut row_weights,
+                    &mut small_row_cache,
+                    row,
+                    pivot,
+                    col,
+                    pivot_weight,
+                );
                 if let Some(next_col) = next_col {
                     push_weighted_binary_row_bucket(
                         &row_weights,
@@ -2961,6 +3010,11 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut small_weight_buckets =
         SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
+    let mut small_row_cache = SmallBinaryRowCache::new(if use_weighted_buckets {
+        binary_height
+    } else {
+        0
+    });
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for (row, first_one) in first_ones.into_iter().enumerate() {
         if let Some(col) = first_one {
@@ -2998,6 +3052,11 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
         };
         pivot_for_col[col] = Some(pivot);
         is_pivot_row[pivot] = true;
+        let pivot_weight = if use_weighted_buckets {
+            row_weights[pivot]
+        } else {
+            0
+        };
 
         while let Some(row) = if use_weighted_buckets {
             pop_weighted_binary_row_bucket(
@@ -3010,8 +3069,15 @@ fn try_hybrid_binary_hdpc_solve<M: BinaryMatrix>(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
-                row_weights[row] = weight;
+                let next_col = eliminate_weighted_binary_row(
+                    &mut rows,
+                    &mut row_weights,
+                    &mut small_row_cache,
+                    row,
+                    pivot,
+                    col,
+                    pivot_weight,
+                );
                 if let Some(next_col) = next_col {
                     push_weighted_binary_row_bucket(
                         &row_weights,
@@ -3141,6 +3207,31 @@ fn binary_decoded_solution(
         });
     }
     decoded
+}
+
+fn eliminate_weighted_binary_row(
+    rows: &mut PackedBinaryRows,
+    row_weights: &mut [u32],
+    small_row_cache: &mut SmallBinaryRowCache,
+    row: usize,
+    pivot: usize,
+    col: usize,
+    pivot_weight: u32,
+) -> Option<usize> {
+    if pivot_weight <= SMALL_WEIGHT_BINARY_BUCKET_MAX {
+        debug_assert_ne!(row_weights[row], 0);
+        let pivot_entries = small_row_cache.entries(rows, pivot, col);
+        let (weight, next_col) =
+            rows.xor_columns_update_weight_and_first_one(row, pivot_entries, row_weights[row]);
+        row_weights[row] = weight;
+        small_row_cache.invalidate(row);
+        return next_col;
+    }
+
+    let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
+    row_weights[row] = weight;
+    small_row_cache.invalidate(row);
+    next_col
 }
 
 fn dense_hdpc_coefficients(matrix: &DenseOctetMatrix) -> Vec<Octet> {
@@ -3292,6 +3383,11 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut small_weight_buckets =
         SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
+    let mut small_row_cache = SmallBinaryRowCache::new(if use_weighted_buckets {
+        binary_height
+    } else {
+        0
+    });
     let mut next_in_bucket = vec![NO_BUCKET_ROW; binary_height];
     for (row, first_one) in first_ones.into_iter().enumerate() {
         if let Some(col) = first_one {
@@ -3331,6 +3427,11 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
         pivot_for_col[col] = Some(pivot);
         is_pivot_row[pivot] = true;
         pivots.push((col, pivot));
+        let pivot_weight = if use_weighted_buckets {
+            row_weights[pivot]
+        } else {
+            0
+        };
 
         let pivot_symbol = mapped_binary_symbol_row(pivot, s, h);
         while let Some(row) = if use_weighted_buckets {
@@ -3344,8 +3445,15 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
-                row_weights[row] = weight;
+                let next_col = eliminate_weighted_binary_row(
+                    &mut rows,
+                    &mut row_weights,
+                    &mut small_row_cache,
+                    row,
+                    pivot,
+                    col,
+                    pivot_weight,
+                );
                 if let Some(next_col) = next_col {
                     push_weighted_binary_row_bucket(
                         &row_weights,
@@ -4431,6 +4539,8 @@ fn solve_binary(
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut small_weight_buckets =
         SmallWeightBinaryBuckets::new(if use_weighted_buckets { width } else { 0 });
+    let mut small_row_cache =
+        SmallBinaryRowCache::new(if use_weighted_buckets { height } else { 0 });
     let mut next_in_bucket = vec![NO_BUCKET_ROW; height];
     for row in 0..height {
         if let Some(col) = rows.first_one_at_or_after(row, 0) {
@@ -4469,6 +4579,11 @@ fn solve_binary(
         };
         pivot_for_col[col] = Some(pivot);
         is_pivot_row[pivot] = true;
+        let pivot_weight = if use_weighted_buckets {
+            row_weights[pivot]
+        } else {
+            0
+        };
 
         while let Some(row) = if use_weighted_buckets {
             pop_weighted_binary_row_bucket(
@@ -4481,8 +4596,15 @@ fn solve_binary(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let (weight, next_col) = rows.xor_suffix_count_ones_and_first_one(row, pivot, col);
-                row_weights[row] = weight;
+                let next_col = eliminate_weighted_binary_row(
+                    &mut rows,
+                    &mut row_weights,
+                    &mut small_row_cache,
+                    row,
+                    pivot,
+                    col,
+                    pivot_weight,
+                );
                 if let Some(next_col) = next_col {
                     push_weighted_binary_row_bucket(
                         &row_weights,
@@ -4648,6 +4770,36 @@ impl SmallWeightBinaryBuckets {
     fn head_index(&self, bucket: usize, col: usize) -> usize {
         debug_assert!(bucket < SMALL_WEIGHT_BINARY_BUCKET_MAX as usize);
         bucket * self.width + col
+    }
+}
+
+struct SmallBinaryRowCache {
+    entries: Vec<Option<Box<[usize]>>>,
+}
+
+impl SmallBinaryRowCache {
+    fn new(height: usize) -> SmallBinaryRowCache {
+        SmallBinaryRowCache {
+            entries: vec![None; height],
+        }
+    }
+
+    fn entries<'a>(
+        &'a mut self,
+        rows: &PackedBinaryRows,
+        row: usize,
+        start_col: usize,
+    ) -> &'a [usize] {
+        if self.entries[row].is_none() {
+            let mut entries = Vec::new();
+            rows.visit_ones_at_or_after(row, start_col, |col| entries.push(col));
+            self.entries[row] = Some(entries.into_boxed_slice());
+        }
+        self.entries[row].as_deref().expect("small row is cached")
+    }
+
+    fn invalidate(&mut self, row: usize) {
+        self.entries[row] = None;
     }
 }
 

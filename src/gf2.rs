@@ -159,24 +159,42 @@ impl PackedBinaryRows {
             offset += 1;
         }
 
-        while offset + 4 <= words_per_row {
+        while offset + 8 <= words_per_row {
             let word0;
             let word1;
             let word2;
             let word3;
+            let word4;
+            let word5;
+            let word6;
+            let word7;
             unsafe {
                 word0 = *dest_ptr.add(offset) ^ *src_ptr.add(offset);
                 word1 = *dest_ptr.add(offset + 1) ^ *src_ptr.add(offset + 1);
                 word2 = *dest_ptr.add(offset + 2) ^ *src_ptr.add(offset + 2);
                 word3 = *dest_ptr.add(offset + 3) ^ *src_ptr.add(offset + 3);
+                word4 = *dest_ptr.add(offset + 4) ^ *src_ptr.add(offset + 4);
+                word5 = *dest_ptr.add(offset + 5) ^ *src_ptr.add(offset + 5);
+                word6 = *dest_ptr.add(offset + 6) ^ *src_ptr.add(offset + 6);
+                word7 = *dest_ptr.add(offset + 7) ^ *src_ptr.add(offset + 7);
                 *dest_ptr.add(offset) = word0;
                 *dest_ptr.add(offset + 1) = word1;
                 *dest_ptr.add(offset + 2) = word2;
                 *dest_ptr.add(offset + 3) = word3;
+                *dest_ptr.add(offset + 4) = word4;
+                *dest_ptr.add(offset + 5) = word5;
+                *dest_ptr.add(offset + 6) = word6;
+                *dest_ptr.add(offset + 7) = word7;
             }
-            weight +=
-                word0.count_ones() + word1.count_ones() + word2.count_ones() + word3.count_ones();
-            offset += 4;
+            weight += word0.count_ones()
+                + word1.count_ones()
+                + word2.count_ones()
+                + word3.count_ones()
+                + word4.count_ones()
+                + word5.count_ones()
+                + word6.count_ones()
+                + word7.count_ones();
+            offset += 8;
         }
         while offset < words_per_row {
             let word = unsafe {
@@ -214,6 +232,38 @@ impl PackedBinaryRows {
             }
             word = self.words[row_start + offset];
         }
+    }
+
+    pub(crate) fn xor_columns_update_weight_and_first_one(
+        &mut self,
+        dest: usize,
+        cols: &[usize],
+        mut weight: u32,
+    ) -> (u32, Option<usize>) {
+        let Some(&start_col) = cols.first() else {
+            return (weight, None);
+        };
+        debug_assert!(self.contains(dest, start_col));
+
+        for &col in cols {
+            debug_assert!(col < self.width);
+            let word = self.word_index(dest, col);
+            let mask = bit_mask(col);
+            if (self.words[word] & mask) == 0 {
+                self.words[word] |= mask;
+                weight += 1;
+            } else {
+                self.words[word] &= !mask;
+                weight -= 1;
+            }
+        }
+
+        let first_one = if weight == 0 {
+            None
+        } else {
+            self.first_one_at_or_after(dest, start_col)
+        };
+        (weight, first_one)
     }
 
     pub(crate) fn weight_at_or_after(&self, row: usize, start_col: usize) -> u32 {
@@ -376,6 +426,24 @@ mod tests {
         assert_eq!(packed.weight_at_or_after(0, 2), 3);
         assert_eq!(packed.weight_at_or_after(0, 64), 2);
         assert_eq!(packed.weight_at_or_after(0, 96), 0);
+    }
+
+    #[test]
+    fn column_xor_updates_weight_and_first_one() {
+        let rows = vec![vec![0, 3, 65, 70, 95]];
+        let mut packed = PackedBinaryRows::from_sparse(rows, 96);
+        let cols = [3, 64, 70];
+
+        let (weight, first_one) = packed.xor_columns_update_weight_and_first_one(0, &cols, 4);
+
+        assert_eq!(weight, 3);
+        assert_eq!(first_one, Some(64));
+        assert!(packed.contains(0, 0));
+        assert!(!packed.contains(0, 3));
+        assert!(packed.contains(0, 64));
+        assert!(packed.contains(0, 65));
+        assert!(!packed.contains(0, 70));
+        assert!(packed.contains(0, 95));
     }
 
     #[test]
