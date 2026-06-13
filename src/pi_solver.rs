@@ -1632,27 +1632,21 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
         return None;
     }
 
-    let free_cols = pivot_for_col
-        .iter()
-        .enumerate()
-        .filter_map(|(col, &pivot)| {
-            (pivot == NO_COEFFICIENT_COLUMN).then_some(coefficient_col(col))
-        })
-        .collect::<Vec<_>>();
+    let mut free_cols = Vec::with_capacity(h);
+    let mut back_substitution_capacity = 0usize;
+    for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        if pivot == NO_COEFFICIENT_COLUMN {
+            free_cols.push(coefficient_col(col));
+        } else if use_weighted_buckets {
+            back_substitution_capacity +=
+                row_weights[coefficient_col_index(pivot)].saturating_sub(1) as usize;
+        }
+    }
     if free_cols.len() > h {
         return None;
     }
 
     let pivot_count = width - free_cols.len();
-    let back_substitution_capacity = if use_weighted_buckets {
-        pivot_for_col
-            .iter()
-            .filter(|&&pivot| pivot != NO_COEFFICIENT_COLUMN)
-            .map(|&pivot| row_weights[coefficient_col_index(pivot)].saturating_sub(1) as usize)
-            .sum()
-    } else {
-        0
-    };
 
     let mut hdpc_coefficients = dense_hdpc_coefficient_values_column_major(hdpc_rows);
     let mut hdpc_update_pivots = Vec::with_capacity(pivot_count);
@@ -1661,28 +1655,25 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
     let mut hdpc_update_unit_only = Vec::with_capacity(pivot_count);
     let mut back_substitution_counts = vec![0usize; width];
     let mut back_substitution_entries = Vec::with_capacity(back_substitution_capacity);
-    let mut pivot_entries = Vec::new();
     for (col, &pivot) in pivot_for_col.iter().enumerate() {
         if pivot == NO_COEFFICIENT_COLUMN {
             continue;
         }
         let pivot = coefficient_col_index(pivot);
-        pivot_entries.clear();
-        rows.visit_ones_at_or_after(pivot, col + 1, |entry_col| {
-            pivot_entries.push(entry_col);
-        });
-        for &dependent_col in &pivot_entries {
-            back_substitution_counts[dependent_col] += 1;
-            back_substitution_entries.push((coefficient_col(dependent_col), coefficient_col(col)));
-        }
 
-        let (update_start, update_unit_only) = eliminate_direct_hdpc_column(
-            &mut hdpc_coefficients,
-            h,
-            col,
-            &pivot_entries,
-            &mut hdpc_update_entries,
-        );
+        let (update_start, update_unit_only) =
+            eliminate_direct_hdpc_column_and_collect_back_substitution(
+                &rows,
+                &mut hdpc_coefficients,
+                h,
+                col,
+                pivot,
+                DirectBackSubstitutionWork {
+                    counts: &mut back_substitution_counts,
+                    entries: &mut back_substitution_entries,
+                },
+                &mut hdpc_update_entries,
+            );
         if update_start != hdpc_update_entries.len() {
             hdpc_update_pivots.push(coefficient_col(direct_binary_symbol_index(pivot, s, h)));
             hdpc_update_ranges.push((update_start, hdpc_update_entries.len()));
@@ -1838,11 +1829,19 @@ fn prepare_direct_back_substitution_batches(
 }
 
 #[cfg(feature = "std")]
-fn eliminate_direct_hdpc_column(
+struct DirectBackSubstitutionWork<'a> {
+    counts: &'a mut [usize],
+    entries: &'a mut Vec<(CoefficientColumn, CoefficientColumn)>,
+}
+
+#[cfg(feature = "std")]
+fn eliminate_direct_hdpc_column_and_collect_back_substitution(
+    rows: &PackedBinaryRows,
     hdpc_coefficients: &mut [u8],
     h: usize,
     col: usize,
-    pivot_entries: &[usize],
+    pivot: usize,
+    back_substitution: DirectBackSubstitutionWork<'_>,
     hdpc_update_entries: &mut Vec<(CoefficientColumn, Octet)>,
 ) -> (usize, bool) {
     debug_assert!(h <= 16);
@@ -1851,6 +1850,8 @@ fn eliminate_direct_hdpc_column(
     let mut factors = [0u8; 16];
     factors[..h].copy_from_slice(&hdpc_coefficients[col_start..col_start + h]);
     hdpc_coefficients[col_start..col_start + h].fill(0);
+    let source_col = coefficient_col(col);
+    let dependent_start_col = col + 1;
 
     if h == 16 {
         let factor_block = u128::from_ne_bytes(factors);
@@ -1860,7 +1861,13 @@ fn eliminate_direct_hdpc_column(
                     hdpc_update_entries.push((coefficient_col(row), Octet::new(factor)));
                 }
             }
-            for &entry_col in pivot_entries {
+        }
+        rows.visit_ones_at_or_after(pivot, dependent_start_col, |entry_col| {
+            back_substitution.counts[entry_col] += 1;
+            back_substitution
+                .entries
+                .push((coefficient_col(entry_col), source_col));
+            if factor_block != 0 {
                 let entry_start = entry_col * h;
                 let entry_ptr = unsafe { hdpc_coefficients.as_mut_ptr().add(entry_start) };
                 let updated = unsafe { entry_ptr.cast::<u128>().read_unaligned() ^ factor_block };
@@ -1868,17 +1875,27 @@ fn eliminate_direct_hdpc_column(
                     entry_ptr.cast::<u128>().write_unaligned(updated);
                 }
             }
-        }
+        });
     } else {
+        let mut nonzero_factors = [(0usize, 0u8); 16];
+        let mut nonzero_factor_count = 0usize;
         for (row, &factor) in factors[..h].iter().enumerate() {
             if factor == 0 {
                 continue;
             }
             hdpc_update_entries.push((coefficient_col(row), Octet::new(factor)));
-            for &entry_col in pivot_entries {
+            nonzero_factors[nonzero_factor_count] = (row, factor);
+            nonzero_factor_count += 1;
+        }
+        rows.visit_ones_at_or_after(pivot, dependent_start_col, |entry_col| {
+            back_substitution.counts[entry_col] += 1;
+            back_substitution
+                .entries
+                .push((coefficient_col(entry_col), source_col));
+            for &(row, factor) in &nonzero_factors[..nonzero_factor_count] {
                 hdpc_coefficients[entry_col * h + row] ^= factor;
             }
-        }
+        });
     }
 
     let update_unit_only = hdpc_update_entries[update_start..]
@@ -1936,13 +1953,14 @@ fn slices_from_counts(counts: Vec<usize>) -> CachedSystematicSliceParts {
 #[cfg(feature = "std")]
 fn direct_slices_from_counts(counts: Vec<usize>) -> DirectSystematicSliceParts {
     let mut ranges = Vec::with_capacity(counts.len());
+    let mut offsets = Vec::with_capacity(counts.len());
     let mut next_start = 0usize;
     for count in counts {
         let start = next_start;
+        offsets.push(start);
         next_start += count;
         ranges.push((start, next_start));
     }
-    let offsets = ranges.iter().map(|&(start, _)| start).collect::<Vec<_>>();
     let entries = Vec::with_capacity(next_start);
     (ranges, offsets, entries, next_start)
 }
