@@ -2246,7 +2246,45 @@ fn addassign_direct_symbol_batch(
     }
     let bytes_ptr = bytes.as_mut_ptr();
 
-    for &dest in dests {
+    let mut dest_chunks = dests.chunks_exact(4);
+    for chunk in dest_chunks.by_ref() {
+        let dest0 = coefficient_col_index(chunk[0]);
+        let dest1 = coefficient_col_index(chunk[1]);
+        let dest2 = coefficient_col_index(chunk[2]);
+        let dest3 = coefficient_col_index(chunk[3]);
+        assert_ne!(dest0, src);
+        assert_ne!(dest1, src);
+        assert_ne!(dest2, src);
+        assert_ne!(dest3, src);
+        assert_ne!(dest0, dest1);
+        assert_ne!(dest0, dest2);
+        assert_ne!(dest0, dest3);
+        assert_ne!(dest1, dest2);
+        assert_ne!(dest1, dest3);
+        assert_ne!(dest2, dest3);
+        let dest0_start = dest0 * symbol_size;
+        let dest1_start = dest1 * symbol_size;
+        let dest2_start = dest2 * symbol_size;
+        let dest3_start = dest3 * symbol_size;
+        assert!(dest0_start + symbol_size <= bytes.len());
+        assert!(dest1_start + symbol_size <= bytes.len());
+        assert!(dest2_start + symbol_size <= bytes.len());
+        assert!(dest3_start + symbol_size <= bytes.len());
+        unsafe {
+            add_assign_path.apply_same_len_raw_4(
+                [
+                    bytes_ptr.add(dest0_start),
+                    bytes_ptr.add(dest1_start),
+                    bytes_ptr.add(dest2_start),
+                    bytes_ptr.add(dest3_start),
+                ],
+                src_ptr,
+                symbol_size,
+            );
+        }
+    }
+
+    for &dest in dest_chunks.remainder() {
         let dest = coefficient_col_index(dest);
         assert_ne!(dest, src);
         let dest_start = dest * symbol_size;
