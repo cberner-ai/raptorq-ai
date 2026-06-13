@@ -23,7 +23,7 @@ ENCODE_DEFAULT_SYMBOL_COUNTS = (
 )
 DECODE_DEFAULT_SYMBOL_COUNTS = (10, 100, 250, 500, 1000)
 CI_SYMBOL_COUNTS = (10, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000)
-CI_DECODE_5_PERCENT_SYMBOL_COUNTS = (10, 100, 250, 500, 1000)
+CI_DECODE_5_PERCENT_SYMBOL_COUNTS = CI_SYMBOL_COUNTS
 EXPECTED_CUSTOM_THROUGHPUT_ROWS = (
     2 * len(CI_SYMBOL_COUNTS)
     + len(CI_SYMBOL_COUNTS)
@@ -128,8 +128,8 @@ class CiBenchmarkTests(unittest.TestCase):
         self.assertEqual(counts[:-2], (10, 100, 250, 500, 1000, 2000, 5000, 10000))
         self.assertEqual(counts[-2:], (20000, 50000))
         self.assertEqual(counts, ENCODE_DEFAULT_SYMBOL_COUNTS)
-        self.assertEqual(CI_DECODE_5_PERCENT_SYMBOL_COUNTS, counts[:5])
-        self.assertEqual(CI_DECODE_5_PERCENT_SYMBOL_COUNTS, DECODE_DEFAULT_SYMBOL_COUNTS)
+        self.assertEqual(CI_DECODE_5_PERCENT_SYMBOL_COUNTS, counts)
+        self.assertEqual(DECODE_DEFAULT_SYMBOL_COUNTS, counts[:5])
 
     def test_ci_benchmark_sources_use_shared_symbol_counts(self):
         encode_source = read_bench_source("encode_benchmark.rs")
@@ -148,7 +148,7 @@ class CiBenchmarkTests(unittest.TestCase):
         self.assertNotIn("const CI_DECODE_SYMBOL_COUNTS", decode_source)
         self.assertNotIn("const CI_DECODE_MIXED_ONE_REPAIR_SYMBOL_COUNTS", decode_source)
         self.assertNotIn("CI_OVERHEAD_SYMBOL_COUNTS", decode_source)
-        self.assertIn("ci_decode_5_percent_symbol_counts()", decode_source)
+        self.assertNotIn("ci_decode_5_percent_symbol_counts", decode_source)
 
     def test_encode_benchmark_restores_original_workload_and_counts(self):
         source = read_bench_source("encode_benchmark.rs")
@@ -207,17 +207,17 @@ class CiBenchmarkTests(unittest.TestCase):
                 r"(?s)\}\s*else\s*\{.*TARGET_TOTAL_BYTES.*SYMBOL_COUNTS\.as_slice\(\)",
             )
 
-    def test_decode_ci_5_percent_row_uses_supported_shared_count_prefix(self):
+    def test_decode_ci_5_percent_row_uses_shared_ci_counts(self):
         source = read_bench_source("decode_benchmark.rs")
 
-        self.assertIn(
-            "const MAX_CI_DECODE_5_PERCENT_SYMBOL_COUNT: usize = 1000;",
-            source,
-        )
-        self.assertIn("fn ci_decode_5_percent_symbol_counts()", source)
+        self.assertNotIn("MAX_CI_DECODE_5_PERCENT_SYMBOL_COUNT", source)
+        self.assertNotIn("ci_decode_5_percent_symbol_counts", source)
         self.assertIn("CI_SYMBOL_COUNTS", source)
-        self.assertIn(".partition_point", source)
-        self.assertIn("ci_decode_5_percent_symbol_counts(),", source)
+        self.assertNotIn(".partition_point", source)
+        self.assertRegex(
+            source,
+            r"(?s)black_box\(benchmark\(\s*symbol_size,\s*0\.05,\s*target_total_bytes,\s*symbol_counts,\s*\)\);",
+        )
 
     def test_decode_benchmark_uses_repair_only_chunks_for_all_rows(self):
         source = read_bench_source("decode_benchmark.rs")
@@ -295,8 +295,12 @@ class CiBenchmarkTests(unittest.TestCase):
             "encode_benchmark/encoded/without pre-built plan/symbols=50000",
             metrics,
         )
-        self.assertNotIn(
+        self.assertIn(
             "decode_benchmark/decoded/1280 bytes/symbols=20000/overhead=5.0%",
+            metrics,
+        )
+        self.assertIn(
+            "decode_benchmark/decoded/1280 bytes/symbols=50000/overhead=5.0%",
             metrics,
         )
         self.assertIn(
@@ -365,7 +369,7 @@ symbol count = 10, decoded 127 MB in 0.456secs using 0.0% overhead, throughput: 
                     CI_SYMBOL_COUNTS
                 ),
                 "decode_benchmark/decoded/1280 bytes/overhead=5.0%": set(
-                    CI_DECODE_5_PERCENT_SYMBOL_COUNTS
+                    CI_SYMBOL_COUNTS
                 ),
             },
         )
@@ -380,8 +384,12 @@ symbol count = 10, decoded 127 MB in 0.456secs using 0.0% overhead, throughput: 
         rows = [row for row in table.splitlines() if row.startswith("| `")]
         self.assertEqual(len(rows), EXPECTED_CUSTOM_THROUGHPUT_ROWS)
         self.assertNotIn("additional throughput rows omitted", table)
-        self.assertNotIn(
+        self.assertIn(
             "decode_benchmark/decoded/1280 bytes/symbols=20000/overhead=5.0%",
+            table,
+        )
+        self.assertIn(
+            "decode_benchmark/decoded/1280 bytes/symbols=50000/overhead=5.0%",
             table,
         )
         self.assertIn(
