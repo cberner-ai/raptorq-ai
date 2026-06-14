@@ -2553,6 +2553,140 @@ fn addassign_symbol_row_batch<const CHECK_ZERO_SOURCE: bool>(
     }
 }
 
+fn addassign_symbol_source_batch(
+    symbols: &mut SymbolSlab,
+    dest: usize,
+    sources: &[usize],
+    add_assign_path: AddAssignFastPath,
+) {
+    if sources.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let bytes = symbols.as_mut_bytes();
+    let dest_start = dest * symbol_size;
+    assert!(dest_start + symbol_size <= bytes.len());
+    assert_symbol_source_batch_dest(dest, sources);
+    let dest_ptr = unsafe { bytes.as_mut_ptr().add(dest_start) };
+    addassign_symbol_sources_raw(
+        dest_ptr,
+        bytes.as_ptr(),
+        bytes.len(),
+        symbol_size,
+        sources,
+        add_assign_path,
+    );
+}
+
+fn addassign_symbol_sources_to_slice(
+    dest: &mut [u8],
+    symbols: &SymbolSlab,
+    sources: &[usize],
+    add_assign_path: AddAssignFastPath,
+) {
+    if sources.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    assert_eq!(dest.len(), symbol_size);
+    addassign_symbol_sources_raw(
+        dest.as_mut_ptr(),
+        symbols.as_bytes().as_ptr(),
+        symbols.as_bytes().len(),
+        symbol_size,
+        sources,
+        add_assign_path,
+    );
+}
+
+fn addassign_symbol_sources_raw(
+    dest_ptr: *mut u8,
+    source_base: *const u8,
+    source_len: usize,
+    symbol_size: usize,
+    sources: &[usize],
+    add_assign_path: AddAssignFastPath,
+) {
+    let mut source_chunks = sources.chunks_exact(8);
+    for chunk in source_chunks.by_ref() {
+        let src0_start = chunk[0] * symbol_size;
+        let src1_start = chunk[1] * symbol_size;
+        let src2_start = chunk[2] * symbol_size;
+        let src3_start = chunk[3] * symbol_size;
+        let src4_start = chunk[4] * symbol_size;
+        let src5_start = chunk[5] * symbol_size;
+        let src6_start = chunk[6] * symbol_size;
+        let src7_start = chunk[7] * symbol_size;
+        assert!(src0_start + symbol_size <= source_len);
+        assert!(src1_start + symbol_size <= source_len);
+        assert!(src2_start + symbol_size <= source_len);
+        assert!(src3_start + symbol_size <= source_len);
+        assert!(src4_start + symbol_size <= source_len);
+        assert!(src5_start + symbol_size <= source_len);
+        assert!(src6_start + symbol_size <= source_len);
+        assert!(src7_start + symbol_size <= source_len);
+        unsafe {
+            add_assign_path.apply_sources_same_len_raw_8(
+                dest_ptr,
+                [
+                    source_base.add(src0_start),
+                    source_base.add(src1_start),
+                    source_base.add(src2_start),
+                    source_base.add(src3_start),
+                    source_base.add(src4_start),
+                    source_base.add(src5_start),
+                    source_base.add(src6_start),
+                    source_base.add(src7_start),
+                ],
+                symbol_size,
+            );
+        }
+    }
+
+    let mut source_chunks = source_chunks.remainder().chunks_exact(4);
+    for chunk in source_chunks.by_ref() {
+        let src0_start = chunk[0] * symbol_size;
+        let src1_start = chunk[1] * symbol_size;
+        let src2_start = chunk[2] * symbol_size;
+        let src3_start = chunk[3] * symbol_size;
+        assert!(src0_start + symbol_size <= source_len);
+        assert!(src1_start + symbol_size <= source_len);
+        assert!(src2_start + symbol_size <= source_len);
+        assert!(src3_start + symbol_size <= source_len);
+        unsafe {
+            add_assign_path.apply_sources_same_len_raw_4(
+                dest_ptr,
+                [
+                    source_base.add(src0_start),
+                    source_base.add(src1_start),
+                    source_base.add(src2_start),
+                    source_base.add(src3_start),
+                ],
+                symbol_size,
+            );
+        }
+    }
+
+    for &source in source_chunks.remainder() {
+        let source_start = source * symbol_size;
+        assert!(source_start + symbol_size <= source_len);
+        unsafe {
+            let dest_symbol = core::slice::from_raw_parts_mut(dest_ptr, symbol_size);
+            let source_symbol =
+                core::slice::from_raw_parts(source_base.add(source_start), symbol_size);
+            add_assign_path.apply_same_len(dest_symbol, source_symbol);
+        }
+    }
+}
+
+fn assert_symbol_source_batch_dest(dest: usize, sources: &[usize]) {
+    for &source in sources {
+        assert_ne!(dest, source);
+    }
+}
+
 fn assert_symbol_row_batch_dests(src: usize, dests: &[usize]) {
     for (index, &dest) in dests.iter().enumerate() {
         assert_ne!(dest, src);
@@ -3120,9 +3254,27 @@ fn binary_rows_satisfied<M: BinaryMatrix>(
     let add_assign_path = AddAssignFastPath::new(decoded.symbol_size());
     for row in start_row..matrix.height() {
         check.fill(0);
+        let mut source_batch = [0usize; 8];
+        let mut source_batch_len = 0usize;
         matrix.visit_row_entries(row, |col| {
-            add_assign_path.apply_same_len(&mut check, decoded.get(col));
+            source_batch[source_batch_len] = col;
+            source_batch_len += 1;
+            if source_batch_len == source_batch.len() {
+                addassign_symbol_sources_to_slice(
+                    &mut check,
+                    decoded,
+                    &source_batch,
+                    add_assign_path,
+                );
+                source_batch_len = 0;
+            }
         });
+        addassign_symbol_sources_to_slice(
+            &mut check,
+            decoded,
+            &source_batch[..source_batch_len],
+            add_assign_path,
+        );
         if check.as_slice() != symbols.get(row) {
             return false;
         }
@@ -5193,10 +5345,22 @@ fn solve_binary_with_initial_metadata(
     for col in (0..width).rev() {
         let pivot = pivot_for_col[col].expect("pivot was recorded for every decoded column");
         decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
+        let mut source_batch = [0usize; 8];
+        let mut source_batch_len = 0usize;
         rows.visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
-            let (dependent_symbol, dest_symbol) = decoded.get_disjoint_mut(dependent_col, col);
-            add_assign_path.apply(dest_symbol, dependent_symbol);
+            source_batch[source_batch_len] = dependent_col;
+            source_batch_len += 1;
+            if source_batch_len == source_batch.len() {
+                addassign_symbol_source_batch(&mut decoded, col, &source_batch, add_assign_path);
+                source_batch_len = 0;
+            }
         });
+        addassign_symbol_source_batch(
+            &mut decoded,
+            col,
+            &source_batch[..source_batch_len],
+            add_assign_path,
+        );
     }
 
     (Some(decoded), None)
