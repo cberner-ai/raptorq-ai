@@ -71,7 +71,7 @@ const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
 const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
-const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 20_000;
+const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 10_000;
 #[cfg(all(feature = "std", not(test)))]
 const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 1_024;
 #[cfg(all(feature = "std", test))]
@@ -8215,6 +8215,16 @@ mod tests {
             .expect("direct systematic test threshold should be reachable")
     }
 
+    fn first_source_batched_direct_source_symbols() -> u32 {
+        (1..=SQUARE_HYBRID_MAX_WIDTH as u32)
+            .find(|&source_symbols| {
+                let width = num_intermediate_symbols(source_symbols) as usize;
+                (DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH..=SQUARE_HYBRID_MAX_WIDTH)
+                    .contains(&width)
+            })
+            .expect("source-batched direct test threshold should be reachable")
+    }
+
     #[test]
     fn threshold_systematic_plan_uses_direct_systematic_solve() {
         let source_symbols = first_direct_systematic_source_symbols();
@@ -8249,6 +8259,25 @@ mod tests {
             crate::operation_vector::perform_op(op, &mut replayed);
         }
         assert_eq!(replayed, decoded);
+    }
+
+    #[test]
+    fn source_batched_direct_plan_starts_at_large_width() {
+        let source_symbols = first_source_batched_direct_source_symbols();
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        let indices: Vec<u32> = (0..k_prime).collect();
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        assert!(width >= DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH);
+        let plan = prepare_direct_systematic_plan(&matrix, &hdpc_rows, source_symbols)
+            .expect("source-batched direct plan should build");
+
+        assert!(matches!(
+            &plan.back_substitution,
+            DirectSystematicBackSubstitution::SourcesByDest(_)
+        ));
     }
 
     #[test]
