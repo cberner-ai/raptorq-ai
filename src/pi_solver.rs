@@ -48,6 +48,7 @@ const SPARSE_SOURCE_MERGE_MAX_SOURCE_LEN: usize = 512;
 const SPARSE_SOURCE_LINEAR_SCAN_LIMIT: usize = 24;
 const SHORT_ROW_LINEAR_SCAN_LIMIT: usize = 8;
 const BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH: usize = 512;
+const BINARY_SOURCE_BATCH_16_MIN_WIDTH: usize = 10_000;
 const TRIANGULAR_RECORDING_MIN_WIDTH: usize = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
 const HYBRID_MAX_WIDTH: usize = u16::MAX as usize;
 const SQUARE_HYBRID_MAX_WIDTH: usize = HYBRID_MAX_WIDTH;
@@ -2609,7 +2610,67 @@ fn addassign_symbol_sources_raw(
     sources: &[usize],
     add_assign_path: AddAssignFastPath,
 ) {
-    let mut source_chunks = sources.chunks_exact(8);
+    let mut source_chunks = sources.chunks_exact(16);
+    for chunk in source_chunks.by_ref() {
+        let src0_start = chunk[0] * symbol_size;
+        let src1_start = chunk[1] * symbol_size;
+        let src2_start = chunk[2] * symbol_size;
+        let src3_start = chunk[3] * symbol_size;
+        let src4_start = chunk[4] * symbol_size;
+        let src5_start = chunk[5] * symbol_size;
+        let src6_start = chunk[6] * symbol_size;
+        let src7_start = chunk[7] * symbol_size;
+        let src8_start = chunk[8] * symbol_size;
+        let src9_start = chunk[9] * symbol_size;
+        let src10_start = chunk[10] * symbol_size;
+        let src11_start = chunk[11] * symbol_size;
+        let src12_start = chunk[12] * symbol_size;
+        let src13_start = chunk[13] * symbol_size;
+        let src14_start = chunk[14] * symbol_size;
+        let src15_start = chunk[15] * symbol_size;
+        assert!(src0_start + symbol_size <= source_len);
+        assert!(src1_start + symbol_size <= source_len);
+        assert!(src2_start + symbol_size <= source_len);
+        assert!(src3_start + symbol_size <= source_len);
+        assert!(src4_start + symbol_size <= source_len);
+        assert!(src5_start + symbol_size <= source_len);
+        assert!(src6_start + symbol_size <= source_len);
+        assert!(src7_start + symbol_size <= source_len);
+        assert!(src8_start + symbol_size <= source_len);
+        assert!(src9_start + symbol_size <= source_len);
+        assert!(src10_start + symbol_size <= source_len);
+        assert!(src11_start + symbol_size <= source_len);
+        assert!(src12_start + symbol_size <= source_len);
+        assert!(src13_start + symbol_size <= source_len);
+        assert!(src14_start + symbol_size <= source_len);
+        assert!(src15_start + symbol_size <= source_len);
+        unsafe {
+            add_assign_path.apply_sources_same_len_raw_16(
+                dest_ptr,
+                [
+                    source_base.add(src0_start),
+                    source_base.add(src1_start),
+                    source_base.add(src2_start),
+                    source_base.add(src3_start),
+                    source_base.add(src4_start),
+                    source_base.add(src5_start),
+                    source_base.add(src6_start),
+                    source_base.add(src7_start),
+                    source_base.add(src8_start),
+                    source_base.add(src9_start),
+                    source_base.add(src10_start),
+                    source_base.add(src11_start),
+                    source_base.add(src12_start),
+                    source_base.add(src13_start),
+                    source_base.add(src14_start),
+                    source_base.add(src15_start),
+                ],
+                symbol_size,
+            );
+        }
+    }
+
+    let mut source_chunks = source_chunks.remainder().chunks_exact(8);
     for chunk in source_chunks.by_ref() {
         let src0_start = chunk[0] * symbol_size;
         let src1_start = chunk[1] * symbol_size;
@@ -3254,25 +3315,11 @@ fn binary_rows_satisfied<M: BinaryMatrix>(
     let add_assign_path = AddAssignFastPath::new(decoded.symbol_size());
     for row in start_row..matrix.height() {
         check.fill(0);
-        let mut source_batch = [0usize; 8];
-        let mut source_batch_len = 0usize;
-        matrix.visit_row_entries(row, |col| {
-            source_batch[source_batch_len] = col;
-            source_batch_len += 1;
-            if source_batch_len == source_batch.len() {
-                addassign_symbol_sources_to_slice(
-                    &mut check,
-                    decoded,
-                    &source_batch,
-                    add_assign_path,
-                );
-                source_batch_len = 0;
-            }
-        });
-        addassign_symbol_sources_to_slice(
+        addassign_binary_row_sources_to_slice::<8, M>(
+            matrix,
+            row,
             &mut check,
             decoded,
-            &source_batch[..source_batch_len],
             add_assign_path,
         );
         if check.as_slice() != symbols.get(row) {
@@ -3280,6 +3327,31 @@ fn binary_rows_satisfied<M: BinaryMatrix>(
         }
     }
     true
+}
+
+fn addassign_binary_row_sources_to_slice<const BATCH: usize, M: BinaryMatrix>(
+    matrix: &M,
+    row: usize,
+    check: &mut [u8],
+    decoded: &SymbolSlab,
+    add_assign_path: AddAssignFastPath,
+) {
+    let mut source_batch = [0usize; BATCH];
+    let mut source_batch_len = 0usize;
+    matrix.visit_row_entries(row, |col| {
+        source_batch[source_batch_len] = col;
+        source_batch_len += 1;
+        if source_batch_len == source_batch.len() {
+            addassign_symbol_sources_to_slice(check, decoded, &source_batch, add_assign_path);
+            source_batch_len = 0;
+        }
+    });
+    addassign_symbol_sources_to_slice(
+        check,
+        decoded,
+        &source_batch[..source_batch_len],
+        add_assign_path,
+    );
 }
 
 fn verify_no_hdpc_solution(decoded: SymbolSlab, source_block_symbols: u32) -> Option<SymbolSlab> {
@@ -5345,25 +5417,54 @@ fn solve_binary_with_initial_metadata(
     for col in (0..width).rev() {
         let pivot = pivot_for_col[col].expect("pivot was recorded for every decoded column");
         decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
-        let mut source_batch = [0usize; 8];
-        let mut source_batch_len = 0usize;
-        rows.visit_ones_at_or_after(pivot, col + 1, |dependent_col| {
-            source_batch[source_batch_len] = dependent_col;
-            source_batch_len += 1;
-            if source_batch_len == source_batch.len() {
-                addassign_symbol_source_batch(&mut decoded, col, &source_batch, add_assign_path);
-                source_batch_len = 0;
-            }
-        });
-        addassign_symbol_source_batch(
-            &mut decoded,
-            col,
-            &source_batch[..source_batch_len],
-            add_assign_path,
-        );
+        if width >= BINARY_SOURCE_BATCH_16_MIN_WIDTH && height == width {
+            addassign_packed_row_sources_to_symbol::<16>(
+                &rows,
+                pivot,
+                col + 1,
+                &mut decoded,
+                col,
+                add_assign_path,
+            );
+        } else {
+            addassign_packed_row_sources_to_symbol::<8>(
+                &rows,
+                pivot,
+                col + 1,
+                &mut decoded,
+                col,
+                add_assign_path,
+            );
+        }
     }
 
     (Some(decoded), None)
+}
+
+fn addassign_packed_row_sources_to_symbol<const BATCH: usize>(
+    rows: &PackedBinaryRows,
+    row: usize,
+    start_col: usize,
+    decoded: &mut SymbolSlab,
+    dest: usize,
+    add_assign_path: AddAssignFastPath,
+) {
+    let mut source_batch = [0usize; BATCH];
+    let mut source_batch_len = 0usize;
+    rows.visit_ones_at_or_after(row, start_col, |dependent_col| {
+        source_batch[source_batch_len] = dependent_col;
+        source_batch_len += 1;
+        if source_batch_len == source_batch.len() {
+            addassign_symbol_source_batch(decoded, dest, &source_batch, add_assign_path);
+            source_batch_len = 0;
+        }
+    });
+    addassign_symbol_source_batch(
+        decoded,
+        dest,
+        &source_batch[..source_batch_len],
+        add_assign_path,
+    );
 }
 
 fn push_row_bucket(
