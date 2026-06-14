@@ -1654,7 +1654,9 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
 
     let pivot_count = width - free_cols.len();
 
-    let mut hdpc_coefficients = dense_hdpc_coefficient_values_column_major(hdpc_rows);
+    let hdpc_coefficient_stride = direct_hdpc_coefficient_stride(h);
+    let mut hdpc_coefficients =
+        dense_hdpc_coefficient_values_column_major_padded(hdpc_rows, hdpc_coefficient_stride);
     let mut hdpc_update_pivots = Vec::with_capacity(pivot_count);
     let mut hdpc_update_ranges = Vec::with_capacity(pivot_count);
     let mut hdpc_update_entries = Vec::with_capacity(pivot_count.saturating_mul(h));
@@ -1707,7 +1709,13 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
         entries: hdpc_update_entries,
         unit_only: hdpc_update_unit_only,
     };
-    let hdpc_free_rows = direct_hdpc_free_rows(hdpc_coefficients, &free_cols, width, h)?;
+    let hdpc_free_rows = direct_hdpc_free_rows(
+        hdpc_coefficients,
+        &free_cols,
+        width,
+        h,
+        hdpc_coefficient_stride,
+    )?;
     let back_substitution = prepare_direct_back_substitution_batches(
         back_substitution_counts,
         back_substitution_entries,
@@ -1865,16 +1873,16 @@ fn eliminate_direct_hdpc_column_and_collect_back_substitution(
     back_substitution: DirectBackSubstitutionWork<'_>,
     hdpc_update_entries: &mut Vec<(CoefficientColumn, Octet)>,
 ) -> (usize, bool) {
-    debug_assert!(h <= 16);
+    let stride = direct_hdpc_coefficient_stride(h);
     let update_start = hdpc_update_entries.len();
-    let col_start = col * h;
+    let col_start = col * stride;
     let mut factors = [0u8; 16];
     factors[..h].copy_from_slice(&hdpc_coefficients[col_start..col_start + h]);
     hdpc_coefficients[col_start..col_start + h].fill(0);
     let source_col = coefficient_col(col);
     let dependent_start_col = col + 1;
 
-    if h == 16 {
+    if stride == 16 {
         let factor_block = u128::from_ne_bytes(factors);
         if factor_block != 0 {
             for (row, &factor) in factors.iter().enumerate() {
@@ -1889,7 +1897,7 @@ fn eliminate_direct_hdpc_column_and_collect_back_substitution(
                 .entries
                 .push((coefficient_col(entry_col), source_col));
             if factor_block != 0 {
-                let entry_start = entry_col * h;
+                let entry_start = entry_col * stride;
                 let entry_ptr = unsafe { hdpc_coefficients.as_mut_ptr().add(entry_start) };
                 let updated = unsafe { entry_ptr.cast::<u128>().read_unaligned() ^ factor_block };
                 unsafe {
@@ -1914,7 +1922,7 @@ fn eliminate_direct_hdpc_column_and_collect_back_substitution(
                 .entries
                 .push((coefficient_col(entry_col), source_col));
             for &(row, factor) in &nonzero_factors[..nonzero_factor_count] {
-                hdpc_coefficients[entry_col * h + row] ^= factor;
+                hdpc_coefficients[entry_col * stride + row] ^= factor;
             }
         });
     }
@@ -1934,16 +1942,16 @@ fn eliminate_direct_hdpc_column_entries_and_collect_back_substitution(
     back_substitution: DirectBackSubstitutionWork<'_>,
     hdpc_update_entries: &mut Vec<(CoefficientColumn, Octet)>,
 ) -> (usize, bool) {
-    debug_assert!(h <= 16);
+    let stride = direct_hdpc_coefficient_stride(h);
     debug_assert_eq!(pivot_entries.first().copied(), Some(coefficient_col(col)));
     let update_start = hdpc_update_entries.len();
-    let col_start = col * h;
+    let col_start = col * stride;
     let mut factors = [0u8; 16];
     factors[..h].copy_from_slice(&hdpc_coefficients[col_start..col_start + h]);
     hdpc_coefficients[col_start..col_start + h].fill(0);
     let source_col = coefficient_col(col);
 
-    if h == 16 {
+    if stride == 16 {
         let factor_block = u128::from_ne_bytes(factors);
         if factor_block != 0 {
             for (row, &factor) in factors.iter().enumerate() {
@@ -1959,7 +1967,7 @@ fn eliminate_direct_hdpc_column_entries_and_collect_back_substitution(
                 .entries
                 .push((coefficient_col(entry_col), source_col));
             if factor_block != 0 {
-                let entry_start = entry_col * h;
+                let entry_start = entry_col * stride;
                 let entry_ptr = unsafe { hdpc_coefficients.as_mut_ptr().add(entry_start) };
                 let updated = unsafe { entry_ptr.cast::<u128>().read_unaligned() ^ factor_block };
                 unsafe {
@@ -1985,7 +1993,7 @@ fn eliminate_direct_hdpc_column_entries_and_collect_back_substitution(
                 .entries
                 .push((coefficient_col(entry_col), source_col));
             for &(row, factor) in &nonzero_factors[..nonzero_factor_count] {
-                hdpc_coefficients[entry_col * h + row] ^= factor;
+                hdpc_coefficients[entry_col * stride + row] ^= factor;
             }
         }
     }
@@ -2002,20 +2010,18 @@ fn direct_hdpc_free_rows(
     free_cols: &[CoefficientColumn],
     width: usize,
     h: usize,
+    stride: usize,
 ) -> Option<DirectSystematicFreeRows> {
-    assert_eq!(hdpc_coefficients.len(), width * h);
+    assert_eq!(hdpc_coefficients.len(), width * stride);
 
     let mut free_rows = Vec::with_capacity(h);
     for row in 0..h {
         let mut free_row = Vec::with_capacity(free_cols.len());
-        for col in 0..width {
-            let value = hdpc_coefficients[col * h + row];
+        for (free_index, &col) in free_cols.iter().enumerate() {
+            let value = hdpc_coefficients[coefficient_col_index(col) * stride + row];
             if value == 0 {
                 continue;
             }
-            let free_index = free_cols
-                .iter()
-                .position(|&free_col| coefficient_col_index(free_col) == col)?;
             free_row.push((coefficient_col(free_index), Octet::new(value)));
         }
         free_rows.push(free_row.into_boxed_slice());
@@ -2147,12 +2153,22 @@ fn try_apply_prepared_direct_systematic_plan(
     }
     for (update_index, &pivot) in plan.hdpc_update_pivots.iter().enumerate() {
         let pivot_symbol = symbols.get(coefficient_col_index(pivot));
-        for &(row, factor) in plan.hdpc_updates.slice(update_index) {
-            fused_mul_path.apply_nonzero(
-                hdpc_symbols.get_mut(coefficient_col_index(row)),
+        let update_slice = plan.hdpc_updates.slice(update_index);
+        if plan.hdpc_updates.unit_only[update_index] {
+            addassign_external_symbol_batch(
+                &mut hdpc_symbols,
                 pivot_symbol,
-                &factor,
+                update_slice,
+                add_assign_path,
             );
+        } else {
+            for &(row, factor) in update_slice {
+                fused_mul_path.apply_nonzero(
+                    hdpc_symbols.get_mut(coefficient_col_index(row)),
+                    pivot_symbol,
+                    &factor,
+                );
+            }
         }
     }
 
@@ -2347,6 +2363,110 @@ fn addassign_direct_symbol_batch_nonzero_source(
     add_assign_path: AddAssignFastPath,
 ) {
     addassign_direct_symbol_batch_impl::<false>(symbols, src, dests, add_assign_path);
+}
+
+#[cfg(feature = "std")]
+fn addassign_external_symbol_batch(
+    symbols: &mut SymbolSlab,
+    src_symbol: &[u8],
+    dests: &[(CoefficientColumn, Octet)],
+    add_assign_path: AddAssignFastPath,
+) {
+    if dests.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    assert_eq!(src_symbol.len(), symbol_size);
+    let bytes = symbols.as_mut_bytes();
+    let bytes_ptr = bytes.as_mut_ptr();
+    let src_ptr = src_symbol.as_ptr();
+
+    let mut dest_chunks = dests.chunks_exact(8);
+    for chunk in dest_chunks.by_ref() {
+        debug_assert!(chunk.iter().all(|&(_, factor)| factor == Octet::one()));
+        let dest0 = coefficient_col_index(chunk[0].0);
+        let dest1 = coefficient_col_index(chunk[1].0);
+        let dest2 = coefficient_col_index(chunk[2].0);
+        let dest3 = coefficient_col_index(chunk[3].0);
+        let dest4 = coefficient_col_index(chunk[4].0);
+        let dest5 = coefficient_col_index(chunk[5].0);
+        let dest6 = coefficient_col_index(chunk[6].0);
+        let dest7 = coefficient_col_index(chunk[7].0);
+        let dest0_start = dest0 * symbol_size;
+        let dest1_start = dest1 * symbol_size;
+        let dest2_start = dest2 * symbol_size;
+        let dest3_start = dest3 * symbol_size;
+        let dest4_start = dest4 * symbol_size;
+        let dest5_start = dest5 * symbol_size;
+        let dest6_start = dest6 * symbol_size;
+        let dest7_start = dest7 * symbol_size;
+        assert!(dest0_start + symbol_size <= bytes.len());
+        assert!(dest1_start + symbol_size <= bytes.len());
+        assert!(dest2_start + symbol_size <= bytes.len());
+        assert!(dest3_start + symbol_size <= bytes.len());
+        assert!(dest4_start + symbol_size <= bytes.len());
+        assert!(dest5_start + symbol_size <= bytes.len());
+        assert!(dest6_start + symbol_size <= bytes.len());
+        assert!(dest7_start + symbol_size <= bytes.len());
+        unsafe {
+            add_assign_path.apply_same_len_raw_8(
+                [
+                    bytes_ptr.add(dest0_start),
+                    bytes_ptr.add(dest1_start),
+                    bytes_ptr.add(dest2_start),
+                    bytes_ptr.add(dest3_start),
+                    bytes_ptr.add(dest4_start),
+                    bytes_ptr.add(dest5_start),
+                    bytes_ptr.add(dest6_start),
+                    bytes_ptr.add(dest7_start),
+                ],
+                src_ptr,
+                symbol_size,
+            );
+        }
+    }
+
+    let mut dest_chunks = dest_chunks.remainder().chunks_exact(4);
+    for chunk in dest_chunks.by_ref() {
+        debug_assert!(chunk.iter().all(|&(_, factor)| factor == Octet::one()));
+        let dest0 = coefficient_col_index(chunk[0].0);
+        let dest1 = coefficient_col_index(chunk[1].0);
+        let dest2 = coefficient_col_index(chunk[2].0);
+        let dest3 = coefficient_col_index(chunk[3].0);
+        let dest0_start = dest0 * symbol_size;
+        let dest1_start = dest1 * symbol_size;
+        let dest2_start = dest2 * symbol_size;
+        let dest3_start = dest3 * symbol_size;
+        assert!(dest0_start + symbol_size <= bytes.len());
+        assert!(dest1_start + symbol_size <= bytes.len());
+        assert!(dest2_start + symbol_size <= bytes.len());
+        assert!(dest3_start + symbol_size <= bytes.len());
+        unsafe {
+            add_assign_path.apply_same_len_raw_4(
+                [
+                    bytes_ptr.add(dest0_start),
+                    bytes_ptr.add(dest1_start),
+                    bytes_ptr.add(dest2_start),
+                    bytes_ptr.add(dest3_start),
+                ],
+                src_ptr,
+                symbol_size,
+            );
+        }
+    }
+
+    for &(dest, factor) in dest_chunks.remainder() {
+        debug_assert_eq!(factor, Octet::one());
+        let dest = coefficient_col_index(dest);
+        let dest_start = dest * symbol_size;
+        assert!(dest_start + symbol_size <= bytes.len());
+        unsafe {
+            let dest_symbol =
+                core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
+            add_assign_path.apply_same_len(dest_symbol, src_symbol);
+        }
+    }
 }
 
 #[cfg(feature = "std")]
@@ -4028,6 +4148,27 @@ fn dense_hdpc_coefficient_values_column_major(matrix: &DenseOctetMatrix) -> Vec<
     for row in 0..matrix.height() {
         for (col, coefficient) in matrix.row(row).iter().enumerate() {
             coefficients[col * matrix.height() + row] = coefficient.value();
+        }
+    }
+    coefficients
+}
+
+#[cfg(feature = "std")]
+fn direct_hdpc_coefficient_stride(h: usize) -> usize {
+    debug_assert!(h <= 16);
+    16
+}
+
+#[cfg(feature = "std")]
+fn dense_hdpc_coefficient_values_column_major_padded(
+    matrix: &DenseOctetMatrix,
+    stride: usize,
+) -> Vec<u8> {
+    debug_assert!(matrix.height() <= stride);
+    let mut coefficients = vec![0u8; matrix.width() * stride];
+    for row in 0..matrix.height() {
+        for (col, coefficient) in matrix.row(row).iter().enumerate() {
+            coefficients[col * stride + row] = coefficient.value();
         }
     }
     coefficients
