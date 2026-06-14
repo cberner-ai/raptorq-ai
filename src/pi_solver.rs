@@ -69,7 +69,7 @@ const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
-const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 10_000;
+const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(all(feature = "std", not(test)))]
 const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 1_024;
 #[cfg(all(feature = "std", test))]
@@ -7969,7 +7969,7 @@ mod tests {
 
     #[test]
     fn large_systematic_plan_uses_hybrid_direct_systematic_solve() {
-        let source_symbols = 5_000;
+        let source_symbols = 4_000;
         let k_prime = extended_source_block_symbols(source_symbols);
         let symbols = SymbolSlab::with_zeros(num_intermediate_symbols(source_symbols) as usize, 1);
         let indices: Vec<u32> = (0..k_prime).collect();
