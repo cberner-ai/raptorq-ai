@@ -18,17 +18,18 @@ use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
 use crate::octets::{
     AddAssignFastPath, FusedAddAssignMulScalarFastPath, add_assign, bytes_are_zero,
-    fused_addassign_mul_scalar, mulassign_scalar,
+    fused_addassign_mul_scalar, mulassign_alpha, mulassign_scalar,
 };
 use crate::operation_vector::SymbolOps;
 #[cfg(feature = "std")]
 use crate::operation_vector::fused_addassign_symbol_batch;
+use crate::rng::RfcRand;
 use crate::sparse_matrix::SparseBinaryMatrix;
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::num_ldpc_symbols;
 use crate::systematic_constants::{
     MAX_SUPPORTED_INTERMEDIATE_SYMBOLS, calculate_p1, extended_source_block_symbols,
-    num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
+    num_hdpc_symbols, num_intermediate_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
 };
 
 type CoefficientColumn = u16;
@@ -3360,8 +3361,64 @@ fn verify_no_hdpc_solution(decoded: SymbolSlab, source_block_symbols: u32) -> Op
         return Some(decoded);
     }
 
+    let h = num_hdpc_symbols(source_block_symbols) as usize;
+    if is_rfc_hdpc_shape(decoded.len(), h, source_block_symbols)
+        && decoded.len() >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH
+    {
+        return rfc_hdpc_rows_satisfied_horner(&decoded, h).then_some(decoded);
+    }
+
     let hdpc_rows = generate_hdpc_rows(source_block_symbols);
     hdpc_rows_satisfied(&decoded, &hdpc_rows).then_some(decoded)
+}
+
+fn is_rfc_hdpc_shape(width: usize, h: usize, source_block_symbols: u32) -> bool {
+    width == num_intermediate_symbols(source_block_symbols) as usize
+        && h == num_hdpc_symbols(source_block_symbols) as usize
+        && h > 1
+}
+
+fn rfc_hdpc_rows_satisfied_horner(decoded: &SymbolSlab, h: usize) -> bool {
+    let width = decoded.len();
+    let Some(gamma_width) = width.checked_sub(h) else {
+        return false;
+    };
+    if h <= 1 || gamma_width == 0 {
+        return false;
+    }
+
+    let symbol_size = decoded.symbol_size();
+    let add_assign_path = AddAssignFastPath::new(symbol_size);
+    let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
+    let mut prefix = vec![0u8; symbol_size];
+    let mut checks = SymbolSlab::with_zeros(h, symbol_size);
+
+    for col in 0..gamma_width {
+        mulassign_alpha(&mut prefix);
+        add_assign_path.apply(&mut prefix, decoded.get(col));
+
+        if col + 1 == gamma_width {
+            for row in 0..h {
+                let factor = Octet::alpha_pow(row);
+                fused_mul_path.apply_nonzero(checks.get_mut(row), &prefix, &factor);
+            }
+        } else {
+            let random = RfcRand::new((col + 1) as u32);
+            let row_a = random.get(6, h as u32) as usize;
+            let row_b = (row_a + random.get(7, h as u32 - 1) as usize + 1) % h;
+            add_assign_path.apply(checks.get_mut(row_a), &prefix);
+            add_assign_path.apply(checks.get_mut(row_b), &prefix);
+        }
+    }
+
+    for row in 0..h {
+        add_assign_path.apply(checks.get_mut(row), decoded.get(gamma_width + row));
+    }
+
+    checks
+        .as_bytes()
+        .chunks_exact(symbol_size)
+        .all(bytes_are_zero)
 }
 
 fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bool {
@@ -6767,6 +6824,30 @@ mod recording_tests {
 
         let zero_decoded = SymbolSlab::with_zeros(4, 2);
         assert!(hdpc_rows_satisfied_column_major(&zero_decoded, &hdpc_rows));
+    }
+
+    #[test]
+    fn horner_hdpc_verification_matches_generated_rows() {
+        for source_symbols in [10, 100, 1000] {
+            let hdpc_rows = generate_hdpc_rows(source_symbols);
+            let symbol_size = 3usize;
+            let mut bytes = vec![0u8; hdpc_rows.width() * symbol_size];
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(29).wrapping_add(17);
+            }
+            let decoded = SymbolSlab::from_bytes(bytes, symbol_size);
+
+            assert_eq!(
+                rfc_hdpc_rows_satisfied_horner(&decoded, hdpc_rows.height()),
+                hdpc_rows_satisfied_row_major(&decoded, &hdpc_rows)
+            );
+
+            let zero_decoded = SymbolSlab::with_zeros(hdpc_rows.width(), symbol_size);
+            assert!(rfc_hdpc_rows_satisfied_horner(
+                &zero_decoded,
+                hdpc_rows.height()
+            ));
+        }
     }
 
     #[test]
