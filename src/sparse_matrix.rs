@@ -11,8 +11,6 @@ use crate::octet::Octet;
 use serde::{Deserialize, Serialize};
 
 const APPEND_BUILD_MIN_WIDTH: usize = 512;
-const PARALLEL_PACK_METADATA_MIN_ROWS: usize = 16_384;
-
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct SparseBinaryMatrix {
@@ -244,17 +242,19 @@ impl BinaryMatrix for SparseBinaryMatrix {
         height: usize,
     ) -> (PackedBinaryRows, Vec<u32>, Vec<Option<usize>>) {
         assert!(height <= self.rows.len());
+        if !self.rows_normalized {
+            return PackedBinaryRows::from_sparse_entries_with_row_weights_and_first_ones(
+                self.width,
+                &self.rows[..height],
+            );
+        }
+
         let mut packed = PackedBinaryRows::new(height, self.width);
         let mut row_weights = Vec::with_capacity(height);
         let mut first_ones = Vec::with_capacity(height);
         for (row, entries) in self.rows[..height].iter().enumerate() {
             row_weights.push(entries.len() as u32);
-            let mut first_one = entries.first().copied();
-            for &col in entries {
-                if !self.rows_normalized && first_one.is_some_and(|first| col < first) {
-                    first_one = Some(col);
-                }
-            }
+            let first_one = entries.first().copied();
             packed.set_entries(row, entries);
             first_ones.push(first_one);
         }
@@ -280,7 +280,7 @@ impl BinaryMatrix for SparseBinaryMatrix {
     fn packed_rows_with_row_weights_and_first_ones(
         &self,
     ) -> (PackedBinaryRows, Vec<u32>, Vec<Option<usize>>) {
-        if !self.rows_normalized && self.rows.len() >= PARALLEL_PACK_METADATA_MIN_ROWS {
+        if !self.rows_normalized {
             return PackedBinaryRows::from_sparse_entries_with_row_weights_and_first_ones(
                 self.width, &self.rows,
             );
@@ -291,12 +291,7 @@ impl BinaryMatrix for SparseBinaryMatrix {
         let mut first_ones = Vec::with_capacity(self.rows.len());
         for (row, entries) in self.rows.iter().enumerate() {
             row_weights.push(entries.len() as u32);
-            let mut first_one = entries.first().copied();
-            for &col in entries {
-                if !self.rows_normalized && first_one.is_some_and(|first| col < first) {
-                    first_one = Some(col);
-                }
-            }
+            let first_one = entries.first().copied();
             packed.set_entries(row, entries);
             first_ones.push(first_one);
         }

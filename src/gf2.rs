@@ -14,13 +14,6 @@ use core::arch::x86_64::{
 use crate::matrix::BinaryMatrix;
 
 const WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS: usize = 256;
-#[cfg(feature = "std")]
-const PARALLEL_SPARSE_PACK_MIN_ROWS: usize = 16_384;
-#[cfg(feature = "std")]
-const PARALLEL_SPARSE_PACK_ROWS_PER_THREAD: usize = 4_096;
-#[cfg(feature = "std")]
-const PARALLEL_SPARSE_PACK_MAX_THREADS: usize = 4;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedBinaryRows {
     height: usize,
@@ -72,48 +65,6 @@ impl PackedBinaryRows {
         let mut packed = PackedBinaryRows::new(height, width);
         let mut row_weights = vec![0; height];
         let mut first_ones = vec![None; height];
-
-        #[cfg(feature = "std")]
-        if height >= PARALLEL_SPARSE_PACK_MIN_ROWS {
-            let available_threads = std::thread::available_parallelism()
-                .map(usize::from)
-                .unwrap_or(1);
-            let thread_count = available_threads
-                .min(PARALLEL_SPARSE_PACK_MAX_THREADS)
-                .min(height.div_ceil(PARALLEL_SPARSE_PACK_ROWS_PER_THREAD));
-            if thread_count > 1 {
-                let rows_per_chunk = height.div_ceil(thread_count);
-                std::thread::scope(|scope| {
-                    let mut remaining_words = packed.words.as_mut_slice();
-                    let mut remaining_weights = row_weights.as_mut_slice();
-                    let mut remaining_first_ones = first_ones.as_mut_slice();
-                    for row_chunk in rows.chunks(rows_per_chunk) {
-                        let chunk_rows = row_chunk.len();
-                        let (word_chunk, next_words) =
-                            remaining_words.split_at_mut(chunk_rows * packed.words_per_row);
-                        remaining_words = next_words;
-                        let (weight_chunk, next_weights) =
-                            remaining_weights.split_at_mut(chunk_rows);
-                        remaining_weights = next_weights;
-                        let (first_one_chunk, next_first_ones) =
-                            remaining_first_ones.split_at_mut(chunk_rows);
-                        remaining_first_ones = next_first_ones;
-                        let words_per_row = packed.words_per_row;
-                        scope.spawn(move || {
-                            fill_sparse_entry_metadata_chunk(
-                                width,
-                                words_per_row,
-                                row_chunk,
-                                word_chunk,
-                                weight_chunk,
-                                first_one_chunk,
-                            );
-                        });
-                    }
-                });
-                return (packed, row_weights, first_ones);
-            }
-        }
 
         fill_sparse_entry_metadata_chunk(
             width,
@@ -683,9 +634,10 @@ impl PackedBinaryRows {
     pub(crate) fn set_entries(&mut self, row: usize, cols: &[usize]) {
         assert!(row < self.height);
         let row_start = self.row_start(row);
+        let row_words = &mut self.words[row_start..row_start + self.words_per_row];
         for &col in cols {
             debug_assert!(col < self.width);
-            self.words[row_start + col / u64::BITS as usize] |= bit_mask(col);
+            row_words[col / u64::BITS as usize] |= bit_mask(col);
         }
     }
 
@@ -714,18 +666,17 @@ fn fill_sparse_entry_metadata_chunk(
     for (row, entries) in rows.iter().enumerate() {
         row_weights[row] = entries.len() as u32;
         let row_words = &mut words[row * words_per_row..(row + 1) * words_per_row];
-        let mut first_one = None;
+        let mut first_one = width;
         for &col in entries {
             debug_assert!(col < width);
-            if first_one.is_none_or(|first| col < first) {
-                first_one = Some(col);
-            }
+            first_one = first_one.min(col);
             row_words[col / u64::BITS as usize] |= bit_mask(col);
         }
-        first_ones[row] = first_one;
+        first_ones[row] = (first_one != width).then_some(first_one);
     }
 }
 
+#[inline]
 fn bit_mask(col: usize) -> u64 {
     1u64 << (col % u64::BITS as usize)
 }
@@ -913,31 +864,31 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn large_sparse_entries_pack_with_metadata() {
-        let mut rows = vec![Vec::new(); PARALLEL_SPARSE_PACK_MIN_ROWS];
+        const LARGE_ROWS: usize = 16_384;
+        const MIDDLE_ROW: usize = 4_097;
+
+        let mut rows = vec![Vec::new(); LARGE_ROWS];
         rows[0] = vec![70, 3];
-        rows[PARALLEL_SPARSE_PACK_ROWS_PER_THREAD + 1] = vec![128, 1, 256];
-        rows[PARALLEL_SPARSE_PACK_MIN_ROWS - 1] = vec![200];
+        rows[MIDDLE_ROW] = vec![128, 1, 256];
+        rows[LARGE_ROWS - 1] = vec![200];
 
         let (packed, row_weights, first_ones) =
             PackedBinaryRows::from_sparse_entries_with_row_weights_and_first_ones(257, &rows);
 
-        assert_eq!(packed.height(), PARALLEL_SPARSE_PACK_MIN_ROWS);
+        assert_eq!(packed.height(), LARGE_ROWS);
         assert_eq!(packed.width(), 257);
         assert_eq!(row_weights[0], 2);
         assert_eq!(first_ones[0], Some(3));
         assert!(packed.contains(0, 3));
         assert!(packed.contains(0, 70));
-        assert_eq!(row_weights[PARALLEL_SPARSE_PACK_ROWS_PER_THREAD + 1], 3);
-        assert_eq!(
-            first_ones[PARALLEL_SPARSE_PACK_ROWS_PER_THREAD + 1],
-            Some(1)
-        );
-        assert!(packed.contains(PARALLEL_SPARSE_PACK_ROWS_PER_THREAD + 1, 1));
-        assert!(packed.contains(PARALLEL_SPARSE_PACK_ROWS_PER_THREAD + 1, 128));
-        assert!(packed.contains(PARALLEL_SPARSE_PACK_ROWS_PER_THREAD + 1, 256));
-        assert_eq!(row_weights[PARALLEL_SPARSE_PACK_MIN_ROWS - 1], 1);
-        assert_eq!(first_ones[PARALLEL_SPARSE_PACK_MIN_ROWS - 1], Some(200));
-        assert!(packed.contains(PARALLEL_SPARSE_PACK_MIN_ROWS - 1, 200));
+        assert_eq!(row_weights[MIDDLE_ROW], 3);
+        assert_eq!(first_ones[MIDDLE_ROW], Some(1));
+        assert!(packed.contains(MIDDLE_ROW, 1));
+        assert!(packed.contains(MIDDLE_ROW, 128));
+        assert!(packed.contains(MIDDLE_ROW, 256));
+        assert_eq!(row_weights[LARGE_ROWS - 1], 1);
+        assert_eq!(first_ones[LARGE_ROWS - 1], Some(200));
+        assert!(packed.contains(LARGE_ROWS - 1, 200));
     }
 
     #[test]
