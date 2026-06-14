@@ -93,6 +93,7 @@ const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 4_096;
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
 const OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH: usize = 10_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 40_000;
+const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 4_096;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 #[cfg(all(test, feature = "std"))]
@@ -3364,6 +3365,14 @@ fn verify_no_hdpc_solution(decoded: SymbolSlab, source_block_symbols: u32) -> Op
 }
 
 fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bool {
+    if hdpc_rows.width() >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH && hdpc_rows.height() > 1 {
+        return hdpc_rows_satisfied_column_major(decoded, hdpc_rows);
+    }
+
+    hdpc_rows_satisfied_row_major(decoded, hdpc_rows)
+}
+
+fn hdpc_rows_satisfied_row_major(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bool {
     let mut check = vec![0u8; decoded.symbol_size()];
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(decoded.symbol_size());
     for row in 0..hdpc_rows.height() {
@@ -3378,6 +3387,29 @@ fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bo
         }
     }
     true
+}
+
+fn hdpc_rows_satisfied_column_major(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bool {
+    let symbol_size = decoded.symbol_size();
+    let h = hdpc_rows.height();
+    let coefficients = dense_hdpc_coefficient_values_column_major(hdpc_rows);
+    let mut checks = vec![0u8; h * symbol_size];
+    let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
+
+    for col in 0..hdpc_rows.width() {
+        let coefficients = &coefficients[col * h..(col + 1) * h];
+        unsafe {
+            fused_mul_path.apply_column_coefficients(
+                checks.as_mut_ptr(),
+                symbol_size,
+                decoded.get(col).as_ptr(),
+                coefficients,
+                symbol_size,
+            );
+        }
+    }
+
+    checks.chunks_exact(symbol_size).all(bytes_are_zero)
 }
 
 // Repair systems with at least L rows can often be reduced mostly over GF(2).
@@ -3934,7 +3966,6 @@ fn dense_hdpc_coefficients(matrix: &DenseOctetMatrix) -> Vec<Octet> {
     matrix.as_slice().to_vec()
 }
 
-#[cfg(feature = "std")]
 fn dense_hdpc_coefficient_values_column_major(matrix: &DenseOctetMatrix) -> Vec<u8> {
     let mut coefficients = vec![0u8; matrix.width() * matrix.height()];
     for row in 0..matrix.height() {
@@ -6702,6 +6733,41 @@ impl<M: BinaryMatrix> IntermediateSymbolDecoder<M> {
 #[cfg(test)]
 mod recording_tests {
     use super::*;
+
+    #[test]
+    fn column_major_hdpc_verification_matches_row_major() {
+        let mut hdpc_rows = DenseOctetMatrix::new(3, 4);
+        hdpc_rows.row_mut(0).copy_from_slice(&[
+            Octet::new(2),
+            Octet::zero(),
+            Octet::new(9),
+            Octet::one(),
+        ]);
+        hdpc_rows.row_mut(1).copy_from_slice(&[
+            Octet::zero(),
+            Octet::new(7),
+            Octet::new(11),
+            Octet::new(5),
+        ]);
+        hdpc_rows.row_mut(2).copy_from_slice(&[
+            Octet::new(3),
+            Octet::one(),
+            Octet::zero(),
+            Octet::new(13),
+        ]);
+
+        let decoded =
+            SymbolSlab::from_bytes(vec![0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87], 2);
+
+        assert_eq!(
+            hdpc_rows_satisfied_column_major(&decoded, &hdpc_rows),
+            hdpc_rows_satisfied_row_major(&decoded, &hdpc_rows)
+        );
+        assert!(!hdpc_rows_satisfied_column_major(&decoded, &hdpc_rows));
+
+        let zero_decoded = SymbolSlab::with_zeros(4, 2);
+        assert!(hdpc_rows_satisfied_column_major(&zero_decoded, &hdpc_rows));
+    }
 
     #[test]
     fn operation_recording_solver_records_for_supported_width() {
