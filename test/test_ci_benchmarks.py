@@ -21,7 +21,7 @@ ENCODE_DEFAULT_SYMBOL_COUNTS = (
     20000,
     50000,
 )
-DECODE_DEFAULT_SYMBOL_COUNTS = (10, 100, 250, 500, 1000)
+DECODE_DEFAULT_SYMBOL_COUNTS = ENCODE_DEFAULT_SYMBOL_COUNTS
 CI_SYMBOL_COUNTS = (10, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000)
 CI_DECODE_5_PERCENT_SYMBOL_COUNTS = CI_SYMBOL_COUNTS
 EXPECTED_CUSTOM_THROUGHPUT_ROWS = (
@@ -129,7 +129,7 @@ class CiBenchmarkTests(unittest.TestCase):
         self.assertEqual(counts[-2:], (20000, 50000))
         self.assertEqual(counts, ENCODE_DEFAULT_SYMBOL_COUNTS)
         self.assertEqual(CI_DECODE_5_PERCENT_SYMBOL_COUNTS, counts)
-        self.assertEqual(DECODE_DEFAULT_SYMBOL_COUNTS, counts[:5])
+        self.assertEqual(DECODE_DEFAULT_SYMBOL_COUNTS, counts)
 
     def test_ci_benchmark_sources_use_shared_symbol_counts(self):
         encode_source = read_bench_source("encode_benchmark.rs")
@@ -166,7 +166,7 @@ class CiBenchmarkTests(unittest.TestCase):
             "8 * 1024 * 1024",
         )
 
-    def test_decode_benchmark_keeps_default_repair_only_counts_bounded(self):
+    def test_decode_benchmark_uses_full_default_repair_only_counts(self):
         source = read_bench_source("decode_benchmark.rs")
 
         self.assertEqual(
