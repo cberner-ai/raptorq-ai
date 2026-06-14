@@ -229,6 +229,47 @@ impl FusedAddAssignMulScalarFastPath {
         let table = scalar.mul_table();
         fused_addassign_table(dest, src, table);
     }
+
+    /// Applies one source slice into a strided set of destination slices, using one coefficient
+    /// per destination.
+    ///
+    /// # Safety
+    ///
+    /// `dests` must point to `coefficients.len()` writable slices of `len` bytes separated by
+    /// `dest_stride`. Each destination slice must be disjoint from every other destination and
+    /// from `src`, and `src` must be valid for `len` bytes.
+    pub(crate) unsafe fn apply_column_coefficients(
+        self,
+        dests: *mut u8,
+        dest_stride: usize,
+        src: *const u8,
+        coefficients: &[u8],
+        len: usize,
+    ) {
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_avx2 {
+            unsafe {
+                fused_addassign_mul_column_coefficients_avx2(
+                    dests,
+                    dest_stride,
+                    src,
+                    coefficients,
+                    len,
+                );
+            }
+            return;
+        }
+
+        unsafe {
+            fused_addassign_mul_column_coefficients_scalar(
+                dests,
+                dest_stride,
+                src,
+                coefficients,
+                len,
+            );
+        }
+    }
 }
 
 pub fn add_assign(dest: &mut [u8], src: &[u8]) {
@@ -422,6 +463,148 @@ unsafe fn fused_addassign_mul_scalar_avx2(dest: &mut [u8], src: &[u8], scalar: u
         let table = Octet::new(scalar).mul_table();
         for (d, s) in dest[offset..].iter_mut().zip(src[offset..].iter()) {
             *d ^= table[*s as usize];
+        }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+const COLUMN_COEFFICIENT_AVX2_STACK_MAX: usize = 64;
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn fused_addassign_mul_column_coefficients_avx2(
+    dests: *mut u8,
+    dest_stride: usize,
+    src: *const u8,
+    coefficients: &[u8],
+    len: usize,
+) {
+    if coefficients.len() > COLUMN_COEFFICIENT_AVX2_STACK_MAX {
+        unsafe {
+            fused_addassign_mul_column_coefficients_scalar(
+                dests,
+                dest_stride,
+                src,
+                coefficients,
+                len,
+            );
+        }
+        return;
+    }
+
+    let zero = _mm256_setzero_si256();
+    let mut rows = [0usize; COLUMN_COEFFICIENT_AVX2_STACK_MAX];
+    let mut low_tables = [zero; COLUMN_COEFFICIENT_AVX2_STACK_MAX];
+    let mut high_tables = [zero; COLUMN_COEFFICIENT_AVX2_STACK_MAX];
+    let mut table_count = 0usize;
+    for (row, &coefficient) in coefficients.iter().enumerate() {
+        if coefficient == 0 {
+            continue;
+        }
+        rows[table_count] = row;
+        low_tables[table_count] = avx2_low_nibble_table(coefficient);
+        high_tables[table_count] = avx2_high_nibble_table(coefficient);
+        table_count += 1;
+    }
+
+    let mask = _mm256_set1_epi8(0x0f);
+    let tables = ColumnCoefficientAvx2Tables {
+        rows: &rows[..table_count],
+        low_tables: &low_tables[..table_count],
+        high_tables: &high_tables[..table_count],
+        mask,
+    };
+    let mut offset = 0usize;
+
+    while offset + 128 <= len {
+        unsafe {
+            fused_addassign_mul_column_coefficients_32(dests, dest_stride, src, &tables, offset);
+            fused_addassign_mul_column_coefficients_32(
+                dests,
+                dest_stride,
+                src,
+                &tables,
+                offset + 32,
+            );
+            fused_addassign_mul_column_coefficients_32(
+                dests,
+                dest_stride,
+                src,
+                &tables,
+                offset + 64,
+            );
+            fused_addassign_mul_column_coefficients_32(
+                dests,
+                dest_stride,
+                src,
+                &tables,
+                offset + 96,
+            );
+        }
+        offset += 128;
+    }
+    while offset + 32 <= len {
+        unsafe {
+            fused_addassign_mul_column_coefficients_32(dests, dest_stride, src, &tables, offset);
+        }
+        offset += 32;
+    }
+
+    if offset < len {
+        unsafe {
+            fused_addassign_mul_column_coefficients_tail(
+                dests,
+                dest_stride,
+                src.add(offset),
+                coefficients,
+                len - offset,
+                offset,
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+struct ColumnCoefficientAvx2Tables<'a> {
+    rows: &'a [usize],
+    low_tables: &'a [__m256i],
+    high_tables: &'a [__m256i],
+    mask: __m256i,
+}
+
+unsafe fn fused_addassign_mul_column_coefficients_scalar(
+    dests: *mut u8,
+    dest_stride: usize,
+    src: *const u8,
+    coefficients: &[u8],
+    len: usize,
+) {
+    unsafe {
+        fused_addassign_mul_column_coefficients_tail(dests, dest_stride, src, coefficients, len, 0);
+    }
+}
+
+unsafe fn fused_addassign_mul_column_coefficients_tail(
+    dests: *mut u8,
+    dest_stride: usize,
+    src: *const u8,
+    coefficients: &[u8],
+    len: usize,
+    dest_offset: usize,
+) {
+    let src = unsafe { core::slice::from_raw_parts(src, len) };
+    for (row, &coefficient) in coefficients.iter().enumerate() {
+        if coefficient == 0 {
+            continue;
+        }
+        let dest = unsafe {
+            core::slice::from_raw_parts_mut(dests.add(row * dest_stride + dest_offset), len)
+        };
+        if coefficient == 1 {
+            add_assign_scalar(dest, src);
+        } else {
+            let table = Octet::new(coefficient).mul_table();
+            fused_addassign_table(dest, src, table);
         }
     }
 }
@@ -749,6 +932,32 @@ unsafe fn fused_addassign_mul_32(
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn fused_addassign_mul_column_coefficients_32(
+    dests: *mut u8,
+    dest_stride: usize,
+    src: *const u8,
+    tables: &ColumnCoefficientAvx2Tables<'_>,
+    offset: usize,
+) {
+    let source = unsafe { _mm256_loadu_si256(src.add(offset).cast::<__m256i>()) };
+    for ((&row, &low_table), &high_table) in tables
+        .rows
+        .iter()
+        .zip(tables.low_tables.iter())
+        .zip(tables.high_tables.iter())
+    {
+        let product = gf256_mul_vector(source, low_table, high_table, tables.mask);
+        let dest = unsafe { dests.add(row * dest_stride + offset).cast::<__m256i>() };
+        let current = unsafe { _mm256_loadu_si256(dest.cast_const()) };
+        let next = _mm256_xor_si256(current, product);
+        unsafe {
+            _mm256_storeu_si256(dest, next);
+        }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 static AVX2_LOW_NIBBLE_TABLES: [[u8; 32]; 256] = generate_avx2_low_nibble_tables();
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -890,6 +1099,50 @@ mod tests {
                 FusedAddAssignMulScalarFastPath::new(len).apply(&mut fast_path_dest, &src, &octet);
                 assert_eq!(fast_path_dest, expected);
             }
+        }
+    }
+
+    #[test]
+    fn fused_column_coefficients_match_scalar_tables() {
+        for len in [0usize, 1, 31, 32, 33, 64, 79] {
+            let src = patterned_bytes(len)
+                .into_iter()
+                .map(|byte| byte.rotate_left(2) ^ 0x39)
+                .collect::<Vec<_>>();
+            let coefficients = [0u8, 1, 2, 29, 255];
+            let mut dests = Vec::new();
+            let mut expected = Vec::new();
+
+            for (row, &coefficient) in coefficients.iter().enumerate() {
+                let original = patterned_bytes(len)
+                    .into_iter()
+                    .map(|byte| byte.wrapping_add(row as u8))
+                    .collect::<Vec<_>>();
+                let mut row_expected = original.clone();
+                if coefficient == 1 {
+                    for (dest, src) in row_expected.iter_mut().zip(src.iter()) {
+                        *dest ^= *src;
+                    }
+                } else if coefficient != 0 {
+                    let table = Octet::new(coefficient).mul_table();
+                    for (dest, src) in row_expected.iter_mut().zip(src.iter()) {
+                        *dest ^= table[*src as usize];
+                    }
+                }
+                dests.extend_from_slice(&original);
+                expected.extend_from_slice(&row_expected);
+            }
+
+            unsafe {
+                FusedAddAssignMulScalarFastPath::new(len).apply_column_coefficients(
+                    dests.as_mut_ptr(),
+                    len,
+                    src.as_ptr(),
+                    &coefficients,
+                    len,
+                );
+            }
+            assert_eq!(dests, expected);
         }
     }
 
