@@ -72,6 +72,8 @@ const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 10_000;
+#[cfg(feature = "std")]
+const DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 50_000;
 #[cfg(all(feature = "std", not(test)))]
 const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 1_024;
 #[cfg(all(feature = "std", test))]
@@ -1514,8 +1516,17 @@ fn prepare_direct_systematic_plan_for_decode<M: BinaryMatrix>(
         matrix,
         hdpc_rows,
         source_block_symbols,
-        DirectBackSubstitutionLayout::DestsBySource,
+        direct_decode_back_substitution_layout(matrix.width()),
     )
+}
+
+#[cfg(feature = "std")]
+fn direct_decode_back_substitution_layout(width: usize) -> DirectBackSubstitutionLayout {
+    if width >= DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH {
+        DirectBackSubstitutionLayout::SourcesByDest
+    } else {
+        DirectBackSubstitutionLayout::DestsBySource
+    }
 }
 
 #[cfg(feature = "std")]
@@ -3534,22 +3545,27 @@ fn try_overdetermined_no_hdpc_prefix_solve_owned<M: BinaryMatrix>(
     if prefix_height == matrix.height() {
         return OverdeterminedNoHdpcPrefixSolve::Fallback(symbols);
     }
-
     let symbol_size = symbols.symbol_size();
     let mut prefix_bytes = symbols.into_bytes();
     let suffix_bytes = prefix_bytes.split_off(prefix_height * symbol_size);
     let prefix_symbols = SymbolSlab::from_bytes(prefix_bytes, symbol_size);
-    let (decoded, _) = if width >= OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH {
-        let (prefix_rows, row_weights, first_ones) =
-            matrix.packed_row_prefix_with_row_weights_and_first_ones(prefix_height);
-        solve_binary_with_weighted_metadata(prefix_rows, prefix_symbols, row_weights, first_ones)
-    } else {
-        let prefix_rows = matrix.packed_row_prefix(prefix_height);
-        solve_binary(prefix_rows, prefix_symbols)
+    let (decoded, suffix_bytes) = match solve_full_rank_binary_prefix_owned(
+        matrix,
+        prefix_height,
+        prefix_symbols,
+        suffix_bytes,
+        symbol_size,
+    ) {
+        FullRankBinaryPrefixSolve::Decoded {
+            decoded,
+            suffix_bytes,
+        } => (decoded, suffix_bytes),
+        FullRankBinaryPrefixSolve::RankDeficient { restored_symbols } => {
+            return OverdeterminedNoHdpcPrefixSolve::Fallback(restored_symbols);
+        }
+        FullRankBinaryPrefixSolve::Failed => return OverdeterminedNoHdpcPrefixSolve::Failed,
     };
-    let Some(decoded) =
-        decoded.and_then(|decoded| verify_no_hdpc_solution(decoded, source_block_symbols))
-    else {
+    let Some(decoded) = verify_no_hdpc_solution(decoded, source_block_symbols) else {
         return OverdeterminedNoHdpcPrefixSolve::Failed;
     };
     let suffix_symbols = SymbolSlab::from_bytes(suffix_bytes, symbol_size);
@@ -3557,6 +3573,220 @@ fn try_overdetermined_no_hdpc_prefix_solve_owned<M: BinaryMatrix>(
         OverdeterminedNoHdpcPrefixSolve::Decoded(decoded)
     } else {
         OverdeterminedNoHdpcPrefixSolve::Failed
+    }
+}
+
+enum FullRankBinaryPrefixSolve {
+    Decoded {
+        decoded: SymbolSlab,
+        suffix_bytes: Vec<u8>,
+    },
+    RankDeficient {
+        restored_symbols: SymbolSlab,
+    },
+    Failed,
+}
+
+fn solve_full_rank_binary_prefix_owned<M: BinaryMatrix>(
+    matrix: &M,
+    prefix_height: usize,
+    mut symbols: SymbolSlab,
+    suffix_bytes: Vec<u8>,
+    symbol_size: usize,
+) -> FullRankBinaryPrefixSolve {
+    let width = matrix.width();
+    let use_weighted_buckets = width >= OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH;
+    let (mut rows, mut row_weights, first_ones) = if use_weighted_buckets {
+        matrix.packed_row_prefix_with_row_weights_and_first_ones(prefix_height)
+    } else {
+        let rows = matrix.packed_row_prefix(prefix_height);
+        let first_ones = (0..rows.height())
+            .map(|row| rows.first_one_at_or_after(row, 0))
+            .collect();
+        (rows, Vec::new(), first_ones)
+    };
+    let mut bucket_heads = vec![NO_BUCKET_ROW; width];
+    let mut small_weight_buckets = SmallWeightBinaryBuckets::<u16>::new(
+        if use_weighted_buckets { width } else { 0 },
+        DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+    );
+    let mut small_row_cache = SmallBinaryRowCache::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX>::new(
+        if use_weighted_buckets {
+            prefix_height
+        } else {
+            0
+        },
+    );
+    let mut next_in_bucket = vec![NO_BUCKET_ROW; prefix_height];
+    for (row, first_one) in first_ones.into_iter().enumerate() {
+        if let Some(col) = first_one {
+            if use_weighted_buckets {
+                push_weighted_binary_row_bucket(
+                    &row_weights,
+                    &mut bucket_heads,
+                    &mut small_weight_buckets,
+                    &mut next_in_bucket,
+                    col,
+                    row,
+                );
+            } else {
+                push_row_bucket(&mut bucket_heads, &mut next_in_bucket, col, row);
+            }
+        }
+    }
+
+    let mut pivot_for_col = vec![usize::MAX; width];
+    let mut is_pivot_row = vec![false; prefix_height];
+    let mut forward_ranges = Vec::with_capacity(width);
+    let mut forward_entries = Vec::with_capacity(width.saturating_mul(4));
+    let add_assign_path = AddAssignFastPath::new(symbol_size);
+    let batch_forward_symbols = width >= BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH;
+    let mut forward_symbol_dests = Vec::new();
+    for col in 0..width {
+        let pivot = if use_weighted_buckets {
+            pop_lightest_weighted_binary_row_bucket(
+                &row_weights,
+                &mut bucket_heads,
+                &mut small_weight_buckets,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
+            pop_lightest_binary_row_bucket(&rows, &mut bucket_heads, &mut next_in_bucket, col)
+        };
+        let Some(pivot) = pivot else {
+            restore_binary_forward_symbols(
+                &mut symbols,
+                &pivot_for_col,
+                &forward_ranges,
+                &forward_entries,
+                add_assign_path,
+            );
+            let mut bytes = symbols.into_bytes();
+            bytes.extend_from_slice(&suffix_bytes);
+            return FullRankBinaryPrefixSolve::RankDeficient {
+                restored_symbols: SymbolSlab::from_bytes(bytes, symbol_size),
+            };
+        };
+        pivot_for_col[col] = pivot;
+        is_pivot_row[pivot] = true;
+        let pivot_weight = if use_weighted_buckets {
+            row_weights[pivot]
+        } else {
+            0
+        };
+
+        let dest_start = forward_entries.len();
+        if batch_forward_symbols {
+            forward_symbol_dests.clear();
+        }
+        while let Some(row) = if use_weighted_buckets {
+            pop_weighted_binary_row_bucket(
+                &mut bucket_heads,
+                &mut small_weight_buckets,
+                &mut next_in_bucket,
+                col,
+            )
+        } else {
+            pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
+        } {
+            if use_weighted_buckets {
+                let next_col = eliminate_weighted_binary_row::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX>(
+                    &mut rows,
+                    &mut row_weights,
+                    &mut small_row_cache,
+                    row,
+                    pivot,
+                    col,
+                    pivot_weight,
+                );
+                if let Some(next_col) = next_col {
+                    push_weighted_binary_row_bucket(
+                        &row_weights,
+                        &mut bucket_heads,
+                        &mut small_weight_buckets,
+                        &mut next_in_bucket,
+                        next_col,
+                        row,
+                    );
+                }
+            } else {
+                rows.xor_suffix(row, pivot, col);
+                if let Some(next_col) = rows.first_one_at_or_after(row, col + 1) {
+                    push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
+                }
+            }
+            forward_entries.push(coefficient_col(row));
+            if batch_forward_symbols {
+                forward_symbol_dests.push(row);
+            } else {
+                let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot, row);
+                add_assign_path.apply(dest_symbol, pivot_symbol);
+            }
+        }
+        if batch_forward_symbols {
+            addassign_symbol_row_batch::<true>(
+                &mut symbols,
+                pivot,
+                &forward_symbol_dests,
+                add_assign_path,
+            );
+        }
+        forward_ranges.push((dest_start, forward_entries.len()));
+    }
+
+    for (row, is_pivot) in is_pivot_row.into_iter().enumerate() {
+        if !is_pivot && (!rows.is_zero(row) || !symbol_is_zero(symbols.get(row))) {
+            return FullRankBinaryPrefixSolve::Failed;
+        }
+    }
+
+    let mut decoded = SymbolSlab::with_zeros(width, symbol_size);
+    for col in (0..width).rev() {
+        let pivot = pivot_for_col[col];
+        decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
+        if width >= BINARY_SOURCE_BATCH_16_MIN_WIDTH && rows.height() == width {
+            addassign_packed_row_sources_to_symbol::<16>(
+                &rows,
+                pivot,
+                col + 1,
+                &mut decoded,
+                col,
+                add_assign_path,
+            );
+        } else {
+            addassign_packed_row_sources_to_symbol::<8>(
+                &rows,
+                pivot,
+                col + 1,
+                &mut decoded,
+                col,
+                add_assign_path,
+            );
+        }
+    }
+
+    FullRankBinaryPrefixSolve::Decoded {
+        decoded,
+        suffix_bytes,
+    }
+}
+
+fn restore_binary_forward_symbols(
+    symbols: &mut SymbolSlab,
+    pivot_for_col: &[usize],
+    forward_ranges: &[(usize, usize)],
+    forward_entries: &[CoefficientColumn],
+    add_assign_path: AddAssignFastPath,
+) {
+    for col in (0..forward_ranges.len()).rev() {
+        let pivot = pivot_for_col[col];
+        let (start, end) = forward_ranges[col];
+        for &row in forward_entries[start..end].iter().rev() {
+            let row = coefficient_col_index(row);
+            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot, row);
+            add_assign_path.apply(dest_symbol, pivot_symbol);
+        }
     }
 }
 
@@ -7379,6 +7609,55 @@ mod tests {
     }
 
     #[test]
+    fn sources_by_dest_direct_back_substitution_replays_nonzero_chain() {
+        let plan = DirectSystematicPlan {
+            forward_steps: Vec::new(),
+            forward_dests: DirectSystematicSlices {
+                ranges: Vec::new(),
+                entries: Vec::new(),
+            },
+            hdpc_update_pivots: Vec::new().into_boxed_slice(),
+            hdpc_updates: CachedSystematicSlices {
+                ranges: Vec::new(),
+                entries: Vec::new(),
+                unit_only: Vec::new(),
+            },
+            hdpc_free_rows: Vec::new(),
+            free_cols: Vec::new().into_boxed_slice(),
+            pivot_symbol_moves: Vec::new(),
+            back_substitution: DirectSystematicBackSubstitution::SourcesByDest(
+                DirectSystematicSlices {
+                    ranges: vec![(0, 2), (2, 3), (3, 4), (4, 4)],
+                    entries: vec![
+                        coefficient_col(1),
+                        coefficient_col(3),
+                        coefficient_col(2),
+                        coefficient_col(3),
+                    ],
+                },
+            ),
+            width: 4,
+            s: 0,
+            h: 0,
+        };
+        let mut symbols = SymbolSlab::from_bytes(
+            vec![
+                0x10, 0x11, 0x12, 0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x80, 0x81, 0x82,
+            ],
+            3,
+        );
+
+        apply_prepared_direct_systematic_plan(&plan, &mut symbols);
+
+        assert_eq!(
+            symbols.as_bytes(),
+            &[
+                0x70, 0x71, 0x72, 0xe0, 0xe1, 0xe2, 0xc0, 0xc0, 0xc0, 0x80, 0x81, 0x82
+            ]
+        );
+    }
+
+    #[test]
     fn non_singleton_bucket_preserves_unit_tie_break_at_min_suffix() {
         let rows = vec![
             vec![
@@ -7898,6 +8177,24 @@ mod tests {
             self.rows.clone()
         }
 
+        fn packed_row_prefix(&self, height: usize) -> PackedBinaryRows {
+            packed_prefix_rows(&self.rows, height)
+        }
+
+        fn packed_row_prefix_with_row_weights_and_first_ones(
+            &self,
+            height: usize,
+        ) -> (PackedBinaryRows, Vec<u32>, Vec<Option<usize>>) {
+            let rows = packed_prefix_rows(&self.rows, height);
+            let row_weights = (0..rows.height())
+                .map(|row| rows.weight_at_or_after(row, 0))
+                .collect();
+            let first_ones = (0..rows.height())
+                .map(|row| rows.first_one_at_or_after(row, 0))
+                .collect();
+            (rows, row_weights, first_ones)
+        }
+
         fn packed_rows_with_first_ones(&self) -> (PackedBinaryRows, Vec<Option<usize>>) {
             let rows = self.rows.clone();
             let first_ones = (0..rows.height())
@@ -7925,6 +8222,15 @@ mod tests {
         {
             assert!(row < self.height());
         }
+    }
+
+    fn packed_prefix_rows(rows: &PackedBinaryRows, height: usize) -> PackedBinaryRows {
+        assert!(height <= rows.height());
+        let mut prefix = PackedBinaryRows::new(height, rows.width());
+        for row in 0..height {
+            rows.visit_ones_at_or_after(row, 0, |col| prefix.set(row, col));
+        }
+        prefix
     }
 
     fn packed_identity_with_duplicate_row(width: usize) -> PackedBinaryRows {
@@ -8281,6 +8587,22 @@ mod tests {
     }
 
     #[test]
+    fn source_batched_decode_plan_is_limited_to_very_large_widths() {
+        assert!(matches!(
+            direct_decode_back_substitution_layout(
+                DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH - 1
+            ),
+            DirectBackSubstitutionLayout::DestsBySource
+        ));
+        assert!(matches!(
+            direct_decode_back_substitution_layout(
+                DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
+            ),
+            DirectBackSubstitutionLayout::SourcesByDest
+        ));
+    }
+
+    #[test]
     fn systematic_plan_cache_insert_evicts_old_entries() {
         let mut cache = SystematicPlanCache::default();
 
@@ -8588,6 +8910,88 @@ mod tests {
 
         assert_eq!(owned_decoded, SymbolSlab::with_zeros(width, 1));
         assert_eq!(decoded, SymbolSlab::with_zeros(width, 1));
+    }
+
+    #[test]
+    fn overdetermined_no_hdpc_prefix_falls_back_when_suffix_rows_complete_rank() {
+        let source_symbols = 1;
+        let width = 4;
+        let h = num_hdpc_symbols(source_symbols) as usize;
+        let prefix_height = width + h;
+        let mut matrix = DenseBinaryMatrix::new(prefix_height + 1, width);
+        matrix.set(0, 0, true);
+        matrix.set(0, 1, true);
+        matrix.set(1, 0, true);
+        matrix.set(2, 2, true);
+        matrix.set(prefix_height, width - 1, true);
+        let expected = [0x11, 0x22, 0x33, 0x44];
+        let mut symbols = SymbolSlab::with_zeros(matrix.height(), 1);
+        symbols.get_mut(0)[0] = expected[0] ^ expected[1];
+        symbols.get_mut(1)[0] = expected[0];
+        symbols.get_mut(2)[0] = expected[2];
+        symbols.get_mut(prefix_height)[0] = expected[3];
+
+        let returned_symbols = match try_overdetermined_no_hdpc_prefix_solve_owned(
+            &matrix,
+            symbols.clone(),
+            source_symbols,
+        ) {
+            OverdeterminedNoHdpcPrefixSolve::Decoded(_) => {
+                panic!("rank-deficient prefix should not decode")
+            }
+            OverdeterminedNoHdpcPrefixSolve::Fallback(returned_symbols) => returned_symbols,
+            OverdeterminedNoHdpcPrefixSolve::Failed => {
+                panic!("rank-deficient prefix should fall back")
+            }
+        };
+
+        assert_eq!(returned_symbols, symbols);
+        let (decoded, ops) =
+            fused_inverse_mul_symbols_no_hdpc(matrix, returned_symbols, source_symbols);
+
+        assert_eq!(decoded.unwrap().as_bytes(), expected.as_slice());
+        assert!(ops.is_none());
+    }
+
+    #[test]
+    fn public_no_hdpc_decode_restores_owned_prefix_before_suffix_rank_fallback() {
+        let source_symbols = 1;
+        let width = OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH;
+        let h = num_hdpc_symbols(source_symbols) as usize;
+        let prefix_height = width + h;
+        let mut rows = PackedBinaryRows::new(prefix_height + 1, width);
+        rows.set(0, 0);
+        rows.set(0, 1);
+        rows.set(1, 0);
+        for col in 2..width - 1 {
+            rows.set(col, col);
+        }
+        rows.set(prefix_height, width - 1);
+        let matrix = PackedOnlyMatrix::new(rows);
+
+        let symbol_size = 2;
+        let col0 = [0x11, 0x22];
+        let col1 = [0x33, 0x44];
+        let col2 = [0x55, 0x66];
+        let last = [0x77, 0x88];
+        let mut expected = SymbolSlab::with_zeros(width, symbol_size);
+        expected.get_mut(0).copy_from_slice(&col0);
+        expected.get_mut(1).copy_from_slice(&col1);
+        expected.get_mut(2).copy_from_slice(&col2);
+        expected.get_mut(width - 1).copy_from_slice(&last);
+
+        let mut symbols = SymbolSlab::with_zeros(prefix_height + 1, symbol_size);
+        symbols
+            .get_mut(0)
+            .copy_from_slice(&[col0[0] ^ col1[0], col0[1] ^ col1[1]]);
+        symbols.get_mut(1).copy_from_slice(&col0);
+        symbols.get_mut(2).copy_from_slice(&col2);
+        symbols.get_mut(prefix_height).copy_from_slice(&last);
+
+        let (decoded, ops) = fused_inverse_mul_symbols_no_hdpc(matrix, symbols, source_symbols);
+
+        assert_eq!(decoded.unwrap(), expected);
+        assert!(ops.is_none());
     }
 
     #[test]
