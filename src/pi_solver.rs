@@ -47,6 +47,7 @@ const SPARSE_SOURCE_MERGE_DEST_FACTOR: usize = 3;
 const SPARSE_SOURCE_MERGE_MAX_SOURCE_LEN: usize = 512;
 const SPARSE_SOURCE_LINEAR_SCAN_LIMIT: usize = 24;
 const SHORT_ROW_LINEAR_SCAN_LIMIT: usize = 8;
+const BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH: usize = 512;
 const TRIANGULAR_RECORDING_MIN_WIDTH: usize = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
 const HYBRID_MAX_WIDTH: usize = u16::MAX as usize;
 const SQUARE_HYBRID_MAX_WIDTH: usize = HYBRID_MAX_WIDTH;
@@ -2453,6 +2454,110 @@ fn addassign_direct_symbol_batch_impl<const CHECK_ZERO_SOURCE: bool>(
             let dest_symbol =
                 core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
             add_assign_path.apply_same_len(dest_symbol, src_symbol);
+        }
+    }
+}
+
+fn addassign_symbol_row_batch<const CHECK_ZERO_SOURCE: bool>(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    dests: &[usize],
+    add_assign_path: AddAssignFastPath,
+) {
+    if dests.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let bytes = symbols.as_mut_bytes();
+    let src_start = src * symbol_size;
+    assert!(src_start + symbol_size <= bytes.len());
+    let src_ptr = unsafe { bytes.as_ptr().add(src_start) };
+    let src_symbol = unsafe { core::slice::from_raw_parts(src_ptr, symbol_size) };
+    if CHECK_ZERO_SOURCE && bytes_are_zero(src_symbol) {
+        return;
+    }
+    let bytes_ptr = bytes.as_mut_ptr();
+
+    let mut dest_chunks = dests.chunks_exact(8);
+    for chunk in dest_chunks.by_ref() {
+        assert_symbol_row_batch_dests(src, chunk);
+        let dest0_start = chunk[0] * symbol_size;
+        let dest1_start = chunk[1] * symbol_size;
+        let dest2_start = chunk[2] * symbol_size;
+        let dest3_start = chunk[3] * symbol_size;
+        let dest4_start = chunk[4] * symbol_size;
+        let dest5_start = chunk[5] * symbol_size;
+        let dest6_start = chunk[6] * symbol_size;
+        let dest7_start = chunk[7] * symbol_size;
+        assert!(dest0_start + symbol_size <= bytes.len());
+        assert!(dest1_start + symbol_size <= bytes.len());
+        assert!(dest2_start + symbol_size <= bytes.len());
+        assert!(dest3_start + symbol_size <= bytes.len());
+        assert!(dest4_start + symbol_size <= bytes.len());
+        assert!(dest5_start + symbol_size <= bytes.len());
+        assert!(dest6_start + symbol_size <= bytes.len());
+        assert!(dest7_start + symbol_size <= bytes.len());
+        unsafe {
+            add_assign_path.apply_same_len_raw_8(
+                [
+                    bytes_ptr.add(dest0_start),
+                    bytes_ptr.add(dest1_start),
+                    bytes_ptr.add(dest2_start),
+                    bytes_ptr.add(dest3_start),
+                    bytes_ptr.add(dest4_start),
+                    bytes_ptr.add(dest5_start),
+                    bytes_ptr.add(dest6_start),
+                    bytes_ptr.add(dest7_start),
+                ],
+                src_ptr,
+                symbol_size,
+            );
+        }
+    }
+
+    let mut dest_chunks = dest_chunks.remainder().chunks_exact(4);
+    for chunk in dest_chunks.by_ref() {
+        assert_symbol_row_batch_dests(src, chunk);
+        let dest0_start = chunk[0] * symbol_size;
+        let dest1_start = chunk[1] * symbol_size;
+        let dest2_start = chunk[2] * symbol_size;
+        let dest3_start = chunk[3] * symbol_size;
+        assert!(dest0_start + symbol_size <= bytes.len());
+        assert!(dest1_start + symbol_size <= bytes.len());
+        assert!(dest2_start + symbol_size <= bytes.len());
+        assert!(dest3_start + symbol_size <= bytes.len());
+        unsafe {
+            add_assign_path.apply_same_len_raw_4(
+                [
+                    bytes_ptr.add(dest0_start),
+                    bytes_ptr.add(dest1_start),
+                    bytes_ptr.add(dest2_start),
+                    bytes_ptr.add(dest3_start),
+                ],
+                src_ptr,
+                symbol_size,
+            );
+        }
+    }
+
+    for &dest in dest_chunks.remainder() {
+        assert_ne!(dest, src);
+        let dest_start = dest * symbol_size;
+        assert!(dest_start + symbol_size <= bytes.len());
+        unsafe {
+            let dest_symbol =
+                core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
+            add_assign_path.apply_same_len(dest_symbol, src_symbol);
+        }
+    }
+}
+
+fn assert_symbol_row_batch_dests(src: usize, dests: &[usize]) {
+    for (index, &dest) in dests.iter().enumerate() {
+        assert_ne!(dest, src);
+        for &other in &dests[..index] {
+            assert_ne!(dest, other);
         }
     }
 }
@@ -4968,6 +5073,7 @@ fn solve_binary_with_initial_metadata(
     }
 
     let add_assign_path = AddAssignFastPath::new(symbols.symbol_size());
+    let batch_forward_symbols = width >= BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH;
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut small_weight_buckets = SmallWeightBinaryBuckets::<u16>::new(
         if use_weighted_buckets { width } else { 0 },
@@ -4996,6 +5102,7 @@ fn solve_binary_with_initial_metadata(
 
     let mut pivot_for_col = vec![None; width];
     let mut is_pivot_row = vec![false; height];
+    let mut forward_symbol_dests = Vec::new();
 
     for col in 0..width {
         let pivot = if use_weighted_buckets {
@@ -5020,6 +5127,9 @@ fn solve_binary_with_initial_metadata(
             0
         };
 
+        if batch_forward_symbols {
+            forward_symbol_dests.clear();
+        }
         while let Some(row) = if use_weighted_buckets {
             pop_weighted_binary_row_bucket(
                 &mut bucket_heads,
@@ -5056,8 +5166,20 @@ fn solve_binary_with_initial_metadata(
                     push_row_bucket(&mut bucket_heads, &mut next_in_bucket, next_col, row);
                 }
             }
-            let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot, row);
-            add_assign_path.apply(dest_symbol, pivot_symbol);
+            if batch_forward_symbols {
+                forward_symbol_dests.push(row);
+            } else {
+                let (pivot_symbol, dest_symbol) = symbols.get_disjoint_mut(pivot, row);
+                add_assign_path.apply(dest_symbol, pivot_symbol);
+            }
+        }
+        if batch_forward_symbols {
+            addassign_symbol_row_batch::<true>(
+                &mut symbols,
+                pivot,
+                &forward_symbol_dests,
+                add_assign_path,
+            );
         }
     }
 
