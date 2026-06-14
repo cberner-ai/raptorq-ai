@@ -61,6 +61,10 @@ impl SymbolSlab {
         &mut self.bytes
     }
 
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
     pub fn get(&self, index: usize) -> &[u8] {
         let start = index * self.symbol_size;
         &self.bytes[start..start + self.symbol_size]
