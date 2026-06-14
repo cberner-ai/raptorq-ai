@@ -297,6 +297,19 @@ pub fn mulassign_scalar(dest: &mut [u8], scalar: &Octet) {
     }
 }
 
+pub(crate) fn mulassign_alpha(dest: &mut [u8]) {
+    if try_mulassign_alpha_avx2(dest) {
+        return;
+    }
+    for byte in dest {
+        let carry = *byte & 0x80;
+        *byte <<= 1;
+        if carry != 0 {
+            *byte ^= 0x1d;
+        }
+    }
+}
+
 pub fn fused_addassign_mul_scalar(dest: &mut [u8], src: &[u8], scalar: &Octet) {
     FusedAddAssignMulScalarFastPath::new(dest.len()).apply(dest, src, scalar);
 }
@@ -375,6 +388,23 @@ fn try_mulassign_scalar_avx2(_dest: &mut [u8], _scalar: &Octet) -> bool {
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+fn try_mulassign_alpha_avx2(dest: &mut [u8]) -> bool {
+    if dest.len() < 32 || !std::arch::is_x86_feature_detected!("avx2") {
+        return false;
+    }
+
+    unsafe {
+        mulassign_alpha_avx2(dest);
+    }
+    true
+}
+
+#[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
+fn try_mulassign_alpha_avx2(_dest: &mut [u8]) -> bool {
+    false
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 fn try_bytes_are_zero_avx2(bytes: &[u8]) -> Option<bool> {
     if bytes.len() < 64 || !std::arch::is_x86_feature_detected!("avx2") {
         return None;
@@ -390,15 +420,17 @@ fn try_bytes_are_zero_avx2(_bytes: &[u8]) -> Option<bool> {
 
 #[cfg(all(feature = "std", target_arch = "x86"))]
 use core::arch::x86::{
-    __m256i, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-    _mm256_or_si256, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8,
-    _mm256_srli_epi16, _mm256_storeu_si256, _mm256_xor_si256,
+    __m256i, _mm256_add_epi8, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
+    _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8,
+    _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_storeu_si256,
+    _mm256_xor_si256,
 };
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 use core::arch::x86_64::{
-    __m256i, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-    _mm256_or_si256, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8,
-    _mm256_srli_epi16, _mm256_storeu_si256, _mm256_xor_si256,
+    __m256i, _mm256_add_epi8, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
+    _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8,
+    _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_storeu_si256,
+    _mm256_xor_si256,
 };
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -430,6 +462,39 @@ unsafe fn mulassign_scalar_avx2(dest: &mut [u8], scalar: u8) {
         let table = Octet::new(scalar).mul_table();
         for byte in &mut dest[offset..] {
             *byte = table[*byte as usize];
+        }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn mulassign_alpha_avx2(dest: &mut [u8]) {
+    let zero = _mm256_setzero_si256();
+    let reduction = _mm256_set1_epi8(0x1d);
+    let mut offset = 0usize;
+    let vector_len = dest.len() / 32 * 32;
+
+    while offset + 128 <= vector_len {
+        unsafe {
+            mulassign_alpha_32(dest, offset, zero, reduction);
+            mulassign_alpha_32(dest, offset + 32, zero, reduction);
+            mulassign_alpha_32(dest, offset + 64, zero, reduction);
+            mulassign_alpha_32(dest, offset + 96, zero, reduction);
+        }
+        offset += 128;
+    }
+    while offset < vector_len {
+        unsafe {
+            mulassign_alpha_32(dest, offset, zero, reduction);
+        }
+        offset += 32;
+    }
+
+    for byte in &mut dest[offset..] {
+        let carry = *byte & 0x80;
+        *byte <<= 1;
+        if carry != 0 {
+            *byte ^= 0x1d;
         }
     }
 }
@@ -856,11 +921,20 @@ unsafe fn xor_8_32(dests: [*mut u8; 8], src: *const u8, offset: usize) {
 #[target_feature(enable = "avx2")]
 unsafe fn xor_sources_4_32(dest: *mut u8, srcs: [*const u8; 4], offset: usize) {
     let dest = unsafe { dest.add(offset).cast::<__m256i>() };
-    let mut updated = unsafe { _mm256_loadu_si256(dest.cast_const()) };
-    for src in srcs {
-        let source = unsafe { _mm256_loadu_si256(src.add(offset).cast::<__m256i>()) };
-        updated = _mm256_xor_si256(updated, source);
-    }
+    let source01 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[0].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[1].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source23 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[2].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[3].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source = _mm256_xor_si256(source01, source23);
+    let updated = unsafe { _mm256_xor_si256(_mm256_loadu_si256(dest.cast_const()), source) };
     unsafe {
         _mm256_storeu_si256(dest, updated);
     }
@@ -870,11 +944,30 @@ unsafe fn xor_sources_4_32(dest: *mut u8, srcs: [*const u8; 4], offset: usize) {
 #[target_feature(enable = "avx2")]
 unsafe fn xor_sources_8_32(dest: *mut u8, srcs: [*const u8; 8], offset: usize) {
     let dest = unsafe { dest.add(offset).cast::<__m256i>() };
-    let mut updated = unsafe { _mm256_loadu_si256(dest.cast_const()) };
-    for src in srcs {
-        let source = unsafe { _mm256_loadu_si256(src.add(offset).cast::<__m256i>()) };
-        updated = _mm256_xor_si256(updated, source);
-    }
+    let source0123 = unsafe {
+        let source01 = _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[0].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[1].add(offset).cast::<__m256i>()),
+        );
+        let source23 = _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[2].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[3].add(offset).cast::<__m256i>()),
+        );
+        _mm256_xor_si256(source01, source23)
+    };
+    let source4567 = unsafe {
+        let source45 = _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[4].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[5].add(offset).cast::<__m256i>()),
+        );
+        let source67 = _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[6].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[7].add(offset).cast::<__m256i>()),
+        );
+        _mm256_xor_si256(source45, source67)
+    };
+    let source = _mm256_xor_si256(source0123, source4567);
+    let updated = unsafe { _mm256_xor_si256(_mm256_loadu_si256(dest.cast_const()), source) };
     unsafe {
         _mm256_storeu_si256(dest, updated);
     }
@@ -884,11 +977,62 @@ unsafe fn xor_sources_8_32(dest: *mut u8, srcs: [*const u8; 8], offset: usize) {
 #[target_feature(enable = "avx2")]
 unsafe fn xor_sources_16_32(dest: *mut u8, srcs: [*const u8; 16], offset: usize) {
     let dest = unsafe { dest.add(offset).cast::<__m256i>() };
-    let mut updated = unsafe { _mm256_loadu_si256(dest.cast_const()) };
-    for src in srcs {
-        let source = unsafe { _mm256_loadu_si256(src.add(offset).cast::<__m256i>()) };
-        updated = _mm256_xor_si256(updated, source);
-    }
+    let source01 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[0].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[1].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source23 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[2].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[3].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source45 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[4].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[5].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source67 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[6].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[7].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source89 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[8].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[9].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source1011 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[10].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[11].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source1213 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[12].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[13].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source1415 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[14].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[15].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source03 = _mm256_xor_si256(source01, source23);
+    let source47 = _mm256_xor_si256(source45, source67);
+    let source811 = _mm256_xor_si256(source89, source1011);
+    let source1215 = _mm256_xor_si256(source1213, source1415);
+    let source07 = _mm256_xor_si256(source03, source47);
+    let source815 = _mm256_xor_si256(source811, source1215);
+    let source = _mm256_xor_si256(source07, source815);
+    let updated = unsafe { _mm256_xor_si256(_mm256_loadu_si256(dest.cast_const()), source) };
     unsafe {
         _mm256_storeu_si256(dest, updated);
     }
@@ -908,6 +1052,19 @@ unsafe fn mulassign_32(
         let value = _mm256_loadu_si256(dest_ptr.cast_const());
         let product = gf256_mul_vector(value, low_table, high_table, mask);
         _mm256_storeu_si256(dest_ptr, product);
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn mulassign_alpha_32(dest: &mut [u8], offset: usize, zero: __m256i, reduction: __m256i) {
+    unsafe {
+        let dest_ptr = dest.as_mut_ptr().add(offset).cast::<__m256i>();
+        let value = _mm256_loadu_si256(dest_ptr.cast_const());
+        let doubled = _mm256_add_epi8(value, value);
+        let carry_mask = _mm256_cmpgt_epi8(zero, value);
+        let reduced = _mm256_xor_si256(doubled, _mm256_and_si256(carry_mask, reduction));
+        _mm256_storeu_si256(dest_ptr, reduced);
     }
 }
 
@@ -1068,6 +1225,19 @@ mod tests {
         mulassign_scalar(&mut data, &Octet::new(7));
 
         assert_eq!(data, vec![0u8; 129]);
+    }
+
+    #[test]
+    fn mulassign_alpha_matches_scalar_two() {
+        for len in [0usize, 1, 31, 32, 33, 64, 129] {
+            let mut data = patterned_bytes(len);
+            let mut expected = data.clone();
+
+            mulassign_scalar(&mut expected, &Octet::new(2));
+            mulassign_alpha(&mut data);
+
+            assert_eq!(data, expected, "alpha multiply failed for length {len}");
+        }
     }
 
     #[test]
