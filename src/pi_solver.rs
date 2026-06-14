@@ -70,6 +70,8 @@ const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
 const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
+#[cfg(feature = "std")]
+const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 20_000;
 #[cfg(all(feature = "std", not(test)))]
 const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 1_024;
 #[cfg(all(feature = "std", test))]
@@ -384,10 +386,23 @@ struct DirectSystematicPlan {
     hdpc_free_rows: DirectSystematicFreeRows,
     free_cols: Box<[CoefficientColumn]>,
     pivot_symbol_moves: Vec<Box<[usize]>>,
-    back_substitution: DirectSystematicSlices,
+    back_substitution: DirectSystematicBackSubstitution,
     width: usize,
     s: usize,
     h: usize,
+}
+
+#[cfg(feature = "std")]
+enum DirectSystematicBackSubstitution {
+    DestsBySource(DirectSystematicSlices),
+    SourcesByDest(DirectSystematicSlices),
+}
+
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+enum DirectBackSubstitutionLayout {
+    DestsBySource,
+    SourcesByDest,
 }
 
 #[cfg(feature = "std")]
@@ -1484,6 +1499,7 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
         matrix,
         hdpc_rows,
         source_block_symbols,
+        DirectBackSubstitutionLayout::SourcesByDest,
     )
 }
 
@@ -1497,6 +1513,7 @@ fn prepare_direct_systematic_plan_for_decode<M: BinaryMatrix>(
         matrix,
         hdpc_rows,
         source_block_symbols,
+        DirectBackSubstitutionLayout::DestsBySource,
     )
 }
 
@@ -1508,11 +1525,21 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
     matrix: &M,
     hdpc_rows: &DenseOctetMatrix,
     source_block_symbols: u32,
+    back_substitution_layout: DirectBackSubstitutionLayout,
 ) -> Option<DirectSystematicPlan> {
     let s = num_ldpc_symbols(source_block_symbols) as usize;
     let h = hdpc_rows.height();
     let width = matrix.width();
     let binary_height = matrix.height();
+    let back_substitution_layout = if matches!(
+        back_substitution_layout,
+        DirectBackSubstitutionLayout::SourcesByDest
+    ) && width >= DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
+    {
+        DirectBackSubstitutionLayout::SourcesByDest
+    } else {
+        DirectBackSubstitutionLayout::DestsBySource
+    };
     assert!(width < NO_COEFFICIENT_COLUMN as usize);
     assert!(binary_height < NO_COEFFICIENT_COLUMN as usize);
     assert_eq!(hdpc_rows.width(), width);
@@ -1680,6 +1707,7 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
                     DirectBackSubstitutionWork {
                         counts: &mut back_substitution_counts,
                         entries: &mut back_substitution_entries,
+                        layout: back_substitution_layout,
                     },
                     &mut hdpc_update_entries,
                 )
@@ -1693,6 +1721,7 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
                     DirectBackSubstitutionWork {
                         counts: &mut back_substitution_counts,
                         entries: &mut back_substitution_entries,
+                        layout: back_substitution_layout,
                     },
                     &mut hdpc_update_entries,
                 )
@@ -1716,10 +1745,18 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
         h,
         hdpc_coefficient_stride,
     )?;
-    let back_substitution = prepare_direct_back_substitution_batches(
+    let back_substitution_slices = prepare_direct_back_substitution_batches(
         back_substitution_counts,
         back_substitution_entries,
     );
+    let back_substitution = match back_substitution_layout {
+        DirectBackSubstitutionLayout::DestsBySource => {
+            DirectSystematicBackSubstitution::DestsBySource(back_substitution_slices)
+        }
+        DirectBackSubstitutionLayout::SourcesByDest => {
+            DirectSystematicBackSubstitution::SourcesByDest(back_substitution_slices)
+        }
+    };
     let pivot_symbol_moves = direct_pivot_symbol_moves(&pivot_for_col, s, h, width);
 
     Some(DirectSystematicPlan {
@@ -1837,14 +1874,14 @@ fn prepare_direct_back_substitution_batches(
     back_substitution_entries: Vec<(CoefficientColumn, CoefficientColumn)>,
 ) -> DirectSystematicSlices {
     let (ranges, mut offsets, mut entries, entries_len) = direct_slices_from_counts(counts);
-    for (dependent_col, col) in back_substitution_entries {
-        let dependent_col = coefficient_col_index(dependent_col);
-        let offset = offsets[dependent_col];
+    for (range_col, entry_col) in back_substitution_entries {
+        let range_col = coefficient_col_index(range_col);
+        let offset = offsets[range_col];
         debug_assert!(offset < entries_len);
         unsafe {
-            entries.as_mut_ptr().add(offset).write(col);
+            entries.as_mut_ptr().add(offset).write(entry_col);
         }
-        offsets[dependent_col] += 1;
+        offsets[range_col] += 1;
     }
 
     for (offset, &(_, end)) in offsets.iter().zip(ranges.iter()) {
@@ -1861,6 +1898,25 @@ fn prepare_direct_back_substitution_batches(
 struct DirectBackSubstitutionWork<'a> {
     counts: &'a mut [usize],
     entries: &'a mut Vec<(CoefficientColumn, CoefficientColumn)>,
+    layout: DirectBackSubstitutionLayout,
+}
+
+#[cfg(feature = "std")]
+impl DirectBackSubstitutionWork<'_> {
+    fn push(&mut self, dest_col: usize, source_col: usize) {
+        match self.layout {
+            DirectBackSubstitutionLayout::DestsBySource => {
+                self.counts[source_col] += 1;
+                self.entries
+                    .push((coefficient_col(source_col), coefficient_col(dest_col)));
+            }
+            DirectBackSubstitutionLayout::SourcesByDest => {
+                self.counts[dest_col] += 1;
+                self.entries
+                    .push((coefficient_col(dest_col), coefficient_col(source_col)));
+            }
+        }
+    }
 }
 
 #[cfg(feature = "std")]
@@ -1870,7 +1926,7 @@ fn eliminate_direct_hdpc_column_and_collect_back_substitution(
     h: usize,
     col: usize,
     pivot: usize,
-    back_substitution: DirectBackSubstitutionWork<'_>,
+    mut back_substitution: DirectBackSubstitutionWork<'_>,
     hdpc_update_entries: &mut Vec<(CoefficientColumn, Octet)>,
 ) -> (usize, bool) {
     let stride = direct_hdpc_coefficient_stride(h);
@@ -1879,7 +1935,6 @@ fn eliminate_direct_hdpc_column_and_collect_back_substitution(
     let mut factors = [0u8; 16];
     factors[..h].copy_from_slice(&hdpc_coefficients[col_start..col_start + h]);
     hdpc_coefficients[col_start..col_start + h].fill(0);
-    let source_col = coefficient_col(col);
     let dependent_start_col = col + 1;
 
     if stride == 16 {
@@ -1892,10 +1947,7 @@ fn eliminate_direct_hdpc_column_and_collect_back_substitution(
             }
         }
         rows.visit_ones_at_or_after(pivot, dependent_start_col, |entry_col| {
-            back_substitution.counts[entry_col] += 1;
-            back_substitution
-                .entries
-                .push((coefficient_col(entry_col), source_col));
+            back_substitution.push(col, entry_col);
             if factor_block != 0 {
                 let entry_start = entry_col * stride;
                 let entry_ptr = unsafe { hdpc_coefficients.as_mut_ptr().add(entry_start) };
@@ -1917,10 +1969,7 @@ fn eliminate_direct_hdpc_column_and_collect_back_substitution(
             nonzero_factor_count += 1;
         }
         rows.visit_ones_at_or_after(pivot, dependent_start_col, |entry_col| {
-            back_substitution.counts[entry_col] += 1;
-            back_substitution
-                .entries
-                .push((coefficient_col(entry_col), source_col));
+            back_substitution.push(col, entry_col);
             for &(row, factor) in &nonzero_factors[..nonzero_factor_count] {
                 hdpc_coefficients[entry_col * stride + row] ^= factor;
             }
@@ -1939,7 +1988,7 @@ fn eliminate_direct_hdpc_column_entries_and_collect_back_substitution(
     hdpc_coefficients: &mut [u8],
     h: usize,
     col: usize,
-    back_substitution: DirectBackSubstitutionWork<'_>,
+    mut back_substitution: DirectBackSubstitutionWork<'_>,
     hdpc_update_entries: &mut Vec<(CoefficientColumn, Octet)>,
 ) -> (usize, bool) {
     let stride = direct_hdpc_coefficient_stride(h);
@@ -1949,8 +1998,6 @@ fn eliminate_direct_hdpc_column_entries_and_collect_back_substitution(
     let mut factors = [0u8; 16];
     factors[..h].copy_from_slice(&hdpc_coefficients[col_start..col_start + h]);
     hdpc_coefficients[col_start..col_start + h].fill(0);
-    let source_col = coefficient_col(col);
-
     if stride == 16 {
         let factor_block = u128::from_ne_bytes(factors);
         if factor_block != 0 {
@@ -1962,10 +2009,7 @@ fn eliminate_direct_hdpc_column_entries_and_collect_back_substitution(
         }
         for &entry_col in &pivot_entries[1..] {
             let entry_col = coefficient_col_index(entry_col);
-            back_substitution.counts[entry_col] += 1;
-            back_substitution
-                .entries
-                .push((coefficient_col(entry_col), source_col));
+            back_substitution.push(col, entry_col);
             if factor_block != 0 {
                 let entry_start = entry_col * stride;
                 let entry_ptr = unsafe { hdpc_coefficients.as_mut_ptr().add(entry_start) };
@@ -1988,10 +2032,7 @@ fn eliminate_direct_hdpc_column_entries_and_collect_back_substitution(
         }
         for &entry_col in &pivot_entries[1..] {
             let entry_col = coefficient_col_index(entry_col);
-            back_substitution.counts[entry_col] += 1;
-            back_substitution
-                .entries
-                .push((coefficient_col(entry_col), source_col));
+            back_substitution.push(col, entry_col);
             for &(row, factor) in &nonzero_factors[..nonzero_factor_count] {
                 hdpc_coefficients[entry_col * stride + row] ^= factor;
             }
@@ -2188,13 +2229,27 @@ fn try_apply_prepared_direct_systematic_plan(
             .get_mut(coefficient_col_index(col))
             .copy_from_slice(free_values.get(free_index));
     }
-    for src in (0..plan.width).rev() {
-        addassign_direct_symbol_batch_nonzero_source(
-            symbols,
-            src,
-            plan.back_substitution.slice(src),
-            add_assign_path,
-        );
+    match &plan.back_substitution {
+        DirectSystematicBackSubstitution::DestsBySource(back_substitution) => {
+            for src in (0..plan.width).rev() {
+                addassign_direct_symbol_batch_nonzero_source(
+                    symbols,
+                    src,
+                    back_substitution.slice(src),
+                    add_assign_path,
+                );
+            }
+        }
+        DirectSystematicBackSubstitution::SourcesByDest(back_substitution) => {
+            for dest in (0..plan.width).rev() {
+                addassign_direct_symbol_source_batch(
+                    symbols,
+                    dest,
+                    back_substitution.slice(dest),
+                    add_assign_path,
+                );
+            }
+        }
     }
     true
 }
@@ -2470,6 +2525,33 @@ fn addassign_external_symbol_batch(
 }
 
 #[cfg(feature = "std")]
+fn addassign_direct_symbol_source_batch(
+    symbols: &mut SymbolSlab,
+    dest: usize,
+    sources: &[CoefficientColumn],
+    add_assign_path: AddAssignFastPath,
+) {
+    if sources.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let bytes = symbols.as_mut_bytes();
+    let dest_start = dest * symbol_size;
+    assert!(dest_start + symbol_size <= bytes.len());
+    assert_direct_symbol_source_batch_dest(dest, sources);
+    let dest_ptr = unsafe { bytes.as_mut_ptr().add(dest_start) };
+    addassign_symbol_sources_raw(
+        dest_ptr,
+        bytes.as_ptr(),
+        bytes.len(),
+        symbol_size,
+        sources,
+        add_assign_path,
+    );
+}
+
+#[cfg(feature = "std")]
 fn addassign_direct_symbol_batch_impl<const CHECK_ZERO_SOURCE: bool>(
     symbols: &mut SymbolSlab,
     src: usize,
@@ -2724,32 +2806,48 @@ fn addassign_symbol_sources_to_slice(
     );
 }
 
-fn addassign_symbol_sources_raw(
+trait SymbolSourceIndex {
+    fn symbol_source_index(self) -> usize;
+}
+
+impl SymbolSourceIndex for usize {
+    fn symbol_source_index(self) -> usize {
+        self
+    }
+}
+
+impl SymbolSourceIndex for CoefficientColumn {
+    fn symbol_source_index(self) -> usize {
+        coefficient_col_index(self)
+    }
+}
+
+fn addassign_symbol_sources_raw<T: Copy + SymbolSourceIndex>(
     dest_ptr: *mut u8,
     source_base: *const u8,
     source_len: usize,
     symbol_size: usize,
-    sources: &[usize],
+    sources: &[T],
     add_assign_path: AddAssignFastPath,
 ) {
     let mut source_chunks = sources.chunks_exact(16);
     for chunk in source_chunks.by_ref() {
-        let src0_start = chunk[0] * symbol_size;
-        let src1_start = chunk[1] * symbol_size;
-        let src2_start = chunk[2] * symbol_size;
-        let src3_start = chunk[3] * symbol_size;
-        let src4_start = chunk[4] * symbol_size;
-        let src5_start = chunk[5] * symbol_size;
-        let src6_start = chunk[6] * symbol_size;
-        let src7_start = chunk[7] * symbol_size;
-        let src8_start = chunk[8] * symbol_size;
-        let src9_start = chunk[9] * symbol_size;
-        let src10_start = chunk[10] * symbol_size;
-        let src11_start = chunk[11] * symbol_size;
-        let src12_start = chunk[12] * symbol_size;
-        let src13_start = chunk[13] * symbol_size;
-        let src14_start = chunk[14] * symbol_size;
-        let src15_start = chunk[15] * symbol_size;
+        let src0_start = chunk[0].symbol_source_index() * symbol_size;
+        let src1_start = chunk[1].symbol_source_index() * symbol_size;
+        let src2_start = chunk[2].symbol_source_index() * symbol_size;
+        let src3_start = chunk[3].symbol_source_index() * symbol_size;
+        let src4_start = chunk[4].symbol_source_index() * symbol_size;
+        let src5_start = chunk[5].symbol_source_index() * symbol_size;
+        let src6_start = chunk[6].symbol_source_index() * symbol_size;
+        let src7_start = chunk[7].symbol_source_index() * symbol_size;
+        let src8_start = chunk[8].symbol_source_index() * symbol_size;
+        let src9_start = chunk[9].symbol_source_index() * symbol_size;
+        let src10_start = chunk[10].symbol_source_index() * symbol_size;
+        let src11_start = chunk[11].symbol_source_index() * symbol_size;
+        let src12_start = chunk[12].symbol_source_index() * symbol_size;
+        let src13_start = chunk[13].symbol_source_index() * symbol_size;
+        let src14_start = chunk[14].symbol_source_index() * symbol_size;
+        let src15_start = chunk[15].symbol_source_index() * symbol_size;
         assert!(src0_start + symbol_size <= source_len);
         assert!(src1_start + symbol_size <= source_len);
         assert!(src2_start + symbol_size <= source_len);
@@ -2794,14 +2892,14 @@ fn addassign_symbol_sources_raw(
 
     let mut source_chunks = source_chunks.remainder().chunks_exact(8);
     for chunk in source_chunks.by_ref() {
-        let src0_start = chunk[0] * symbol_size;
-        let src1_start = chunk[1] * symbol_size;
-        let src2_start = chunk[2] * symbol_size;
-        let src3_start = chunk[3] * symbol_size;
-        let src4_start = chunk[4] * symbol_size;
-        let src5_start = chunk[5] * symbol_size;
-        let src6_start = chunk[6] * symbol_size;
-        let src7_start = chunk[7] * symbol_size;
+        let src0_start = chunk[0].symbol_source_index() * symbol_size;
+        let src1_start = chunk[1].symbol_source_index() * symbol_size;
+        let src2_start = chunk[2].symbol_source_index() * symbol_size;
+        let src3_start = chunk[3].symbol_source_index() * symbol_size;
+        let src4_start = chunk[4].symbol_source_index() * symbol_size;
+        let src5_start = chunk[5].symbol_source_index() * symbol_size;
+        let src6_start = chunk[6].symbol_source_index() * symbol_size;
+        let src7_start = chunk[7].symbol_source_index() * symbol_size;
         assert!(src0_start + symbol_size <= source_len);
         assert!(src1_start + symbol_size <= source_len);
         assert!(src2_start + symbol_size <= source_len);
@@ -2830,10 +2928,10 @@ fn addassign_symbol_sources_raw(
 
     let mut source_chunks = source_chunks.remainder().chunks_exact(4);
     for chunk in source_chunks.by_ref() {
-        let src0_start = chunk[0] * symbol_size;
-        let src1_start = chunk[1] * symbol_size;
-        let src2_start = chunk[2] * symbol_size;
-        let src3_start = chunk[3] * symbol_size;
+        let src0_start = chunk[0].symbol_source_index() * symbol_size;
+        let src1_start = chunk[1].symbol_source_index() * symbol_size;
+        let src2_start = chunk[2].symbol_source_index() * symbol_size;
+        let src3_start = chunk[3].symbol_source_index() * symbol_size;
         assert!(src0_start + symbol_size <= source_len);
         assert!(src1_start + symbol_size <= source_len);
         assert!(src2_start + symbol_size <= source_len);
@@ -2853,7 +2951,7 @@ fn addassign_symbol_sources_raw(
     }
 
     for &source in source_chunks.remainder() {
-        let source_start = source * symbol_size;
+        let source_start = source.symbol_source_index() * symbol_size;
         assert!(source_start + symbol_size <= source_len);
         unsafe {
             let dest_symbol = core::slice::from_raw_parts_mut(dest_ptr, symbol_size);
@@ -2867,6 +2965,13 @@ fn addassign_symbol_sources_raw(
 fn assert_symbol_source_batch_dest(dest: usize, sources: &[usize]) {
     for &source in sources {
         assert_ne!(dest, source);
+    }
+}
+
+#[cfg(feature = "std")]
+fn assert_direct_symbol_source_batch_dest(dest: usize, sources: &[CoefficientColumn]) {
+    for &source in sources {
+        assert_ne!(dest, coefficient_col_index(source));
     }
 }
 
@@ -7174,10 +7279,12 @@ mod tests {
             hdpc_free_rows: Vec::new(),
             free_cols: vec![coefficient_col(4)].into_boxed_slice(),
             pivot_symbol_moves: direct_pivot_symbol_moves(&pivot_for_col, 1, 1, 5),
-            back_substitution: DirectSystematicSlices {
-                ranges: Vec::new(),
-                entries: Vec::new(),
-            },
+            back_substitution: DirectSystematicBackSubstitution::SourcesByDest(
+                DirectSystematicSlices {
+                    ranges: Vec::new(),
+                    entries: Vec::new(),
+                },
+            ),
             width: 5,
             s: 1,
             h: 1,
