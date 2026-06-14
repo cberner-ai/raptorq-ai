@@ -204,13 +204,17 @@ impl EncodingTupleParameters {
     #[inline]
     fn tuple_from_y(self, internal_symbol_id: u32, y: u32) -> (u32, u32, u32, u32, u32, u32) {
         let y_rand = RfcRand::new(y);
-        let d = deg(y_rand.get(0u32, 1048576), self.lt_symbols);
-        let a = 1 + y_rand.get(1u32, self.lt_symbols - 1);
-        let b = y_rand.get(2u32, self.lt_symbols);
+        let d = deg(y_rand.get_raw(0u32) & (1_048_576 - 1), self.lt_symbols);
+        let a = 1 + y_rand.get_raw(1u32) % (self.lt_symbols - 1);
+        let b = y_rand.get_raw(2u32) % self.lt_symbols;
         let isi_rand = RfcRand::new(internal_symbol_id);
-        let d1 = if d < 4 { 2 + isi_rand.get(3u32, 2) } else { 2 };
-        let a1 = 1 + isi_rand.get(4u32, self.p1 - 1);
-        let b1 = isi_rand.get(5u32, self.p1);
+        let d1 = if d < 4 {
+            2 + (isi_rand.get_raw(3u32) & 1)
+        } else {
+            2
+        };
+        let a1 = 1 + isi_rand.get_raw(4u32) % (self.p1 - 1);
+        let b1 = isi_rand.get_raw(5u32) % self.p1;
 
         (d, a, b, d1, a1, b1)
     }

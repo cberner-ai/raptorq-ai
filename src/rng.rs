@@ -23,9 +23,8 @@ impl RfcRand {
     }
 
     #[inline]
-    pub(crate) fn get(self, i: u32, m: u32) -> u32 {
+    pub(crate) fn get_raw(self, i: u32) -> u32 {
         debug_assert!(i < 256);
-        debug_assert!(m > 0);
 
         let i = i as usize;
         let x0 = (self.x0 + i) & 0xff;
@@ -33,7 +32,14 @@ impl RfcRand {
         let x2 = (self.x2 + i) & 0xff;
         let x3 = (self.x3 + i) & 0xff;
 
-        let value = V0[x0] ^ V1[x1] ^ V2[x2] ^ V3[x3];
+        V0[x0] ^ V1[x1] ^ V2[x2] ^ V3[x3]
+    }
+
+    #[inline]
+    pub(crate) fn get(self, i: u32, m: u32) -> u32 {
+        debug_assert!(m > 0);
+
+        let value = self.get_raw(i);
         match m {
             DEGREE_RANDOM_MODULUS => value & (DEGREE_RANDOM_MODULUS - 1),
             D1_RANDOM_MODULUS => value & (D1_RANDOM_MODULUS - 1),
