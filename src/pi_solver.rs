@@ -390,6 +390,7 @@ struct DirectSystematicPlan {
     free_cols: Box<[CoefficientColumn]>,
     pivot_symbol_moves: Vec<Box<[usize]>>,
     back_substitution: DirectSystematicBackSubstitution,
+    trust_source_batch_bounds: bool,
     width: usize,
     s: usize,
     h: usize,
@@ -1503,6 +1504,7 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
         hdpc_rows,
         source_block_symbols,
         DirectBackSubstitutionLayout::SourcesByDest,
+        true,
     )
 }
 
@@ -1517,6 +1519,7 @@ fn prepare_direct_systematic_plan_for_decode<M: BinaryMatrix>(
         hdpc_rows,
         source_block_symbols,
         direct_decode_back_substitution_layout(matrix.width()),
+        false,
     )
 }
 
@@ -1538,6 +1541,7 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
     hdpc_rows: &DenseOctetMatrix,
     source_block_symbols: u32,
     back_substitution_layout: DirectBackSubstitutionLayout,
+    trust_source_batch_bounds: bool,
 ) -> Option<DirectSystematicPlan> {
     let s = num_ldpc_symbols(source_block_symbols) as usize;
     let h = hdpc_rows.height();
@@ -1783,6 +1787,7 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
         free_cols: free_cols.into_boxed_slice(),
         pivot_symbol_moves,
         back_substitution,
+        trust_source_batch_bounds,
         width,
         s,
         h,
@@ -2254,12 +2259,21 @@ fn try_apply_prepared_direct_systematic_plan(
         }
         DirectSystematicBackSubstitution::SourcesByDest(back_substitution) => {
             for dest in (0..plan.width).rev() {
-                addassign_direct_symbol_source_batch(
-                    symbols,
-                    dest,
-                    back_substitution.slice(dest),
-                    add_assign_path,
-                );
+                if plan.trust_source_batch_bounds {
+                    addassign_direct_symbol_source_batch_trusted(
+                        symbols,
+                        dest,
+                        back_substitution.slice(dest),
+                        add_assign_path,
+                    );
+                } else {
+                    addassign_direct_symbol_source_batch(
+                        symbols,
+                        dest,
+                        back_substitution.slice(dest),
+                        add_assign_path,
+                    );
+                }
             }
         }
     }
@@ -2551,9 +2565,36 @@ fn addassign_direct_symbol_source_batch(
     let bytes = symbols.as_mut_bytes();
     let dest_start = dest * symbol_size;
     assert!(dest_start + symbol_size <= bytes.len());
-    assert_direct_symbol_source_batch_dest(dest, sources);
+    debug_assert_direct_symbol_source_batch_dest(dest, sources);
     let dest_ptr = unsafe { bytes.as_mut_ptr().add(dest_start) };
     addassign_symbol_sources_raw(
+        dest_ptr,
+        bytes.as_ptr(),
+        bytes.len(),
+        symbol_size,
+        sources,
+        add_assign_path,
+    );
+}
+
+#[cfg(feature = "std")]
+fn addassign_direct_symbol_source_batch_trusted(
+    symbols: &mut SymbolSlab,
+    dest: usize,
+    sources: &[CoefficientColumn],
+    add_assign_path: AddAssignFastPath,
+) {
+    if sources.is_empty() {
+        return;
+    }
+
+    let symbol_size = symbols.symbol_size();
+    let bytes = symbols.as_mut_bytes();
+    let dest_start = dest * symbol_size;
+    assert!(dest_start + symbol_size <= bytes.len());
+    assert_direct_symbol_source_batch_dest(dest, sources);
+    let dest_ptr = unsafe { bytes.as_mut_ptr().add(dest_start) };
+    addassign_symbol_sources_raw_trusted(
         dest_ptr,
         bytes.as_ptr(),
         bytes.len(),
@@ -2842,6 +2883,45 @@ fn addassign_symbol_sources_raw<T: Copy + SymbolSourceIndex>(
     sources: &[T],
     add_assign_path: AddAssignFastPath,
 ) {
+    addassign_symbol_sources_raw_impl::<true, T>(
+        dest_ptr,
+        source_base,
+        source_len,
+        symbol_size,
+        sources,
+        add_assign_path,
+    );
+}
+
+fn addassign_symbol_sources_raw_trusted<T: Copy + SymbolSourceIndex>(
+    dest_ptr: *mut u8,
+    source_base: *const u8,
+    source_len: usize,
+    symbol_size: usize,
+    sources: &[T],
+    add_assign_path: AddAssignFastPath,
+) {
+    addassign_symbol_sources_raw_impl::<false, T>(
+        dest_ptr,
+        source_base,
+        source_len,
+        symbol_size,
+        sources,
+        add_assign_path,
+    );
+}
+
+fn addassign_symbol_sources_raw_impl<
+    const CHECK_SOURCE_BOUNDS: bool,
+    T: Copy + SymbolSourceIndex,
+>(
+    dest_ptr: *mut u8,
+    source_base: *const u8,
+    source_len: usize,
+    symbol_size: usize,
+    sources: &[T],
+    add_assign_path: AddAssignFastPath,
+) {
     let mut source_chunks = sources.chunks_exact(16);
     for chunk in source_chunks.by_ref() {
         let src0_start = chunk[0].symbol_source_index() * symbol_size;
@@ -2860,22 +2940,22 @@ fn addassign_symbol_sources_raw<T: Copy + SymbolSourceIndex>(
         let src13_start = chunk[13].symbol_source_index() * symbol_size;
         let src14_start = chunk[14].symbol_source_index() * symbol_size;
         let src15_start = chunk[15].symbol_source_index() * symbol_size;
-        assert!(src0_start + symbol_size <= source_len);
-        assert!(src1_start + symbol_size <= source_len);
-        assert!(src2_start + symbol_size <= source_len);
-        assert!(src3_start + symbol_size <= source_len);
-        assert!(src4_start + symbol_size <= source_len);
-        assert!(src5_start + symbol_size <= source_len);
-        assert!(src6_start + symbol_size <= source_len);
-        assert!(src7_start + symbol_size <= source_len);
-        assert!(src8_start + symbol_size <= source_len);
-        assert!(src9_start + symbol_size <= source_len);
-        assert!(src10_start + symbol_size <= source_len);
-        assert!(src11_start + symbol_size <= source_len);
-        assert!(src12_start + symbol_size <= source_len);
-        assert!(src13_start + symbol_size <= source_len);
-        assert!(src14_start + symbol_size <= source_len);
-        assert!(src15_start + symbol_size <= source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src0_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src1_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src2_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src3_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src4_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src5_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src6_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src7_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src8_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src9_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src10_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src11_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src12_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src13_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src14_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src15_start, symbol_size, source_len);
         unsafe {
             add_assign_path.apply_sources_same_len_raw_16(
                 dest_ptr,
@@ -2912,14 +2992,14 @@ fn addassign_symbol_sources_raw<T: Copy + SymbolSourceIndex>(
         let src5_start = chunk[5].symbol_source_index() * symbol_size;
         let src6_start = chunk[6].symbol_source_index() * symbol_size;
         let src7_start = chunk[7].symbol_source_index() * symbol_size;
-        assert!(src0_start + symbol_size <= source_len);
-        assert!(src1_start + symbol_size <= source_len);
-        assert!(src2_start + symbol_size <= source_len);
-        assert!(src3_start + symbol_size <= source_len);
-        assert!(src4_start + symbol_size <= source_len);
-        assert!(src5_start + symbol_size <= source_len);
-        assert!(src6_start + symbol_size <= source_len);
-        assert!(src7_start + symbol_size <= source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src0_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src1_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src2_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src3_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src4_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src5_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src6_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src7_start, symbol_size, source_len);
         unsafe {
             add_assign_path.apply_sources_same_len_raw_8(
                 dest_ptr,
@@ -2944,10 +3024,10 @@ fn addassign_symbol_sources_raw<T: Copy + SymbolSourceIndex>(
         let src1_start = chunk[1].symbol_source_index() * symbol_size;
         let src2_start = chunk[2].symbol_source_index() * symbol_size;
         let src3_start = chunk[3].symbol_source_index() * symbol_size;
-        assert!(src0_start + symbol_size <= source_len);
-        assert!(src1_start + symbol_size <= source_len);
-        assert!(src2_start + symbol_size <= source_len);
-        assert!(src3_start + symbol_size <= source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src0_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src1_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src2_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src3_start, symbol_size, source_len);
         unsafe {
             add_assign_path.apply_sources_same_len_raw_4(
                 dest_ptr,
@@ -2964,13 +3044,26 @@ fn addassign_symbol_sources_raw<T: Copy + SymbolSourceIndex>(
 
     for &source in source_chunks.remainder() {
         let source_start = source.symbol_source_index() * symbol_size;
-        assert!(source_start + symbol_size <= source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(source_start, symbol_size, source_len);
         unsafe {
             let dest_symbol = core::slice::from_raw_parts_mut(dest_ptr, symbol_size);
             let source_symbol =
                 core::slice::from_raw_parts(source_base.add(source_start), symbol_size);
             add_assign_path.apply_same_len(dest_symbol, source_symbol);
         }
+    }
+}
+
+#[inline(always)]
+fn check_source_bounds<const CHECK_SOURCE_BOUNDS: bool>(
+    source_start: usize,
+    symbol_size: usize,
+    source_len: usize,
+) {
+    if CHECK_SOURCE_BOUNDS {
+        assert!(source_start + symbol_size <= source_len);
+    } else {
+        debug_assert!(source_start + symbol_size <= source_len);
     }
 }
 
@@ -2984,6 +3077,13 @@ fn assert_symbol_source_batch_dest(dest: usize, sources: &[usize]) {
 fn assert_direct_symbol_source_batch_dest(dest: usize, sources: &[CoefficientColumn]) {
     for &source in sources {
         assert_ne!(dest, coefficient_col_index(source));
+    }
+}
+
+#[cfg(feature = "std")]
+fn debug_assert_direct_symbol_source_batch_dest(dest: usize, sources: &[CoefficientColumn]) {
+    for &source in sources {
+        debug_assert_ne!(dest, coefficient_col_index(source));
     }
 }
 
@@ -7597,6 +7697,7 @@ mod tests {
                     entries: Vec::new(),
                 },
             ),
+            trust_source_batch_bounds: true,
             width: 5,
             s: 1,
             h: 1,
@@ -7636,6 +7737,7 @@ mod tests {
                     ],
                 },
             ),
+            trust_source_batch_bounds: true,
             width: 4,
             s: 0,
             h: 0,
