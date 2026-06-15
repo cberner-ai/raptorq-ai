@@ -41,6 +41,10 @@ const NO_BUCKET_ROW: usize = usize::MAX;
 const NO_COEFFICIENT_COLUMN: CoefficientColumn = u16::MAX;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 #[cfg(feature = "std")]
+const CACHED_SYSTEMATIC_PLAN_RECORDING_MIN_WIDTH: usize = 512;
+#[cfg(not(feature = "std"))]
+const CACHED_SYSTEMATIC_PLAN_RECORDING_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH + 1;
+#[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT: usize = 96;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
@@ -146,7 +150,8 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
     source_block_symbols: u32,
 ) -> (Option<SymbolSlab>, Option<Vec<SymbolOps>>) {
     let recording = OperationRecording::for_matrix(&matrix, source_block_symbols);
-    if recording == OperationRecording::Record && matrix.width() > MAX_INLINE_RECORDED_SOLVER_WIDTH
+    if recording == OperationRecording::Record
+        && matrix.width() >= CACHED_SYSTEMATIC_PLAN_RECORDING_MIN_WIDTH
     {
         let source_block_symbols = extended_source_block_symbols(source_block_symbols);
         #[cfg(feature = "std")]
@@ -8739,6 +8744,16 @@ mod tests {
             .expect("direct systematic test threshold should be reachable")
     }
 
+    fn first_cached_recording_source_symbols() -> u32 {
+        (1..=MAX_INLINE_RECORDED_SOLVER_WIDTH as u32)
+            .find(|&source_symbols| {
+                let width = num_intermediate_symbols(source_symbols) as usize;
+                (CACHED_SYSTEMATIC_PLAN_RECORDING_MIN_WIDTH..=MAX_INLINE_RECORDED_SOLVER_WIDTH)
+                    .contains(&width)
+            })
+            .expect("cached recording test threshold should be reachable")
+    }
+
     fn first_source_batched_direct_source_symbols() -> u32 {
         (1..=SQUARE_HYBRID_MAX_WIDTH as u32)
             .find(|&source_symbols| {
@@ -8747,6 +8762,61 @@ mod tests {
                     .contains(&width)
             })
             .expect("source-batched direct test threshold should be reachable")
+    }
+
+    #[test]
+    fn mid_width_systematic_plan_uses_cached_semantic_replay() {
+        let source_symbols = first_cached_recording_source_symbols();
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        let s = num_ldpc_symbols(source_symbols) as usize;
+        let h = num_hdpc_symbols(source_symbols) as usize;
+        let mut symbols = SymbolSlab::with_zeros(width, 1);
+        for isi in 0..source_symbols as usize {
+            symbols.get_mut(s + h + isi)[0] = (isi as u8).wrapping_mul(11).wrapping_add(5);
+        }
+        let original_symbols = symbols.clone();
+        let indices: Vec<u32> = (0..k_prime).collect();
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+        let (expected_matrix, expected_hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+        assert_eq!(matrix.width(), width);
+        assert!(width <= MAX_INLINE_RECORDED_SOLVER_WIDTH);
+        assert!(is_full_systematic_planning_matrix(&matrix, source_symbols));
+        let (expected, _) = fused_inverse_mul_symbols_impl(
+            expected_matrix,
+            expected_hdpc_rows,
+            original_symbols.clone(),
+            source_symbols,
+            OperationRecording::Skip,
+        );
+        let expected = expected.expect("mid-width systematic solve should decode");
+
+        let (decoded, ops) = fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_symbols);
+        assert!(
+            decoded.is_none(),
+            "mid-width systematic planning should defer to cached replay"
+        );
+        let ops = ops.expect("mid-width systematic solve should record a cached replay");
+
+        match ops.as_slice() {
+            [
+                SymbolOps::DirectSystematicSolve {
+                    source_block_symbols,
+                }
+                | SymbolOps::ApplyCachedSystematicPlan {
+                    source_block_symbols,
+                },
+            ] => assert_eq!(*source_block_symbols, k_prime),
+            _ => panic!("mid-width systematic solve should record one cached semantic op"),
+        }
+
+        let mut replayed = original_symbols;
+        for op in &ops {
+            crate::operation_vector::perform_op(op, &mut replayed);
+        }
+        assert_eq!(replayed, expected);
     }
 
     #[test]
