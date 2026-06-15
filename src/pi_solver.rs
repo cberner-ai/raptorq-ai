@@ -75,7 +75,7 @@ const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
 const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
-const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 10_000;
+const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 50_000;
 #[cfg(feature = "std")]
@@ -5067,7 +5067,7 @@ fn use_one_shot_square_hybrid_decode(width: usize) -> bool {
 
 #[cfg(all(feature = "std", not(test)))]
 fn use_direct_square_hybrid_decode(width: usize) -> bool {
-    width >= DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH
+    width >= SQUARE_HYBRID_DECODE_MIN_WIDTH
 }
 
 #[cfg(all(feature = "std", test))]
