@@ -54,7 +54,7 @@ pub fn generate_constraint_matrix_no_hdpc<M: BinaryMatrix>(
             repair_isi,
         );
     } else {
-        if (l as usize) < UNSORTED_SPARSE_PACK_MIN_WIDTH || encoded_isis.len() > k_prime as usize {
+        if (l as usize) < UNSORTED_SPARSE_PACK_MIN_WIDTH {
             matrix.normalize_rows();
         }
         matrix.mark_encoded_systematic_isis(s as usize, k_prime, encoded_isis);
@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn large_overdetermined_sparse_matrix_still_normalizes_for_verification() {
+    fn large_overdetermined_sparse_matrix_uses_unsorted_pack_path() {
         let source_symbols = 4096;
         let k_prime = extended_source_block_symbols(source_symbols);
         let indices = (k_prime..k_prime * 2 + 1).collect::<Vec<_>>();
@@ -531,7 +531,7 @@ mod tests {
             generate_constraint_matrix_no_hdpc::<SparseBinaryMatrix>(source_symbols, &indices);
 
         assert!(matrix.width() >= UNSORTED_SPARSE_PACK_MIN_WIDTH);
-        assert!(matrix.rows_normalized_for_test());
+        assert!(!matrix.rows_normalized_for_test());
         assert_eq!(matrix.systematic_source_block_symbols(), None);
         assert!(matrix.systematic_row_isis().is_some());
     }
