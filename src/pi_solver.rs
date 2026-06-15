@@ -94,10 +94,12 @@ const SHORT_PIVOT_MERGE_MAX_LEN: usize = 64;
 const REPAIR_SOURCE_COEFFICIENTS_CACHE_CAPACITY: usize = 16;
 #[cfg(feature = "std")]
 const DIRECT_SINGLE_REPAIR_COEFFICIENT_CACHE_CAPACITY: usize = 32;
-#[cfg(all(feature = "std", not(test)))]
-const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 32_768;
-#[cfg(all(feature = "std", test))]
-const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 64;
+#[cfg(feature = "std")]
+const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 512;
+#[cfg(feature = "std")]
+const IN_PLACE_HYBRID_REPLAY_MAX_MID_WIDTH: usize = 768;
+#[cfg(feature = "std")]
+const LARGE_IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 32_768;
 #[cfg(not(test))]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 4_096;
 #[cfg(test)]
@@ -3399,11 +3401,17 @@ fn apply_cached_hybrid_systematic_plan(
     plan: &CachedHybridSystematicPlan,
     symbols: &mut SymbolSlab,
 ) {
-    if plan.width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH {
+    if use_in_place_hybrid_replay(plan.width) {
         apply_cached_hybrid_systematic_plan_in_place(plan, symbols);
     } else {
         apply_cached_hybrid_systematic_plan_with_binary_slab(plan, symbols);
     }
+}
+
+#[cfg(feature = "std")]
+fn use_in_place_hybrid_replay(width: usize) -> bool {
+    (IN_PLACE_HYBRID_REPLAY_MIN_WIDTH..IN_PLACE_HYBRID_REPLAY_MAX_MID_WIDTH).contains(&width)
+        || width >= LARGE_IN_PLACE_HYBRID_REPLAY_MIN_WIDTH
 }
 
 #[cfg(feature = "std")]
@@ -4463,7 +4471,7 @@ fn prepare_cached_hybrid_systematic_plan_with_small_weight_max<
         .then(|| prepare_cached_hdpc_free_solve_from_rows(&free_rows, free_cols.len(), 1))
         .flatten();
     let back_substitution = prepare_binary_flat_back_substitution_batches(&rows, &pivots, width);
-    let output_symbol_cycles = (width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH)
+    let output_symbol_cycles = use_in_place_hybrid_replay(width)
         .then(|| hybrid_output_symbol_cycles(&pivots, &free_cols, s, h, width))
         .flatten();
 
@@ -8785,6 +8793,16 @@ mod tests {
 
         assert!(decoded.is_some());
         assert!(ops.is_none());
+    }
+
+    #[test]
+    fn in_place_hybrid_replay_is_limited_to_mid_width_500_symbol_band() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert!(!use_in_place_hybrid_replay(width_for(250)));
+        assert!(use_in_place_hybrid_replay(width_for(500)));
+        assert!(!use_in_place_hybrid_replay(width_for(1000)));
+        assert!(!use_in_place_hybrid_replay(width_for(2000)));
     }
 
     #[test]
