@@ -3623,7 +3623,84 @@ fn addassign_mapped_binary_symbol_batch(
     }
     let bytes_ptr = bytes.as_mut_ptr();
 
-    for &dest in dests {
+    let mut dest_chunks = dests.chunks_exact(8);
+    for chunk in dest_chunks.by_ref() {
+        let dest0 = mapped_binary_symbol_row(coefficient_col_index(chunk[0]), s, h);
+        let dest1 = mapped_binary_symbol_row(coefficient_col_index(chunk[1]), s, h);
+        let dest2 = mapped_binary_symbol_row(coefficient_col_index(chunk[2]), s, h);
+        let dest3 = mapped_binary_symbol_row(coefficient_col_index(chunk[3]), s, h);
+        let dest4 = mapped_binary_symbol_row(coefficient_col_index(chunk[4]), s, h);
+        let dest5 = mapped_binary_symbol_row(coefficient_col_index(chunk[5]), s, h);
+        let dest6 = mapped_binary_symbol_row(coefficient_col_index(chunk[6]), s, h);
+        let dest7 = mapped_binary_symbol_row(coefficient_col_index(chunk[7]), s, h);
+        debug_assert_direct_batch_dests(
+            src,
+            &[dest0, dest1, dest2, dest3, dest4, dest5, dest6, dest7],
+        );
+        let dest0_start = dest0 * symbol_size;
+        let dest1_start = dest1 * symbol_size;
+        let dest2_start = dest2 * symbol_size;
+        let dest3_start = dest3 * symbol_size;
+        let dest4_start = dest4 * symbol_size;
+        let dest5_start = dest5 * symbol_size;
+        let dest6_start = dest6 * symbol_size;
+        let dest7_start = dest7 * symbol_size;
+        assert!(dest0_start + symbol_size <= bytes.len());
+        assert!(dest1_start + symbol_size <= bytes.len());
+        assert!(dest2_start + symbol_size <= bytes.len());
+        assert!(dest3_start + symbol_size <= bytes.len());
+        assert!(dest4_start + symbol_size <= bytes.len());
+        assert!(dest5_start + symbol_size <= bytes.len());
+        assert!(dest6_start + symbol_size <= bytes.len());
+        assert!(dest7_start + symbol_size <= bytes.len());
+        unsafe {
+            add_assign_path.apply_same_len_raw_8(
+                [
+                    bytes_ptr.add(dest0_start),
+                    bytes_ptr.add(dest1_start),
+                    bytes_ptr.add(dest2_start),
+                    bytes_ptr.add(dest3_start),
+                    bytes_ptr.add(dest4_start),
+                    bytes_ptr.add(dest5_start),
+                    bytes_ptr.add(dest6_start),
+                    bytes_ptr.add(dest7_start),
+                ],
+                src_ptr,
+                symbol_size,
+            );
+        }
+    }
+
+    let mut dest_chunks = dest_chunks.remainder().chunks_exact(4);
+    for chunk in dest_chunks.by_ref() {
+        let dest0 = mapped_binary_symbol_row(coefficient_col_index(chunk[0]), s, h);
+        let dest1 = mapped_binary_symbol_row(coefficient_col_index(chunk[1]), s, h);
+        let dest2 = mapped_binary_symbol_row(coefficient_col_index(chunk[2]), s, h);
+        let dest3 = mapped_binary_symbol_row(coefficient_col_index(chunk[3]), s, h);
+        debug_assert_direct_batch_dests(src, &[dest0, dest1, dest2, dest3]);
+        let dest0_start = dest0 * symbol_size;
+        let dest1_start = dest1 * symbol_size;
+        let dest2_start = dest2 * symbol_size;
+        let dest3_start = dest3 * symbol_size;
+        assert!(dest0_start + symbol_size <= bytes.len());
+        assert!(dest1_start + symbol_size <= bytes.len());
+        assert!(dest2_start + symbol_size <= bytes.len());
+        assert!(dest3_start + symbol_size <= bytes.len());
+        unsafe {
+            add_assign_path.apply_same_len_raw_4(
+                [
+                    bytes_ptr.add(dest0_start),
+                    bytes_ptr.add(dest1_start),
+                    bytes_ptr.add(dest2_start),
+                    bytes_ptr.add(dest3_start),
+                ],
+                src_ptr,
+                symbol_size,
+            );
+        }
+    }
+
+    for &dest in dest_chunks.remainder() {
         let dest = mapped_binary_symbol_row(coefficient_col_index(dest), s, h);
         assert_ne!(dest, src);
         let dest_start = dest * symbol_size;
