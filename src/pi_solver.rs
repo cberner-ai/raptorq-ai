@@ -78,6 +78,8 @@ const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 10_000;
 #[cfg(feature = "std")]
 const DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 50_000;
+#[cfg(feature = "std")]
+const CACHED_HDPC_FREE_SOLVE_MAX_WIDTH: usize = 10_000;
 #[cfg(all(feature = "std", not(test)))]
 const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 1_024;
 #[cfg(all(feature = "std", test))]
@@ -325,6 +327,7 @@ struct CachedHybridSystematicPlan {
     hdpc_symbol_steps: Vec<HybridHdpcSymbolStep>,
     free_cols: Box<[usize]>,
     free_rows: Vec<CoefficientRow>,
+    free_solve: Option<CachedHdpcFreeSolve>,
     pivots: Box<[(usize, usize)]>,
     back_substitution: CachedBinarySlices,
     output_symbol_cycles: Option<Vec<Box<[usize]>>>,
@@ -432,6 +435,13 @@ enum DirectBackSubstitutionLayout {
 #[cfg(feature = "std")]
 struct DirectSystematicForwardStep {
     pivot_symbol: CoefficientColumn,
+}
+
+#[cfg(feature = "std")]
+struct CachedHdpcFreeSolve {
+    ops: Vec<SymbolOps>,
+    height: usize,
+    free_count: usize,
 }
 
 #[cfg(feature = "std")]
@@ -2450,6 +2460,80 @@ fn solve_prepared_hdpc_free_variables(
 }
 
 #[cfg(feature = "std")]
+fn prepare_cached_hdpc_free_solve_from_rows(
+    rows: &[CoefficientRow],
+    free_count: usize,
+    symbol_size: usize,
+) -> Option<CachedHdpcFreeSolve> {
+    if free_count == 0 {
+        return None;
+    }
+
+    let height = rows.len();
+    let symbols = SymbolSlab::with_zeros(height, symbol_size);
+    let (_, ops) = solve(
+        rows.to_vec(),
+        free_count,
+        symbols,
+        OperationRecording::Record,
+    );
+    Some(CachedHdpcFreeSolve {
+        ops: ops?,
+        height,
+        free_count,
+    })
+}
+
+#[cfg(feature = "std")]
+fn apply_cached_hdpc_free_solve(
+    cached_solve: &CachedHdpcFreeSolve,
+    mut symbols: SymbolSlab,
+) -> Option<SymbolSlab> {
+    assert_eq!(symbols.len(), cached_solve.height);
+
+    for op in &cached_solve.ops {
+        apply_cached_hdpc_free_solve_op(op, &mut symbols);
+    }
+    for row in cached_solve.free_count..cached_solve.height {
+        if !symbol_is_zero(symbols.get(row)) {
+            return None;
+        }
+    }
+
+    let mut free_values = SymbolSlab::with_zeros(cached_solve.free_count, symbols.symbol_size());
+    for row in 0..cached_solve.free_count {
+        free_values.get_mut(row).copy_from_slice(symbols.get(row));
+    }
+    Some(free_values)
+}
+
+#[cfg(feature = "std")]
+fn apply_cached_hdpc_free_solve_op(op: &SymbolOps, symbols: &mut SymbolSlab) {
+    match op {
+        SymbolOps::Swap(a, b) => {
+            symbols.swap_symbols(*a, *b);
+        }
+        SymbolOps::Scale(row, scalar) => {
+            mulassign_scalar(symbols.get_mut(*row), scalar);
+        }
+        SymbolOps::FusedAdd { dest, src, scalar } => {
+            let (src_symbol, dest_symbol) = symbols.get_disjoint_mut(*src, *dest);
+            fused_addassign_mul_scalar(dest_symbol, src_symbol, scalar);
+        }
+        SymbolOps::FusedAddBatch { src, dests } => {
+            for &(dest, factor) in dests.iter() {
+                let (src_symbol, dest_symbol) = symbols.get_disjoint_mut(*src, dest);
+                fused_addassign_mul_scalar(dest_symbol, src_symbol, &factor);
+            }
+        }
+        #[cfg(feature = "std")]
+        SymbolOps::ApplyCachedSystematicPlan { .. } | SymbolOps::DirectSystematicSolve { .. } => {
+            unreachable!("HDPC free solve plan contains only row operations");
+        }
+    }
+}
+
+#[cfg(feature = "std")]
 fn fused_addassign_cached_symbol_batch(
     symbols: &mut SymbolSlab,
     src: usize,
@@ -3367,6 +3451,9 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
             "cached hybrid systematic solve has inconsistent HDPC rows"
         );
         SymbolSlab::with_zeros(0, symbol_size)
+    } else if let Some(free_solve) = &plan.free_solve {
+        apply_cached_hdpc_free_solve(free_solve, hdpc_symbols)
+            .expect("cached hybrid systematic free-column solve failed")
     } else {
         solve_without_recording(plan.free_rows.clone(), plan.free_cols.len(), hdpc_symbols)
             .0
@@ -3447,9 +3534,11 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
                 .get_mut(row)
                 .copy_from_slice(symbols.get(plan.s + row));
         }
-        let Some(free_values) =
+        let Some(free_values) = (if let Some(free_solve) = &plan.free_solve {
+            apply_cached_hdpc_free_solve(free_solve, hdpc_symbols)
+        } else {
             solve_without_recording(plan.free_rows.clone(), plan.free_cols.len(), hdpc_symbols).0
-        else {
+        }) else {
             return false;
         };
         free_values
@@ -4370,6 +4459,9 @@ fn prepare_cached_hybrid_systematic_plan_with_small_weight_max<
     }
 
     let free_rows = hybrid_hdpc_free_rows(&hdpc_coefficients, &free_cols, width)?;
+    let free_solve = (width <= CACHED_HDPC_FREE_SOLVE_MAX_WIDTH)
+        .then(|| prepare_cached_hdpc_free_solve_from_rows(&free_rows, free_cols.len(), 1))
+        .flatten();
     let back_substitution = prepare_binary_flat_back_substitution_batches(&rows, &pivots, width);
     let output_symbol_cycles = (width >= IN_PLACE_HYBRID_REPLAY_MIN_WIDTH)
         .then(|| hybrid_output_symbol_cycles(&pivots, &free_cols, s, h, width))
@@ -4383,6 +4475,7 @@ fn prepare_cached_hybrid_systematic_plan_with_small_weight_max<
         hdpc_symbol_steps,
         free_cols: free_cols.into_boxed_slice(),
         free_rows,
+        free_solve,
         pivots: pivots.into_boxed_slice(),
         back_substitution,
         output_symbol_cycles,
@@ -9065,6 +9158,32 @@ mod tests {
                 (Octet::new(5) + Octet::new(7) * Octet::new(3)).value()
             ]
         );
+    }
+
+    #[test]
+    fn cached_hdpc_free_solve_matches_existing_solver() {
+        let rows = vec![
+            vec![
+                (coefficient_col(0), Octet::one()),
+                (coefficient_col(1), Octet::one()),
+            ],
+            vec![(coefficient_col(1), Octet::one())],
+            Vec::new(),
+        ];
+        let symbols = SymbolSlab::from_bytes(vec![3, 5, 7, 11, 0, 0], 2);
+        let expected = solve_without_recording(rows.clone(), 2, symbols.clone())
+            .0
+            .expect("free solve should be consistent");
+        let cached = prepare_cached_hdpc_free_solve_from_rows(&rows, 2, 1)
+            .expect("free solve should record row operations");
+
+        let actual = apply_cached_hdpc_free_solve(&cached, symbols)
+            .expect("cached free solve should be consistent");
+
+        assert_eq!(actual, expected);
+
+        let inconsistent = SymbolSlab::from_bytes(vec![3, 5, 7, 11, 1, 0], 2);
+        assert!(apply_cached_hdpc_free_solve(&cached, inconsistent).is_none());
     }
 
     #[test]
