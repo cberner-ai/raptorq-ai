@@ -41,7 +41,7 @@ const NO_BUCKET_ROW: usize = usize::MAX;
 const NO_COEFFICIENT_COLUMN: CoefficientColumn = u16::MAX;
 pub(crate) const MAX_INLINE_RECORDED_SOLVER_WIDTH: usize = 4096;
 #[cfg(feature = "std")]
-const CACHED_SYSTEMATIC_PLAN_RECORDING_MIN_WIDTH: usize = 512;
+const CACHED_SYSTEMATIC_PLAN_RECORDING_MIN_WIDTH: usize = 128;
 #[cfg(not(feature = "std"))]
 const CACHED_SYSTEMATIC_PLAN_RECORDING_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH + 1;
 #[cfg(feature = "std")]
@@ -157,6 +157,7 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
         #[cfg(feature = "std")]
         {
             if matrix.width() < DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH {
+                let width = matrix.width();
                 if cached_hybrid_systematic_plan_from_matrix(
                     source_block_symbols,
                     &matrix,
@@ -164,20 +165,28 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
                 )
                 .is_some()
                 {
-                    return (
-                        None,
-                        Some(vec![SymbolOps::DirectSystematicSolve {
-                            source_block_symbols,
-                        }]),
-                    );
+                    let op = SymbolOps::DirectSystematicSolve {
+                        source_block_symbols,
+                    };
+                    if symbol_is_zero(symbols.as_bytes()) {
+                        let decoded = SymbolSlab::with_zeros(width, symbols.symbol_size());
+                        return (Some(decoded), Some(vec![op]));
+                    }
+                    let mut decoded = symbols.clone();
+                    apply_direct_systematic_solve(source_block_symbols, &mut decoded);
+                    return (Some(decoded), Some(vec![op]));
                 }
                 cached_systematic_plan_from_matrix(source_block_symbols, matrix, &hdpc_rows);
-                return (
-                    None,
-                    Some(vec![SymbolOps::ApplyCachedSystematicPlan {
-                        source_block_symbols,
-                    }]),
-                );
+                let op = SymbolOps::ApplyCachedSystematicPlan {
+                    source_block_symbols,
+                };
+                if symbol_is_zero(symbols.as_bytes()) {
+                    let decoded = SymbolSlab::with_zeros(width, symbols.symbol_size());
+                    return (Some(decoded), Some(vec![op]));
+                }
+                let mut decoded = symbols.clone();
+                apply_cached_systematic_plan(source_block_symbols, &mut decoded);
+                return (Some(decoded), Some(vec![op]));
             }
 
             if matrix.width() > SQUARE_HYBRID_MAX_WIDTH {
@@ -8696,7 +8705,8 @@ mod tests {
 
         let (decoded, ops) = fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_symbols);
 
-        assert!(decoded.is_none());
+        let decoded = decoded.expect("hybrid systematic solve should still return zero symbols");
+        assert!(decoded.as_bytes().iter().all(|&byte| byte == 0));
         assert!(matches!(
             ops.as_deref(),
             Some([SymbolOps::DirectSystematicSolve {
@@ -8794,9 +8804,9 @@ mod tests {
         let expected = expected.expect("mid-width systematic solve should decode");
 
         let (decoded, ops) = fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_symbols);
-        assert!(
-            decoded.is_none(),
-            "mid-width systematic planning should defer to cached replay"
+        assert_eq!(
+            decoded.expect("mid-width systematic solve should decode"),
+            expected
         );
         let ops = ops.expect("mid-width systematic solve should record a cached replay");
 
@@ -8817,6 +8827,41 @@ mod tests {
             crate::operation_vector::perform_op(op, &mut replayed);
         }
         assert_eq!(replayed, expected);
+    }
+
+    #[test]
+    fn ci_mid_count_systematic_plans_record_cached_replay() {
+        for source_symbols in [100, 250] {
+            let k_prime = extended_source_block_symbols(source_symbols);
+            let width = num_intermediate_symbols(source_symbols) as usize;
+            assert!(width >= CACHED_SYSTEMATIC_PLAN_RECORDING_MIN_WIDTH);
+            assert!(width < DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH);
+
+            let symbols = SymbolSlab::with_zeros(width, 1);
+            let indices: Vec<u32> = (0..k_prime).collect();
+            let (matrix, hdpc_rows) =
+                generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+
+            let (decoded, ops) =
+                fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_symbols);
+            let decoded = decoded.expect("systematic plan should still return decoded symbols");
+            assert_eq!(decoded.len(), width);
+            assert!(decoded.as_bytes().iter().all(|&byte| byte == 0));
+            match ops
+                .expect("systematic plan should record one cached replay")
+                .as_slice()
+            {
+                [
+                    SymbolOps::DirectSystematicSolve {
+                        source_block_symbols,
+                    }
+                    | SymbolOps::ApplyCachedSystematicPlan {
+                        source_block_symbols,
+                    },
+                ] => assert_eq!(*source_block_symbols, k_prime),
+                _ => panic!("systematic plan should record one cached replay op"),
+            }
+        }
     }
 
     #[test]
