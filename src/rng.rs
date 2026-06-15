@@ -1,24 +1,38 @@
 #[inline]
 pub fn rand(y: u32, i: u32, m: u32) -> u32 {
-    RfcRand::new(y).get(i, m)
+    debug_assert!(i < 256);
+    debug_assert!(m > 0);
+
+    let i = i as usize;
+    let x0 = ((y & 0xff) as usize + i) & 0xff;
+    let x1 = (((y >> 8) & 0xff) as usize + i) & 0xff;
+    let x2 = (((y >> 16) & 0xff) as usize + i) & 0xff;
+    let x3 = (((y >> 24) & 0xff) as usize + i) & 0xff;
+
+    let value = V0[x0] ^ V1[x1] ^ V2[x2] ^ V3[x3];
+    match m {
+        DEGREE_RANDOM_MODULUS => value & (DEGREE_RANDOM_MODULUS - 1),
+        D1_RANDOM_MODULUS => value & (D1_RANDOM_MODULUS - 1),
+        _ => value % m,
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct RfcRand {
-    x0: usize,
-    x1: usize,
-    x2: usize,
-    x3: usize,
+    x0: u32,
+    x1: u32,
+    x2: u32,
+    x3: u32,
 }
 
 impl RfcRand {
     #[inline]
     pub(crate) fn new(y: u32) -> RfcRand {
         RfcRand {
-            x0: (y & 0xff) as usize,
-            x1: ((y >> 8) & 0xff) as usize,
-            x2: ((y >> 16) & 0xff) as usize,
-            x3: ((y >> 24) & 0xff) as usize,
+            x0: y & 0xff,
+            x1: (y >> 8) & 0xff,
+            x2: (y >> 16) & 0xff,
+            x3: (y >> 24) & 0xff,
         }
     }
 
@@ -26,11 +40,10 @@ impl RfcRand {
     pub(crate) fn get_raw(self, i: u32) -> u32 {
         debug_assert!(i < 256);
 
-        let i = i as usize;
-        let x0 = (self.x0 + i) & 0xff;
-        let x1 = (self.x1 + i) & 0xff;
-        let x2 = (self.x2 + i) & 0xff;
-        let x3 = (self.x3 + i) & 0xff;
+        let x0 = ((self.x0 + i) & 0xff) as usize;
+        let x1 = ((self.x1 + i) & 0xff) as usize;
+        let x2 = ((self.x2 + i) & 0xff) as usize;
+        let x3 = ((self.x3 + i) & 0xff) as usize;
 
         V0[x0] ^ V1[x1] ^ V2[x2] ^ V3[x3]
     }
