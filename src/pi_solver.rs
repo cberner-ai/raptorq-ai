@@ -1621,6 +1621,19 @@ fn direct_decode_back_substitution_layout(width: usize) -> DirectBackSubstitutio
 }
 
 #[cfg(feature = "std")]
+#[inline]
+fn use_direct_collect_sources_by_dest(
+    width: usize,
+    binary_height: usize,
+    h: usize,
+    layout: DirectBackSubstitutionLayout,
+) -> bool {
+    binary_height + h == width
+        && width >= DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH
+        && matches!(layout, DirectBackSubstitutionLayout::SourcesByDest)
+}
+
+#[cfg(feature = "std")]
 fn prepare_direct_systematic_plan_with_small_weight_max<
     const SMALL_WEIGHT_MAX: usize,
     M: BinaryMatrix,
@@ -1792,12 +1805,8 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
     let mut hdpc_update_ranges = Vec::with_capacity(pivot_count);
     let mut hdpc_update_entries = Vec::with_capacity(pivot_count.saturating_mul(h));
     let mut hdpc_update_unit_only = Vec::with_capacity(pivot_count);
-    let direct_collect_sources_by_dest = trust_source_batch_bounds
-        && width >= DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH
-        && matches!(
-            back_substitution_layout,
-            DirectBackSubstitutionLayout::SourcesByDest
-        );
+    let direct_collect_sources_by_dest =
+        use_direct_collect_sources_by_dest(width, binary_height, h, back_substitution_layout);
     let mut back_substitution_counts = if direct_collect_sources_by_dest {
         Vec::new()
     } else {
@@ -9402,6 +9411,38 @@ mod tests {
                 DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
             ),
             DirectBackSubstitutionLayout::SourcesByDest
+        ));
+    }
+
+    #[test]
+    fn direct_collect_source_batches_stays_on_square_source_by_dest_plans() {
+        let width = DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH;
+        let h = 10;
+        let square_binary_height = width - h;
+
+        assert!(use_direct_collect_sources_by_dest(
+            width,
+            square_binary_height,
+            h,
+            DirectBackSubstitutionLayout::SourcesByDest
+        ));
+        assert!(!use_direct_collect_sources_by_dest(
+            width - 1,
+            square_binary_height - 1,
+            h,
+            DirectBackSubstitutionLayout::SourcesByDest
+        ));
+        assert!(!use_direct_collect_sources_by_dest(
+            width,
+            square_binary_height + 1,
+            h,
+            DirectBackSubstitutionLayout::SourcesByDest
+        ));
+        assert!(!use_direct_collect_sources_by_dest(
+            width,
+            square_binary_height,
+            h,
+            DirectBackSubstitutionLayout::DestsBySource
         ));
     }
 
