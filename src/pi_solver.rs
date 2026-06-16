@@ -92,6 +92,8 @@ const DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const CACHED_HDPC_FREE_SOLVE_MAX_WIDTH: usize = 10_000;
 #[cfg(feature = "std")]
+const DIRECT_CACHED_HDPC_FREE_SOLVE_MAX_WIDTH: usize = HYBRID_MAX_WIDTH;
+#[cfg(feature = "std")]
 const DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 128;
 #[cfg(all(feature = "std", not(test)))]
 const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH;
@@ -1893,7 +1895,8 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
         h,
         hdpc_coefficient_stride,
     )?;
-    let hdpc_free_solve = (trust_source_batch_bounds && width <= CACHED_HDPC_FREE_SOLVE_MAX_WIDTH)
+    let hdpc_free_solve = (trust_source_batch_bounds
+        && width <= DIRECT_CACHED_HDPC_FREE_SOLVE_MAX_WIDTH)
         .then(|| {
             prepare_cached_hdpc_free_solve_from_direct_rows(&hdpc_free_rows, free_cols.len(), 1)
         })
