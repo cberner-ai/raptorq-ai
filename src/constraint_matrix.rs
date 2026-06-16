@@ -230,23 +230,24 @@ fn fill_encoded_row<M: BinaryMatrix>(
     let (d, a, mut b, d1, a1, mut b1) = source_tuple;
     matrix.reserve_row_entries(row, (d + d1) as usize);
 
-    xor_one(matrix, row, b as usize);
+    // W and P1 are prime, so the non-zero LT/PI steps cannot revisit a column within one tuple.
+    xor_one_unique(matrix, row, b as usize);
     for _ in 1..d {
         b = add_mod_once(b, a, params.lt_symbols);
-        xor_one(matrix, row, b as usize);
+        xor_one_unique(matrix, row, b as usize);
     }
 
     while b1 >= params.pi_symbols {
         b1 = add_mod_once(b1, a1, params.p1);
     }
-    xor_one(matrix, row, (params.lt_symbols + b1) as usize);
+    xor_one_unique(matrix, row, (params.lt_symbols + b1) as usize);
 
     for _ in 1..d1 {
         b1 = add_mod_once(b1, a1, params.p1);
         while b1 >= params.pi_symbols {
             b1 = add_mod_once(b1, a1, params.p1);
         }
-        xor_one(matrix, row, (params.lt_symbols + b1) as usize);
+        xor_one_unique(matrix, row, (params.lt_symbols + b1) as usize);
     }
 }
 
@@ -381,10 +382,6 @@ fn generate_hdpc_rows_uncached(k_prime: u32) -> DenseOctetMatrix {
     rows
 }
 
-fn xor_one<M: BinaryMatrix>(matrix: &mut M, row: usize, col: usize) {
-    matrix.toggle(row, col);
-}
-
 fn xor_one_unique<M: BinaryMatrix>(matrix: &mut M, row: usize, col: usize) {
     matrix.toggle_unique(row, col);
 }
@@ -434,6 +431,42 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn benchmark_encoded_rows_have_unique_indices() {
+        let source_symbol_counts = [250u32, 500, 1000, 2000, 5000, 10000, 20000, 50000];
+
+        for source_symbols in source_symbol_counts {
+            let k_prime = extended_source_block_symbols(source_symbols);
+            let params = EncodingTupleParameters::new(k_prime);
+            let checked_prefix = k_prime + (k_prime / 20).max(1);
+            for isi in 0..checked_prefix {
+                assert_unique_tuple_indices(params, isi);
+            }
+            for isi in [
+                checked_prefix.saturating_mul(2),
+                checked_prefix.saturating_mul(17).saturating_add(3),
+                1_000_000,
+            ] {
+                assert_unique_tuple_indices(params, isi);
+            }
+        }
+    }
+
+    fn assert_unique_tuple_indices(params: EncodingTupleParameters, isi: u32) {
+        let mut entries = Vec::new();
+        enc_indices(
+            params.tuple(isi),
+            params.lt_symbols,
+            params.pi_symbols,
+            params.p1,
+            |col| entries.push(col),
+        );
+        let len = entries.len();
+        entries.sort_unstable();
+        entries.dedup();
+        assert_eq!(entries.len(), len, "duplicate encoding index for ISI {isi}");
     }
 
     #[test]
