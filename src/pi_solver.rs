@@ -3246,6 +3246,42 @@ fn addassign_symbol_sources_raw_impl<
         }
     }
 
+    let mut source_chunks = source_chunks.remainder().chunks_exact(3);
+    for chunk in source_chunks.by_ref() {
+        let src0_start = chunk[0].symbol_source_index() * symbol_size;
+        let src1_start = chunk[1].symbol_source_index() * symbol_size;
+        let src2_start = chunk[2].symbol_source_index() * symbol_size;
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src0_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src1_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src2_start, symbol_size, source_len);
+        unsafe {
+            add_assign_path.apply_sources_same_len_raw_3(
+                dest_ptr,
+                [
+                    source_base.add(src0_start),
+                    source_base.add(src1_start),
+                    source_base.add(src2_start),
+                ],
+                symbol_size,
+            );
+        }
+    }
+
+    let mut source_chunks = source_chunks.remainder().chunks_exact(2);
+    for chunk in source_chunks.by_ref() {
+        let src0_start = chunk[0].symbol_source_index() * symbol_size;
+        let src1_start = chunk[1].symbol_source_index() * symbol_size;
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src0_start, symbol_size, source_len);
+        check_source_bounds::<CHECK_SOURCE_BOUNDS>(src1_start, symbol_size, source_len);
+        unsafe {
+            add_assign_path.apply_sources_same_len_raw_2(
+                dest_ptr,
+                [source_base.add(src0_start), source_base.add(src1_start)],
+                symbol_size,
+            );
+        }
+    }
+
     for &source in source_chunks.remainder() {
         let source_start = source.symbol_source_index() * symbol_size;
         check_source_bounds::<CHECK_SOURCE_BOUNDS>(source_start, symbol_size, source_len);
