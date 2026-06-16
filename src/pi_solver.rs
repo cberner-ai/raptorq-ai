@@ -73,6 +73,10 @@ const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
+const MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 1_000;
+#[cfg(feature = "std")]
+const MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH: usize = 1_500;
+#[cfg(feature = "std")]
 const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
@@ -112,6 +116,14 @@ const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
+
+#[cfg(feature = "std")]
+#[inline]
+fn use_direct_systematic_solve(width: usize) -> bool {
+    width >= DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH
+        || (MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+            .contains(&width)
+}
 
 fn coefficient_col(col: usize) -> CoefficientColumn {
     debug_assert!(CoefficientColumn::try_from(col).is_ok());
@@ -160,7 +172,7 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
         let source_block_symbols = extended_source_block_symbols(source_block_symbols);
         #[cfg(feature = "std")]
         {
-            if matrix.width() < DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH {
+            if !use_direct_systematic_solve(matrix.width()) {
                 let width = matrix.width();
                 if cached_hybrid_systematic_plan_from_matrix(
                     source_block_symbols,
@@ -2310,7 +2322,7 @@ fn try_apply_prepared_direct_systematic_plan(
             slices,
             non_empty_sources,
         } => {
-            if plan.width >= DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH {
+            if use_direct_systematic_solve(plan.width) {
                 for &src in non_empty_sources.iter().rev() {
                     let src = coefficient_col_index(src);
                     addassign_direct_symbol_batch_nonzero_source(
@@ -2335,7 +2347,7 @@ fn try_apply_prepared_direct_systematic_plan(
             slices,
             non_empty_dests,
         } => {
-            if plan.width >= DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH {
+            if use_direct_systematic_solve(plan.width) {
                 for &dest in non_empty_dests.iter().rev() {
                     let dest = coefficient_col_index(dest);
                     addassign_direct_symbol_source_batch_from_plan(
@@ -8967,7 +8979,7 @@ mod tests {
         (1..=SQUARE_HYBRID_MAX_WIDTH as u32)
             .find(|&source_symbols| {
                 let width = num_intermediate_symbols(source_symbols) as usize;
-                (DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..=SQUARE_HYBRID_MAX_WIDTH).contains(&width)
+                use_direct_systematic_solve(width)
             })
             .expect("direct systematic test threshold should be reachable")
     }
@@ -9116,6 +9128,34 @@ mod tests {
             crate::operation_vector::perform_op(op, &mut replayed);
         }
         assert_eq!(replayed, decoded);
+    }
+
+    #[test]
+    fn ci_1000_systematic_plan_uses_direct_systematic_solve() {
+        let source_symbols = 1_000;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        assert!(use_direct_systematic_solve(width));
+
+        let symbols = SymbolSlab::with_zeros(width, 1);
+        let indices: Vec<u32> = (0..k_prime).collect();
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        let (decoded, ops) = fused_inverse_mul_symbols(matrix, hdpc_rows, symbols, source_symbols);
+        assert_eq!(
+            decoded
+                .expect("1000-symbol direct systematic solve should decode")
+                .len(),
+            width
+        );
+        assert!(matches!(
+            ops.expect("1000-symbol direct systematic solve should be recorded")
+                .as_slice(),
+            [SymbolOps::DirectSystematicSolve {
+                source_block_symbols
+            }] if *source_block_symbols == k_prime
+        ));
     }
 
     #[test]
