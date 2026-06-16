@@ -73,7 +73,7 @@ const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
-const LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 250;
+const LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 128;
 #[cfg(feature = "std")]
 const LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH: usize = 500;
 #[cfg(feature = "std")]
@@ -9432,27 +9432,28 @@ mod tests {
     }
 
     #[test]
-    fn ci_250_systematic_plan_uses_low_width_direct_solve() {
-        let source_symbols = 250;
-        let k_prime = extended_source_block_symbols(source_symbols);
-        let width = num_intermediate_symbols(source_symbols) as usize;
-        assert!(
-            (LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
-                .contains(&width)
-        );
-        assert!(use_direct_systematic_solve(width));
-        assert!(use_direct_source_batch_back_substitution(width));
+    fn ci_100_and_250_systematic_plans_use_low_width_direct_solve() {
+        for source_symbols in [100, 250] {
+            let k_prime = extended_source_block_symbols(source_symbols);
+            let width = num_intermediate_symbols(source_symbols) as usize;
+            assert!(
+                (LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+                    .contains(&width)
+            );
+            assert!(use_direct_systematic_solve(width));
+            assert!(use_direct_source_batch_back_substitution(width));
 
-        let indices: Vec<u32> = (0..k_prime).collect();
-        let (matrix, hdpc_rows) =
-            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
-        let plan = prepare_direct_systematic_plan(&matrix, &hdpc_rows, source_symbols)
-            .expect("250-symbol direct plan should build");
+            let indices: Vec<u32> = (0..k_prime).collect();
+            let (matrix, hdpc_rows) =
+                generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+            let plan = prepare_direct_systematic_plan(&matrix, &hdpc_rows, source_symbols)
+                .expect("low-width direct plan should build");
 
-        assert!(matches!(
-            &plan.back_substitution,
-            DirectSystematicBackSubstitution::SourcesByDest { .. }
-        ));
+            assert!(matches!(
+                &plan.back_substitution,
+                DirectSystematicBackSubstitution::SourcesByDest { .. }
+            ));
+        }
     }
 
     #[test]
