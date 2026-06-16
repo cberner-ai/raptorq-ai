@@ -81,7 +81,9 @@ const MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 500;
 #[cfg(feature = "std")]
 const MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH: usize = 1_500;
 #[cfg(feature = "std")]
-const LOW_DIRECT_HYBRID_REPLAY_WARM_MAX_WIDTH: usize = LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH;
+const TRUSTED_MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH: usize = 2_500;
+#[cfg(feature = "std")]
+const LOW_DIRECT_HYBRID_REPLAY_WARM_MAX_WIDTH: usize = LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH;
 const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
@@ -140,11 +142,29 @@ fn use_direct_systematic_solve(width: usize) -> bool {
 
 #[cfg(feature = "std")]
 #[inline]
+fn use_trusted_direct_systematic_solve(width: usize) -> bool {
+    use_direct_systematic_solve(width)
+        || (MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH..TRUSTED_MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+            .contains(&width)
+}
+
+#[cfg(feature = "std")]
+#[inline]
 fn use_direct_source_batch_back_substitution(width: usize) -> bool {
     width >= DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
         || (LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
             .contains(&width)
         || (MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+            .contains(&width)
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn use_trusted_direct_source_batch_back_substitution(width: usize) -> bool {
+    width >= DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
+        || (LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+            .contains(&width)
+        || (MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..TRUSTED_MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
             .contains(&width)
 }
 
@@ -195,7 +215,7 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
         let source_block_symbols = extended_source_block_symbols(source_block_symbols);
         #[cfg(feature = "std")]
         {
-            if !use_direct_systematic_solve(matrix.width()) {
+            if !use_trusted_direct_systematic_solve(matrix.width()) {
                 let width = matrix.width();
                 if cached_hybrid_systematic_plan_from_matrix(
                     source_block_symbols,
@@ -1615,7 +1635,10 @@ fn prepare_direct_systematic_plan_for_decode<M: BinaryMatrix>(
 
 #[cfg(feature = "std")]
 fn direct_decode_back_substitution_layout(width: usize) -> DirectBackSubstitutionLayout {
-    if width >= DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH {
+    if width >= DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
+        || (MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH..TRUSTED_MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+            .contains(&width)
+    {
         DirectBackSubstitutionLayout::SourcesByDest
     } else {
         DirectBackSubstitutionLayout::DestsBySource
@@ -1650,10 +1673,18 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
     let h = hdpc_rows.height();
     let width = matrix.width();
     let binary_height = matrix.height();
+    let source_batch_back_substitution = if trust_source_batch_bounds {
+        use_trusted_direct_source_batch_back_substitution(width)
+    } else {
+        use_direct_source_batch_back_substitution(width)
+            || (MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH
+                ..TRUSTED_MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+                .contains(&width)
+    };
     let back_substitution_layout = if matches!(
         back_substitution_layout,
         DirectBackSubstitutionLayout::SourcesByDest
-    ) && use_direct_source_batch_back_substitution(width)
+    ) && source_batch_back_substitution
     {
         DirectBackSubstitutionLayout::SourcesByDest
     } else {
@@ -2452,12 +2483,13 @@ fn try_apply_prepared_direct_systematic_plan(
             .get_mut(coefficient_col_index(col))
             .copy_from_slice(free_values.get(free_index));
     }
+    let use_non_empty_back_substitution = use_direct_systematic_solve(plan.width);
     match &plan.back_substitution {
         DirectSystematicBackSubstitution::DestsBySource {
             slices,
             non_empty_sources,
         } => {
-            if use_direct_systematic_solve(plan.width) {
+            if use_non_empty_back_substitution {
                 for &src in non_empty_sources.iter().rev() {
                     let src = coefficient_col_index(src);
                     addassign_direct_symbol_batch_nonzero_source(
@@ -2482,7 +2514,7 @@ fn try_apply_prepared_direct_systematic_plan(
             slices,
             non_empty_dests,
         } => {
-            if use_direct_systematic_solve(plan.width) {
+            if use_non_empty_back_substitution {
                 for &dest in non_empty_dests.iter().rev() {
                     let dest = coefficient_col_index(dest);
                     addassign_direct_symbol_source_batch_from_plan(
@@ -9347,6 +9379,55 @@ mod tests {
             [SymbolOps::DirectSystematicSolve {
                 source_block_symbols
             }] if *source_block_symbols == k_prime
+        ));
+    }
+
+    #[test]
+    fn ci_2000_systematic_plan_uses_trusted_direct_solve_and_source_batches() {
+        let source_symbols = 2_000;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        assert!(!use_direct_systematic_solve(width));
+        assert!(use_trusted_direct_systematic_solve(width));
+        assert!(matches!(
+            direct_decode_back_substitution_layout(width),
+            DirectBackSubstitutionLayout::SourcesByDest
+        ));
+
+        let symbols = SymbolSlab::with_zeros(width, 1);
+        let indices: Vec<u32> = (0..k_prime).collect();
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        let (decoded, ops) =
+            fused_inverse_mul_symbols(matrix.clone(), hdpc_rows.clone(), symbols, source_symbols);
+        assert_eq!(
+            decoded
+                .expect("2000-symbol trusted direct systematic solve should decode")
+                .len(),
+            width
+        );
+        assert!(matches!(
+            ops.expect("2000-symbol trusted direct systematic solve should be recorded")
+                .as_slice(),
+            [SymbolOps::DirectSystematicSolve {
+                source_block_symbols
+            }] if *source_block_symbols == k_prime
+        ));
+
+        let encode_plan = prepare_direct_systematic_plan(&matrix, &hdpc_rows, source_symbols)
+            .expect("trusted 2000-symbol direct plan should build");
+        assert!(matches!(
+            &encode_plan.back_substitution,
+            DirectSystematicBackSubstitution::SourcesByDest { .. }
+        ));
+
+        let decode_plan =
+            prepare_direct_systematic_plan_for_decode(&matrix, &hdpc_rows, source_symbols)
+                .expect("decode 2000-symbol direct plan should build");
+        assert!(matches!(
+            &decode_plan.back_substitution,
+            DirectSystematicBackSubstitution::SourcesByDest { .. }
         ));
     }
 
