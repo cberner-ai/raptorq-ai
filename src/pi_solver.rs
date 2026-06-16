@@ -86,7 +86,7 @@ const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
-const DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 50_000;
+const DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const CACHED_HDPC_FREE_SOLVE_MAX_WIDTH: usize = 10_000;
 #[cfg(feature = "std")]
@@ -9308,7 +9308,7 @@ mod tests {
     }
 
     #[test]
-    fn source_batched_decode_plan_is_limited_to_very_large_widths() {
+    fn source_batched_decode_plan_starts_at_large_width() {
         assert!(matches!(
             direct_decode_back_substitution_layout(
                 DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH - 1
