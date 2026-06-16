@@ -406,6 +406,7 @@ struct DirectSystematicPlan {
     hdpc_update_pivots: Box<[CoefficientColumn]>,
     hdpc_updates: CachedSystematicSlices,
     hdpc_free_rows: DirectSystematicFreeRows,
+    hdpc_free_solve: Option<CachedHdpcFreeSolve>,
     free_cols: Box<[CoefficientColumn]>,
     pivot_symbol_moves: Vec<Box<[usize]>>,
     back_substitution: DirectSystematicBackSubstitution,
@@ -1793,6 +1794,11 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
         h,
         hdpc_coefficient_stride,
     )?;
+    let hdpc_free_solve = (trust_source_batch_bounds && width <= CACHED_HDPC_FREE_SOLVE_MAX_WIDTH)
+        .then(|| {
+            prepare_cached_hdpc_free_solve_from_direct_rows(&hdpc_free_rows, free_cols.len(), 1)
+        })
+        .flatten();
     let back_substitution_slices = prepare_direct_back_substitution_batches(
         back_substitution_counts,
         back_substitution_entries,
@@ -1824,6 +1830,7 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
         hdpc_update_pivots: hdpc_update_pivots.into_boxed_slice(),
         hdpc_updates,
         hdpc_free_rows,
+        hdpc_free_solve,
         free_cols: free_cols.into_boxed_slice(),
         pivot_symbol_moves,
         back_substitution,
@@ -2283,6 +2290,7 @@ fn try_apply_prepared_direct_systematic_plan(
 
     let free_values = solve_prepared_hdpc_free_variables(
         &plan.hdpc_free_rows,
+        plan.hdpc_free_solve.as_ref(),
         hdpc_symbols,
         plan.free_cols.len(),
         symbol_size,
@@ -2441,6 +2449,7 @@ fn direct_pivot_symbol_moves(
 #[cfg(feature = "std")]
 fn solve_prepared_hdpc_free_variables(
     rows: &[Box<[(CoefficientColumn, Octet)]>],
+    cached_solve: Option<&CachedHdpcFreeSolve>,
     hdpc_symbols: SymbolSlab,
     free_count: usize,
     symbol_size: usize,
@@ -2455,6 +2464,10 @@ fn solve_prepared_hdpc_free_variables(
             }
         }
         return Some(SymbolSlab::with_zeros(0, symbol_size));
+    }
+
+    if let Some(cached_solve) = cached_solve {
+        return apply_cached_hdpc_free_solve(cached_solve, hdpc_symbols);
     }
 
     let rows = rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>();
@@ -2484,6 +2497,20 @@ fn prepare_cached_hdpc_free_solve_from_rows(
         height,
         free_count,
     })
+}
+
+#[cfg(feature = "std")]
+fn prepare_cached_hdpc_free_solve_from_direct_rows(
+    rows: &DirectSystematicFreeRows,
+    free_count: usize,
+    symbol_size: usize,
+) -> Option<CachedHdpcFreeSolve> {
+    if free_count == 0 {
+        return None;
+    }
+
+    let rows = rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>();
+    prepare_cached_hdpc_free_solve_from_rows(&rows, free_count, symbol_size)
 }
 
 #[cfg(feature = "std")]
@@ -7937,6 +7964,7 @@ mod tests {
                 unit_only: Vec::new(),
             },
             hdpc_free_rows: Vec::new(),
+            hdpc_free_solve: None,
             free_cols: vec![coefficient_col(4)].into_boxed_slice(),
             pivot_symbol_moves: direct_pivot_symbol_moves(&pivot_for_col, 1, 1, 5),
             back_substitution: DirectSystematicBackSubstitution::SourcesByDest {
@@ -7973,6 +8001,7 @@ mod tests {
                 unit_only: Vec::new(),
             },
             hdpc_free_rows: Vec::new(),
+            hdpc_free_solve: None,
             free_cols: Vec::new().into_boxed_slice(),
             pivot_symbol_moves: Vec::new(),
             back_substitution: DirectSystematicBackSubstitution::SourcesByDest {
@@ -8030,6 +8059,7 @@ mod tests {
                 unit_only: Vec::new(),
             },
             hdpc_free_rows: Vec::new(),
+            hdpc_free_solve: None,
             free_cols: Vec::new().into_boxed_slice(),
             pivot_symbol_moves: Vec::new(),
             back_substitution: DirectSystematicBackSubstitution::SourcesByDest {
@@ -9105,6 +9135,14 @@ mod tests {
             &plan.back_substitution,
             DirectSystematicBackSubstitution::SourcesByDest { .. }
         ));
+        if !plan.free_cols.is_empty() {
+            assert!(plan.hdpc_free_solve.is_some());
+        }
+
+        let decode_plan =
+            prepare_direct_systematic_plan_for_decode(&matrix, &hdpc_rows, source_symbols)
+                .expect("direct decode plan should build");
+        assert!(decode_plan.hdpc_free_solve.is_none());
     }
 
     #[test]
