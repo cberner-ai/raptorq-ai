@@ -86,6 +86,8 @@ const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
+const DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH: usize = 20_000;
+#[cfg(feature = "std")]
 const DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const CACHED_HDPC_FREE_SOLVE_MAX_WIDTH: usize = 10_000;
@@ -1790,10 +1792,38 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
     let mut hdpc_update_ranges = Vec::with_capacity(pivot_count);
     let mut hdpc_update_entries = Vec::with_capacity(pivot_count.saturating_mul(h));
     let mut hdpc_update_unit_only = Vec::with_capacity(pivot_count);
-    let mut back_substitution_counts = vec![0usize; width];
-    let mut back_substitution_entries = Vec::with_capacity(back_substitution_capacity);
+    let direct_collect_sources_by_dest = trust_source_batch_bounds
+        && width >= DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH
+        && matches!(
+            back_substitution_layout,
+            DirectBackSubstitutionLayout::SourcesByDest
+        );
+    let mut back_substitution_counts = if direct_collect_sources_by_dest {
+        Vec::new()
+    } else {
+        vec![0usize; width]
+    };
+    let mut back_substitution_entries = if direct_collect_sources_by_dest {
+        Vec::new()
+    } else {
+        Vec::with_capacity(back_substitution_capacity)
+    };
+    let mut direct_source_ranges = if direct_collect_sources_by_dest {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
+    let mut direct_source_entries = if direct_collect_sources_by_dest {
+        Vec::with_capacity(back_substitution_capacity)
+    } else {
+        Vec::new()
+    };
     for (col, &pivot) in pivot_for_col.iter().enumerate() {
+        let direct_source_start = direct_source_entries.len();
         if pivot == NO_COEFFICIENT_COLUMN {
+            if direct_collect_sources_by_dest {
+                direct_source_ranges.push((direct_source_start, direct_source_start));
+            }
             continue;
         }
         let pivot = coefficient_col_index(pivot);
@@ -1806,11 +1836,13 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
                     &mut hdpc_coefficients,
                     h,
                     col,
-                    DirectBackSubstitutionWork {
-                        counts: &mut back_substitution_counts,
-                        entries: &mut back_substitution_entries,
-                        layout: back_substitution_layout,
-                    },
+                    direct_back_substitution_work(
+                        back_substitution_layout,
+                        direct_collect_sources_by_dest,
+                        &mut back_substitution_counts,
+                        &mut back_substitution_entries,
+                        &mut direct_source_entries,
+                    ),
                     &mut hdpc_update_entries,
                 )
             } else {
@@ -1820,14 +1852,19 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
                     h,
                     col,
                     pivot,
-                    DirectBackSubstitutionWork {
-                        counts: &mut back_substitution_counts,
-                        entries: &mut back_substitution_entries,
-                        layout: back_substitution_layout,
-                    },
+                    direct_back_substitution_work(
+                        back_substitution_layout,
+                        direct_collect_sources_by_dest,
+                        &mut back_substitution_counts,
+                        &mut back_substitution_entries,
+                        &mut direct_source_entries,
+                    ),
                     &mut hdpc_update_entries,
                 )
             };
+        if direct_collect_sources_by_dest {
+            direct_source_ranges.push((direct_source_start, direct_source_entries.len()));
+        }
         if update_start != hdpc_update_entries.len() {
             hdpc_update_pivots.push(coefficient_col(direct_binary_symbol_index(pivot, s, h)));
             hdpc_update_ranges.push((update_start, hdpc_update_entries.len()));
@@ -1852,10 +1889,18 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
             prepare_cached_hdpc_free_solve_from_direct_rows(&hdpc_free_rows, free_cols.len(), 1)
         })
         .flatten();
-    let back_substitution_slices = prepare_direct_back_substitution_batches(
-        back_substitution_counts,
-        back_substitution_entries,
-    );
+    let back_substitution_slices = if direct_collect_sources_by_dest {
+        debug_assert_eq!(direct_source_ranges.len(), width);
+        DirectSystematicSlices {
+            ranges: direct_source_ranges,
+            entries: direct_source_entries,
+        }
+    } else {
+        prepare_direct_back_substitution_batches(
+            back_substitution_counts,
+            back_substitution_entries,
+        )
+    };
     let non_empty_back_substitution_slices =
         direct_non_empty_slice_indices(&back_substitution_slices);
     let back_substitution = match back_substitution_layout {
@@ -2023,26 +2068,63 @@ fn direct_non_empty_slice_indices(slices: &DirectSystematicSlices) -> Box<[Coeff
 }
 
 #[cfg(feature = "std")]
-struct DirectBackSubstitutionWork<'a> {
-    counts: &'a mut [usize],
-    entries: &'a mut Vec<(CoefficientColumn, CoefficientColumn)>,
-    layout: DirectBackSubstitutionLayout,
+enum DirectBackSubstitutionWork<'a> {
+    Scatter {
+        counts: &'a mut [usize],
+        entries: &'a mut Vec<(CoefficientColumn, CoefficientColumn)>,
+        layout: DirectBackSubstitutionLayout,
+    },
+    DirectSourcesByDest {
+        entries: &'a mut Vec<CoefficientColumn>,
+    },
 }
 
 #[cfg(feature = "std")]
 impl DirectBackSubstitutionWork<'_> {
     fn push(&mut self, dest_col: usize, source_col: usize) {
-        match self.layout {
-            DirectBackSubstitutionLayout::DestsBySource => {
-                self.counts[source_col] += 1;
-                self.entries
-                    .push((coefficient_col(source_col), coefficient_col(dest_col)));
+        match self {
+            DirectBackSubstitutionWork::Scatter {
+                counts,
+                entries,
+                layout,
+            } => match layout {
+                DirectBackSubstitutionLayout::DestsBySource => {
+                    counts[source_col] += 1;
+                    entries.push((coefficient_col(source_col), coefficient_col(dest_col)));
+                }
+                DirectBackSubstitutionLayout::SourcesByDest => {
+                    counts[dest_col] += 1;
+                    entries.push((coefficient_col(dest_col), coefficient_col(source_col)));
+                }
+            },
+            DirectBackSubstitutionWork::DirectSourcesByDest { entries } => {
+                entries.push(coefficient_col(source_col));
             }
-            DirectBackSubstitutionLayout::SourcesByDest => {
-                self.counts[dest_col] += 1;
-                self.entries
-                    .push((coefficient_col(dest_col), coefficient_col(source_col)));
-            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+fn direct_back_substitution_work<'a>(
+    layout: DirectBackSubstitutionLayout,
+    direct_collect_sources_by_dest: bool,
+    counts: &'a mut [usize],
+    entries: &'a mut Vec<(CoefficientColumn, CoefficientColumn)>,
+    direct_source_entries: &'a mut Vec<CoefficientColumn>,
+) -> DirectBackSubstitutionWork<'a> {
+    if direct_collect_sources_by_dest {
+        debug_assert!(matches!(
+            layout,
+            DirectBackSubstitutionLayout::SourcesByDest
+        ));
+        DirectBackSubstitutionWork::DirectSourcesByDest {
+            entries: direct_source_entries,
+        }
+    } else {
+        DirectBackSubstitutionWork::Scatter {
+            counts,
+            entries,
+            layout,
         }
     }
 }
