@@ -123,6 +123,60 @@ impl AddAssignFastPath {
         }
     }
 
+    /// Applies two source slices into one destination slice.
+    ///
+    /// # Safety
+    ///
+    /// `dest` and every source pointer must be valid for `len` bytes. The destination must be
+    /// writable and must not overlap any source.
+    pub(crate) unsafe fn apply_sources_same_len_raw_2(
+        self,
+        dest: *mut u8,
+        srcs: [*const u8; 2],
+        len: usize,
+    ) {
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_avx2 {
+            unsafe {
+                add_assign_sources_2_avx2(dest, srcs, len);
+            }
+            return;
+        }
+
+        let dest = unsafe { core::slice::from_raw_parts_mut(dest, len) };
+        for src in srcs {
+            let src = unsafe { core::slice::from_raw_parts(src, len) };
+            add_assign_scalar(dest, src);
+        }
+    }
+
+    /// Applies three source slices into one destination slice.
+    ///
+    /// # Safety
+    ///
+    /// `dest` and every source pointer must be valid for `len` bytes. The destination must be
+    /// writable and must not overlap any source.
+    pub(crate) unsafe fn apply_sources_same_len_raw_3(
+        self,
+        dest: *mut u8,
+        srcs: [*const u8; 3],
+        len: usize,
+    ) {
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_avx2 {
+            unsafe {
+                add_assign_sources_3_avx2(dest, srcs, len);
+            }
+            return;
+        }
+
+        let dest = unsafe { core::slice::from_raw_parts_mut(dest, len) };
+        for src in srcs {
+            let src = unsafe { core::slice::from_raw_parts(src, len) };
+            add_assign_scalar(dest, src);
+        }
+    }
+
     /// Applies four source slices into one destination slice.
     ///
     /// # Safety
@@ -780,6 +834,64 @@ unsafe fn add_assign_8_avx2(dests: [*mut u8; 8], src: *const u8, len: usize) {
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
+unsafe fn add_assign_sources_2_avx2(dest: *mut u8, srcs: [*const u8; 2], len: usize) {
+    let mut offset = 0usize;
+    while offset + 128 <= len {
+        unsafe {
+            xor_sources_2_32(dest, srcs, offset);
+            xor_sources_2_32(dest, srcs, offset + 32);
+            xor_sources_2_32(dest, srcs, offset + 64);
+            xor_sources_2_32(dest, srcs, offset + 96);
+        }
+        offset += 128;
+    }
+    while offset + 32 <= len {
+        unsafe {
+            xor_sources_2_32(dest, srcs, offset);
+        }
+        offset += 32;
+    }
+
+    if offset < len {
+        let dest = unsafe { core::slice::from_raw_parts_mut(dest.add(offset), len - offset) };
+        for src in srcs {
+            let src = unsafe { core::slice::from_raw_parts(src.add(offset), len - offset) };
+            add_assign_scalar(dest, src);
+        }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn add_assign_sources_3_avx2(dest: *mut u8, srcs: [*const u8; 3], len: usize) {
+    let mut offset = 0usize;
+    while offset + 128 <= len {
+        unsafe {
+            xor_sources_3_32(dest, srcs, offset);
+            xor_sources_3_32(dest, srcs, offset + 32);
+            xor_sources_3_32(dest, srcs, offset + 64);
+            xor_sources_3_32(dest, srcs, offset + 96);
+        }
+        offset += 128;
+    }
+    while offset + 32 <= len {
+        unsafe {
+            xor_sources_3_32(dest, srcs, offset);
+        }
+        offset += 32;
+    }
+
+    if offset < len {
+        let dest = unsafe { core::slice::from_raw_parts_mut(dest.add(offset), len - offset) };
+        for src in srcs {
+            let src = unsafe { core::slice::from_raw_parts(src.add(offset), len - offset) };
+            add_assign_scalar(dest, src);
+        }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
 unsafe fn add_assign_sources_4_avx2(dest: *mut u8, srcs: [*const u8; 4], len: usize) {
     let mut offset = 0usize;
     while offset + 128 <= len {
@@ -937,6 +1049,44 @@ unsafe fn xor_8_32(dests: [*mut u8; 8], src: *const u8, offset: usize) {
         unsafe {
             _mm256_storeu_si256(dest, updated);
         }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_sources_2_32(dest: *mut u8, srcs: [*const u8; 2], offset: usize) {
+    let dest = unsafe { dest.add(offset).cast::<__m256i>() };
+    let source = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[0].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[1].add(offset).cast::<__m256i>()),
+        )
+    };
+    let updated = unsafe { _mm256_xor_si256(_mm256_loadu_si256(dest.cast_const()), source) };
+    unsafe {
+        _mm256_storeu_si256(dest, updated);
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_sources_3_32(dest: *mut u8, srcs: [*const u8; 3], offset: usize) {
+    let dest = unsafe { dest.add(offset).cast::<__m256i>() };
+    let source01 = unsafe {
+        _mm256_xor_si256(
+            _mm256_loadu_si256(srcs[0].add(offset).cast::<__m256i>()),
+            _mm256_loadu_si256(srcs[1].add(offset).cast::<__m256i>()),
+        )
+    };
+    let source = unsafe {
+        _mm256_xor_si256(
+            source01,
+            _mm256_loadu_si256(srcs[2].add(offset).cast::<__m256i>()),
+        )
+    };
+    let updated = unsafe { _mm256_xor_si256(_mm256_loadu_si256(dest.cast_const()), source) };
+    unsafe {
+        _mm256_storeu_si256(dest, updated);
     }
 }
 
@@ -1467,6 +1617,86 @@ mod tests {
             assert_eq!(
                 bytes, expected,
                 "raw 8-way add_assign failed for length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_assign_sources_raw_2_matches_scalar_xor() {
+        for len in [31usize, 32, 64, 128, 129] {
+            let mut bytes = vec![0u8; len * 3];
+            let dest = patterned_bytes(len)
+                .into_iter()
+                .map(|byte| byte ^ 0xa5)
+                .collect::<Vec<_>>();
+            bytes[..len].copy_from_slice(&dest);
+
+            let mut expected = dest;
+            for symbol in 1..3 {
+                let start = symbol * len;
+                let src = patterned_bytes(len)
+                    .into_iter()
+                    .map(|byte| byte.rotate_left(symbol as u32) ^ symbol as u8)
+                    .collect::<Vec<_>>();
+                bytes[start..start + len].copy_from_slice(&src);
+                expected = scalar_xor(expected, &src);
+            }
+
+            let ptr = bytes.as_mut_ptr();
+            unsafe {
+                AddAssignFastPath::new(len).apply_sources_same_len_raw_2(
+                    ptr,
+                    [ptr.add(len).cast_const(), ptr.add(len * 2).cast_const()],
+                    len,
+                );
+            }
+
+            assert_eq!(
+                &bytes[..len],
+                expected.as_slice(),
+                "raw 2-source add_assign failed for length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_assign_sources_raw_3_matches_scalar_xor() {
+        for len in [31usize, 32, 64, 128, 129] {
+            let mut bytes = vec![0u8; len * 4];
+            let dest = patterned_bytes(len)
+                .into_iter()
+                .map(|byte| byte ^ 0x96)
+                .collect::<Vec<_>>();
+            bytes[..len].copy_from_slice(&dest);
+
+            let mut expected = dest;
+            for symbol in 1..4 {
+                let start = symbol * len;
+                let src = patterned_bytes(len)
+                    .into_iter()
+                    .map(|byte| byte.rotate_left(symbol as u32) ^ symbol as u8)
+                    .collect::<Vec<_>>();
+                bytes[start..start + len].copy_from_slice(&src);
+                expected = scalar_xor(expected, &src);
+            }
+
+            let ptr = bytes.as_mut_ptr();
+            unsafe {
+                AddAssignFastPath::new(len).apply_sources_same_len_raw_3(
+                    ptr,
+                    [
+                        ptr.add(len).cast_const(),
+                        ptr.add(len * 2).cast_const(),
+                        ptr.add(len * 3).cast_const(),
+                    ],
+                    len,
+                );
+            }
+
+            assert_eq!(
+                &bytes[..len],
+                expected.as_slice(),
+                "raw 3-source add_assign failed for length {len}"
             );
         }
     }
