@@ -113,7 +113,7 @@ const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
 const OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH: usize = 10_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH: usize = 20_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 20_000;
-const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 4_096;
+const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 256;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 #[cfg(all(test, feature = "std"))]
@@ -8934,6 +8934,17 @@ mod tests {
         assert!(width_for(100) >= DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH);
         assert!(width_for(250) >= DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH);
         assert!(width_for(500) >= DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH);
+    }
+
+    #[test]
+    fn column_major_hdpc_verify_threshold_covers_medium_overhead_rows() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert!(width_for(100) < COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
+        assert!(width_for(250) >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
+        assert!(width_for(500) >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
+        assert!(width_for(1_000) >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
+        assert!(width_for(2_000) >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
     }
 
     #[test]
