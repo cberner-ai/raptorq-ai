@@ -73,10 +73,15 @@ const FLAT_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH
 #[cfg(feature = "std")]
 const CLONE_FREE_PLAN_ELIMINATION_MIN_WIDTH: usize = 16_384;
 #[cfg(feature = "std")]
-const MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 1_000;
+const LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 250;
+#[cfg(feature = "std")]
+const LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH: usize = 500;
+#[cfg(feature = "std")]
+const MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 500;
 #[cfg(feature = "std")]
 const MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH: usize = 1_500;
 #[cfg(feature = "std")]
+const LOW_DIRECT_HYBRID_REPLAY_WARM_MAX_WIDTH: usize = LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH;
 const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
@@ -123,6 +128,18 @@ const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 #[inline]
 fn use_direct_systematic_solve(width: usize) -> bool {
     width >= DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH
+        || (LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+            .contains(&width)
+        || (MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+            .contains(&width)
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn use_direct_source_batch_back_substitution(width: usize) -> bool {
+    width >= DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
+        || (LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+            .contains(&width)
         || (MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
             .contains(&width)
 }
@@ -223,12 +240,24 @@ pub(crate) fn fused_inverse_mul_symbols<M: BinaryMatrix>(
         let op = SymbolOps::DirectSystematicSolve {
             source_block_symbols,
         };
+        let width = matrix.width();
+        let zero_symbols = symbol_is_zero(symbols.as_bytes());
         #[cfg(feature = "std")]
         {
+            if zero_symbols
+                && width < LOW_DIRECT_HYBRID_REPLAY_WARM_MAX_WIDTH
+                && direct_systematic_plan_is_cached(source_block_symbols)
+            {
+                cached_hybrid_systematic_plan_from_matrix(
+                    source_block_symbols,
+                    &matrix,
+                    &hdpc_rows,
+                );
+            }
             cached_direct_systematic_plan_from_matrix(source_block_symbols, &matrix, &hdpc_rows);
         }
-        if symbol_is_zero(symbols.as_bytes()) {
-            let decoded = SymbolSlab::with_zeros(matrix.width(), symbols.symbol_size());
+        if zero_symbols {
+            let decoded = SymbolSlab::with_zeros(width, symbols.symbol_size());
             return (Some(decoded), Some(vec![op]));
         }
 
@@ -543,6 +572,16 @@ type DirectSystematicPlanCacheLock = Mutex<DirectSystematicPlanCache>;
 fn direct_systematic_plan_cache() -> &'static DirectSystematicPlanCacheLock {
     static CACHE: OnceLock<DirectSystematicPlanCacheLock> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(DirectSystematicPlanCache::default()))
+}
+
+#[cfg(feature = "std")]
+fn direct_systematic_plan_is_cached(source_block_symbols: u32) -> bool {
+    let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    let cache = direct_systematic_plan_cache();
+    let guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.plans.contains_key(&source_block_symbols)
 }
 
 #[cfg(feature = "std")]
@@ -1597,7 +1636,7 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
     let back_substitution_layout = if matches!(
         back_substitution_layout,
         DirectBackSubstitutionLayout::SourcesByDest
-    ) && width >= DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
+    ) && use_direct_source_batch_back_substitution(width)
     {
         DirectBackSubstitutionLayout::SourcesByDest
     } else {
@@ -9214,6 +9253,30 @@ mod tests {
             [SymbolOps::DirectSystematicSolve {
                 source_block_symbols
             }] if *source_block_symbols == k_prime
+        ));
+    }
+
+    #[test]
+    fn ci_250_systematic_plan_uses_low_width_direct_solve() {
+        let source_symbols = 250;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        assert!(
+            (LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+                .contains(&width)
+        );
+        assert!(use_direct_systematic_solve(width));
+        assert!(use_direct_source_batch_back_substitution(width));
+
+        let indices: Vec<u32> = (0..k_prime).collect();
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+        let plan = prepare_direct_systematic_plan(&matrix, &hdpc_rows, source_symbols)
+            .expect("250-symbol direct plan should build");
+
+        assert!(matches!(
+            &plan.back_substitution,
+            DirectSystematicBackSubstitution::SourcesByDest { .. }
         ));
     }
 
