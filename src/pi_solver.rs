@@ -84,8 +84,10 @@ const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
 const DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 50_000;
 #[cfg(feature = "std")]
 const CACHED_HDPC_FREE_SOLVE_MAX_WIDTH: usize = 10_000;
+#[cfg(feature = "std")]
+const DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 128;
 #[cfg(all(feature = "std", not(test)))]
-const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 512;
+const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH;
 #[cfg(all(feature = "std", test))]
 const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 64;
 #[cfg(all(feature = "std", not(test)))]
@@ -8922,6 +8924,16 @@ mod tests {
         assert!(use_in_place_hybrid_replay(width_for(500)));
         assert!(!use_in_place_hybrid_replay(width_for(1000)));
         assert!(!use_in_place_hybrid_replay(width_for(2000)));
+    }
+
+    #[test]
+    fn direct_square_decode_threshold_covers_low_ci_exact_rows() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert!(width_for(10) < DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH);
+        assert!(width_for(100) >= DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH);
+        assert!(width_for(250) >= DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH);
+        assert!(width_for(500) >= DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH);
     }
 
     #[test]
