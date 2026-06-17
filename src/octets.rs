@@ -374,17 +374,12 @@ pub fn mulassign_scalar(dest: &mut [u8], scalar: &Octet) {
     }
 }
 
-pub(crate) fn mulassign_alpha(dest: &mut [u8]) {
-    if try_mulassign_alpha_avx2(dest) {
+pub(crate) fn fused_mulassign_alpha_add_assign(dest: &mut [u8], src: &[u8]) {
+    assert_eq!(dest.len(), src.len());
+    if try_fused_mulassign_alpha_addassign_avx2(dest, src) {
         return;
     }
-    for byte in dest {
-        let carry = *byte & 0x80;
-        *byte <<= 1;
-        if carry != 0 {
-            *byte ^= 0x1d;
-        }
-    }
+    fused_mulassign_alpha_addassign_scalar(dest, src);
 }
 
 pub fn fused_addassign_mul_scalar(dest: &mut [u8], src: &[u8], scalar: &Octet) {
@@ -447,6 +442,17 @@ fn fused_addassign_table(dest: &mut [u8], src: &[u8], table: &[u8; 256]) {
     }
 }
 
+fn fused_mulassign_alpha_addassign_scalar(dest: &mut [u8], src: &[u8]) {
+    for (d, s) in dest.iter_mut().zip(src.iter()) {
+        let carry = *d & 0x80;
+        *d <<= 1;
+        if carry != 0 {
+            *d ^= 0x1d;
+        }
+        *d ^= *s;
+    }
+}
+
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 fn try_mulassign_scalar_avx2(dest: &mut [u8], scalar: &Octet) -> bool {
     if dest.len() < 32 || !avx2_available() {
@@ -465,19 +471,19 @@ fn try_mulassign_scalar_avx2(_dest: &mut [u8], _scalar: &Octet) -> bool {
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-fn try_mulassign_alpha_avx2(dest: &mut [u8]) -> bool {
+fn try_fused_mulassign_alpha_addassign_avx2(dest: &mut [u8], src: &[u8]) -> bool {
     if dest.len() < 32 || !avx2_available() {
         return false;
     }
 
     unsafe {
-        mulassign_alpha_avx2(dest);
+        fused_mulassign_alpha_addassign_avx2(dest, src);
     }
     true
 }
 
 #[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
-fn try_mulassign_alpha_avx2(_dest: &mut [u8]) -> bool {
+fn try_fused_mulassign_alpha_addassign_avx2(_dest: &mut [u8], _src: &[u8]) -> bool {
     false
 }
 
@@ -545,7 +551,7 @@ unsafe fn mulassign_scalar_avx2(dest: &mut [u8], scalar: u8) {
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
-unsafe fn mulassign_alpha_avx2(dest: &mut [u8]) {
+unsafe fn fused_mulassign_alpha_addassign_avx2(dest: &mut [u8], src: &[u8]) {
     let zero = _mm256_setzero_si256();
     let reduction = _mm256_set1_epi8(0x1d);
     let mut offset = 0usize;
@@ -553,27 +559,21 @@ unsafe fn mulassign_alpha_avx2(dest: &mut [u8]) {
 
     while offset + 128 <= vector_len {
         unsafe {
-            mulassign_alpha_32(dest, offset, zero, reduction);
-            mulassign_alpha_32(dest, offset + 32, zero, reduction);
-            mulassign_alpha_32(dest, offset + 64, zero, reduction);
-            mulassign_alpha_32(dest, offset + 96, zero, reduction);
+            fused_mulassign_alpha_addassign_32(dest, src, offset, zero, reduction);
+            fused_mulassign_alpha_addassign_32(dest, src, offset + 32, zero, reduction);
+            fused_mulassign_alpha_addassign_32(dest, src, offset + 64, zero, reduction);
+            fused_mulassign_alpha_addassign_32(dest, src, offset + 96, zero, reduction);
         }
         offset += 128;
     }
     while offset < vector_len {
         unsafe {
-            mulassign_alpha_32(dest, offset, zero, reduction);
+            fused_mulassign_alpha_addassign_32(dest, src, offset, zero, reduction);
         }
         offset += 32;
     }
 
-    for byte in &mut dest[offset..] {
-        let carry = *byte & 0x80;
-        *byte <<= 1;
-        if carry != 0 {
-            *byte ^= 0x1d;
-        }
-    }
+    fused_mulassign_alpha_addassign_scalar(&mut dest[offset..], &src[offset..]);
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -1230,14 +1230,22 @@ unsafe fn mulassign_32(
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
-unsafe fn mulassign_alpha_32(dest: &mut [u8], offset: usize, zero: __m256i, reduction: __m256i) {
+unsafe fn fused_mulassign_alpha_addassign_32(
+    dest: &mut [u8],
+    src: &[u8],
+    offset: usize,
+    zero: __m256i,
+    reduction: __m256i,
+) {
     unsafe {
         let dest_ptr = dest.as_mut_ptr().add(offset).cast::<__m256i>();
         let value = _mm256_loadu_si256(dest_ptr.cast_const());
         let doubled = _mm256_add_epi8(value, value);
         let carry_mask = _mm256_cmpgt_epi8(zero, value);
         let reduced = _mm256_xor_si256(doubled, _mm256_and_si256(carry_mask, reduction));
-        _mm256_storeu_si256(dest_ptr, reduced);
+        let source = _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>());
+        let updated = _mm256_xor_si256(reduced, source);
+        _mm256_storeu_si256(dest_ptr, updated);
     }
 }
 
@@ -1401,15 +1409,20 @@ mod tests {
     }
 
     #[test]
-    fn mulassign_alpha_matches_scalar_two() {
+    fn fused_mulassign_alpha_add_assign_matches_split_ops() {
         for len in [0usize, 1, 31, 32, 33, 64, 129] {
-            let mut data = patterned_bytes(len);
-            let mut expected = data.clone();
+            let mut fused = patterned_bytes(len);
+            let src = patterned_bytes(len)
+                .into_iter()
+                .map(|byte| byte.rotate_left(1))
+                .collect::<Vec<_>>();
+            let mut expected = fused.clone();
 
             mulassign_scalar(&mut expected, &Octet::new(2));
-            mulassign_alpha(&mut data);
+            add_assign(&mut expected, &src);
+            fused_mulassign_alpha_add_assign(&mut fused, &src);
 
-            assert_eq!(data, expected, "alpha multiply failed for length {len}");
+            assert_eq!(fused, expected, "fused alpha add failed for length {len}");
         }
     }
 
