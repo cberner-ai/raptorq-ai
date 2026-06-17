@@ -88,6 +88,8 @@ const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
+const DIRECT_FORWARD_NO_ZERO_CHECK_MIN_WIDTH: usize = 10_000;
+#[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH: usize = 20_000;
 #[cfg(feature = "std")]
 const DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
@@ -167,6 +169,12 @@ fn use_trusted_direct_source_batch_back_substitution(width: usize) -> bool {
             .contains(&width)
         || (MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..TRUSTED_MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
             .contains(&width)
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn use_direct_forward_no_zero_check(width: usize) -> bool {
+    width >= DIRECT_FORWARD_NO_ZERO_CHECK_MIN_WIDTH
 }
 
 fn coefficient_col(col: usize) -> CoefficientColumn {
@@ -2431,13 +2439,24 @@ fn try_apply_prepared_direct_systematic_plan(
     let add_assign_path = AddAssignFastPath::new(symbol_size);
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
 
-    for (step_index, step) in plan.forward_steps.iter().enumerate() {
-        addassign_direct_symbol_batch(
-            symbols,
-            coefficient_col_index(step.pivot_symbol),
-            plan.forward_dests.slice(step_index),
-            add_assign_path,
-        );
+    if use_direct_forward_no_zero_check(plan.width) {
+        for (step_index, step) in plan.forward_steps.iter().enumerate() {
+            addassign_direct_symbol_batch_no_zero_check(
+                symbols,
+                coefficient_col_index(step.pivot_symbol),
+                plan.forward_dests.slice(step_index),
+                add_assign_path,
+            );
+        }
+    } else {
+        for (step_index, step) in plan.forward_steps.iter().enumerate() {
+            addassign_direct_symbol_batch(
+                symbols,
+                coefficient_col_index(step.pivot_symbol),
+                plan.forward_dests.slice(step_index),
+                add_assign_path,
+            );
+        }
     }
 
     let mut hdpc_symbols = SymbolSlab::with_zeros(plan.h, symbol_size);
@@ -2493,7 +2512,7 @@ fn try_apply_prepared_direct_systematic_plan(
             if use_non_empty_back_substitution {
                 for &src in non_empty_sources.iter().rev() {
                     let src = coefficient_col_index(src);
-                    addassign_direct_symbol_batch_nonzero_source(
+                    addassign_direct_symbol_batch_no_zero_check(
                         symbols,
                         src,
                         slices.slice(src),
@@ -2502,7 +2521,7 @@ fn try_apply_prepared_direct_systematic_plan(
                 }
             } else {
                 for src in (0..plan.width).rev() {
-                    addassign_direct_symbol_batch_nonzero_source(
+                    addassign_direct_symbol_batch_no_zero_check(
                         symbols,
                         src,
                         slices.slice(src),
@@ -2807,7 +2826,7 @@ fn addassign_direct_symbol_batch(
 }
 
 #[cfg(feature = "std")]
-fn addassign_direct_symbol_batch_nonzero_source(
+fn addassign_direct_symbol_batch_no_zero_check(
     symbols: &mut SymbolSlab,
     src: usize,
     dests: &[CoefficientColumn],
@@ -5548,7 +5567,7 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
         }
         move_pivot_symbols_to_columns(&mut symbols, &output_symbol_cycles);
         for src in (0..width).rev() {
-            addassign_direct_symbol_batch_nonzero_source(
+            addassign_direct_symbol_batch_no_zero_check(
                 &mut symbols,
                 src,
                 back_substitution.slice(src),
@@ -5569,7 +5588,7 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
         decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
     }
     for src in (0..width).rev() {
-        addassign_direct_symbol_batch_nonzero_source(
+        addassign_direct_symbol_batch_no_zero_check(
             &mut decoded,
             src,
             back_substitution.slice(src),
@@ -9163,6 +9182,16 @@ mod tests {
         assert!(width_for(500) >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
         assert!(width_for(1_000) >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
         assert!(width_for(2_000) >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
+    }
+
+    #[test]
+    fn direct_forward_no_zero_check_starts_after_5k_encode_row() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert!(!use_direct_forward_no_zero_check(width_for(5_000)));
+        assert!(use_direct_forward_no_zero_check(width_for(10_000)));
+        assert!(use_direct_forward_no_zero_check(width_for(20_000)));
+        assert!(use_direct_forward_no_zero_check(width_for(50_000)));
     }
 
     #[test]
