@@ -128,6 +128,12 @@ const OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH: usize = 20_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 20_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_BACKSUB_BATCH4_MAX_WIDTH: usize = 32_768;
 const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 256;
+#[cfg(feature = "std")]
+const HDPC_VERIFY_ROW_PAIRS_CACHE_CAPACITY: usize = 16;
+#[cfg(feature = "std")]
+const HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH: usize = 512;
+#[cfg(feature = "std")]
+const HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH: usize = HYBRID_MAX_WIDTH;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 #[cfg(all(test, feature = "std"))]
@@ -605,6 +611,28 @@ type DirectSystematicPlanCacheLock = Mutex<DirectSystematicPlanCache>;
 fn direct_systematic_plan_cache() -> &'static DirectSystematicPlanCacheLock {
     static CACHE: OnceLock<DirectSystematicPlanCacheLock> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(DirectSystematicPlanCache::default()))
+}
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct HdpcVerifyRowPairsCache {
+    pairs: HashMap<HdpcVerifyRowPairsKey, HdpcVerifyRowPairs>,
+    insertion_order: VecDeque<HdpcVerifyRowPairsKey>,
+}
+
+#[cfg(feature = "std")]
+type HdpcVerifyRowPairsCacheLock = Mutex<HdpcVerifyRowPairsCache>;
+#[cfg(feature = "std")]
+type HdpcVerifyRowPairsKey = (usize, usize);
+#[cfg(feature = "std")]
+type HdpcVerifyRowPair = (CoefficientColumn, CoefficientColumn);
+#[cfg(feature = "std")]
+type HdpcVerifyRowPairs = Arc<[HdpcVerifyRowPair]>;
+
+#[cfg(feature = "std")]
+fn hdpc_verify_row_pairs_cache() -> &'static HdpcVerifyRowPairsCacheLock {
+    static CACHE: OnceLock<HdpcVerifyRowPairsCacheLock> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HdpcVerifyRowPairsCache::default()))
 }
 
 #[cfg(feature = "std")]
@@ -4128,7 +4156,14 @@ pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
 
     let (decoded, ops) = solve_binary(rows, symbols);
     match decoded {
-        Some(decoded) => (verify_no_hdpc_solution(decoded, source_block_symbols), ops),
+        Some(decoded) => (
+            verify_no_hdpc_solution(
+                decoded,
+                source_block_symbols,
+                matrix.height() > matrix.width(),
+            ),
+            ops,
+        ),
         None => (None, ops),
     }
 }
@@ -4171,7 +4206,7 @@ fn try_overdetermined_no_hdpc_prefix_solve_owned<M: BinaryMatrix>(
         }
         FullRankBinaryPrefixSolve::Failed => return OverdeterminedNoHdpcPrefixSolve::Failed,
     };
-    let Some(decoded) = verify_no_hdpc_solution(decoded, source_block_symbols) else {
+    let Some(decoded) = verify_no_hdpc_solution(decoded, source_block_symbols, true) else {
         return OverdeterminedNoHdpcPrefixSolve::Failed;
     };
     let suffix_symbols = SymbolSlab::from_bytes(suffix_bytes, symbol_size);
@@ -4433,7 +4468,7 @@ fn try_overdetermined_no_hdpc_prefix_solve<M: BinaryMatrix>(
         let prefix_rows = matrix.packed_row_prefix(prefix_height);
         solve_binary(prefix_rows, prefix_symbols)
     };
-    let decoded = verify_no_hdpc_solution(decoded?, source_block_symbols)?;
+    let decoded = verify_no_hdpc_solution(decoded?, source_block_symbols, true)?;
     binary_rows_satisfied(matrix, &decoded, symbols, prefix_height).then_some(decoded)
 }
 
@@ -4510,7 +4545,11 @@ fn addassign_binary_row_sources_to_slice<const BATCH: usize, M: BinaryMatrix>(
     );
 }
 
-fn verify_no_hdpc_solution(decoded: SymbolSlab, source_block_symbols: u32) -> Option<SymbolSlab> {
+fn verify_no_hdpc_solution(
+    decoded: SymbolSlab,
+    source_block_symbols: u32,
+    cache_verify_row_pairs: bool,
+) -> Option<SymbolSlab> {
     if decoded.len() != num_intermediate_symbols(source_block_symbols) as usize {
         return Some(decoded);
     }
@@ -4519,7 +4558,8 @@ fn verify_no_hdpc_solution(decoded: SymbolSlab, source_block_symbols: u32) -> Op
     if is_rfc_hdpc_shape(decoded.len(), h, source_block_symbols)
         && decoded.len() >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH
     {
-        return rfc_hdpc_rows_satisfied_horner(&decoded, h).then_some(decoded);
+        return rfc_hdpc_rows_satisfied_horner(&decoded, h, cache_verify_row_pairs)
+            .then_some(decoded);
     }
 
     let hdpc_rows = generate_hdpc_rows(source_block_symbols);
@@ -4540,7 +4580,51 @@ fn rfc_hdpc_verify_rows_for_col(col: usize, h: usize) -> (usize, usize) {
     (row_a, row_b)
 }
 
-fn rfc_hdpc_rows_satisfied_horner(decoded: &SymbolSlab, h: usize) -> bool {
+#[cfg(feature = "std")]
+fn cached_rfc_hdpc_verify_row_pairs_if_present(
+    gamma_width: usize,
+    h: usize,
+) -> Option<HdpcVerifyRowPairs> {
+    let key = (gamma_width, h);
+    let cache = hdpc_verify_row_pairs_cache();
+    let guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.pairs.get(&key).map(Arc::clone)
+}
+
+#[cfg(feature = "std")]
+fn insert_rfc_hdpc_verify_row_pairs(
+    gamma_width: usize,
+    h: usize,
+    generated: Vec<HdpcVerifyRowPair>,
+) {
+    let key = (gamma_width, h);
+    let generated = Arc::from(generated.into_boxed_slice());
+    let cache = hdpc_verify_row_pairs_cache();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.pairs.contains_key(&key) {
+        return;
+    }
+    if guard.pairs.len() >= HDPC_VERIFY_ROW_PAIRS_CACHE_CAPACITY
+        && let Some(evicted) = guard.insertion_order.pop_front()
+    {
+        guard.pairs.remove(&evicted);
+    }
+    guard.insertion_order.push_back(key);
+    guard.pairs.insert(key, generated);
+}
+
+fn rfc_hdpc_rows_satisfied_horner(
+    decoded: &SymbolSlab,
+    h: usize,
+    cache_verify_row_pairs: bool,
+) -> bool {
+    #[cfg(not(feature = "std"))]
+    let _ = cache_verify_row_pairs;
+
     let width = decoded.len();
     let Some(gamma_width) = width.checked_sub(h) else {
         return false;
@@ -4554,6 +4638,22 @@ fn rfc_hdpc_rows_satisfied_horner(decoded: &SymbolSlab, h: usize) -> bool {
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
     let mut prefix = vec![0u8; symbol_size];
     let mut checks = SymbolSlab::with_zeros(h, symbol_size);
+    #[cfg(feature = "std")]
+    let cache_verify_row_pairs = cache_verify_row_pairs
+        && (HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH
+            ..=HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH)
+            .contains(&gamma_width);
+    #[cfg(feature = "std")]
+    let cached_verify_row_pairs = cache_verify_row_pairs
+        .then(|| cached_rfc_hdpc_verify_row_pairs_if_present(gamma_width, h))
+        .flatten();
+    #[cfg(feature = "std")]
+    let mut generated_verify_row_pairs =
+        if cache_verify_row_pairs && cached_verify_row_pairs.is_none() {
+            Vec::with_capacity(gamma_width.saturating_sub(1))
+        } else {
+            Vec::new()
+        };
 
     for col in 0..gamma_width {
         fused_mulassign_alpha_add_assign(&mut prefix, decoded.get(col));
@@ -4564,10 +4664,29 @@ fn rfc_hdpc_rows_satisfied_horner(decoded: &SymbolSlab, h: usize) -> bool {
                 fused_mul_path.apply_nonzero(checks.get_mut(row), &prefix, &factor);
             }
         } else {
+            #[cfg(feature = "std")]
+            let (row_a, row_b) = if let Some(verify_row_pairs) = cached_verify_row_pairs.as_ref() {
+                let (row_a, row_b) = verify_row_pairs[col];
+                (coefficient_col_index(row_a), coefficient_col_index(row_b))
+            } else {
+                let (row_a, row_b) = rfc_hdpc_verify_rows_for_col(col, h);
+                if cache_verify_row_pairs {
+                    debug_assert!(CoefficientColumn::try_from(row_a).is_ok());
+                    debug_assert!(CoefficientColumn::try_from(row_b).is_ok());
+                    generated_verify_row_pairs
+                        .push((coefficient_col(row_a), coefficient_col(row_b)));
+                }
+                (row_a, row_b)
+            };
+            #[cfg(not(feature = "std"))]
             let (row_a, row_b) = rfc_hdpc_verify_rows_for_col(col, h);
-            add_assign_path.apply(checks.get_mut(row_a), &prefix);
-            add_assign_path.apply(checks.get_mut(row_b), &prefix);
+            addassign_hdpc_check_pair(&mut checks, row_a, row_b, &prefix, add_assign_path);
         }
+    }
+
+    #[cfg(feature = "std")]
+    if cache_verify_row_pairs && cached_verify_row_pairs.is_none() {
+        insert_rfc_hdpc_verify_row_pairs(gamma_width, h, generated_verify_row_pairs);
     }
 
     for row in 0..h {
@@ -4578,6 +4697,31 @@ fn rfc_hdpc_rows_satisfied_horner(decoded: &SymbolSlab, h: usize) -> bool {
         .as_bytes()
         .chunks_exact(symbol_size)
         .all(bytes_are_zero)
+}
+
+fn addassign_hdpc_check_pair(
+    checks: &mut SymbolSlab,
+    row_a: usize,
+    row_b: usize,
+    prefix: &[u8],
+    add_assign_path: AddAssignFastPath,
+) {
+    debug_assert_ne!(row_a, row_b);
+    let symbol_size = checks.symbol_size();
+    assert_eq!(prefix.len(), symbol_size);
+    let bytes = checks.as_mut_bytes();
+    let row_a_start = row_a * symbol_size;
+    let row_b_start = row_b * symbol_size;
+    assert!(row_a_start + symbol_size <= bytes.len());
+    assert!(row_b_start + symbol_size <= bytes.len());
+    let bytes_ptr = bytes.as_mut_ptr();
+    unsafe {
+        add_assign_path.apply_same_len_raw_2(
+            [bytes_ptr.add(row_a_start), bytes_ptr.add(row_b_start)],
+            prefix.as_ptr(),
+            symbol_size,
+        );
+    }
 }
 
 fn hdpc_rows_satisfied(decoded: &SymbolSlab, hdpc_rows: &DenseOctetMatrix) -> bool {
@@ -8022,14 +8166,15 @@ mod recording_tests {
             let decoded = SymbolSlab::from_bytes(bytes, symbol_size);
 
             assert_eq!(
-                rfc_hdpc_rows_satisfied_horner(&decoded, hdpc_rows.height()),
+                rfc_hdpc_rows_satisfied_horner(&decoded, hdpc_rows.height(), true),
                 hdpc_rows_satisfied_row_major(&decoded, &hdpc_rows)
             );
 
             let zero_decoded = SymbolSlab::with_zeros(hdpc_rows.width(), symbol_size);
             assert!(rfc_hdpc_rows_satisfied_horner(
                 &zero_decoded,
-                hdpc_rows.height()
+                hdpc_rows.height(),
+                true
             ));
         }
     }
