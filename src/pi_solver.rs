@@ -18,7 +18,7 @@ use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
 use crate::octets::{
     AddAssignFastPath, FusedAddAssignMulScalarFastPath, add_assign, bytes_are_zero,
-    fused_addassign_mul_scalar, mulassign_alpha, mulassign_scalar,
+    fused_addassign_mul_scalar, fused_mulassign_alpha_add_assign, mulassign_scalar,
 };
 use crate::operation_vector::SymbolOps;
 #[cfg(feature = "std")]
@@ -124,6 +124,7 @@ const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
 const OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH: usize = 5_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH: usize = 20_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 20_000;
+const OVERDETERMINED_NO_HDPC_PREFIX_BACKSUB_BATCH4_MAX_WIDTH: usize = 32_768;
 const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 256;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
@@ -4340,6 +4341,17 @@ fn solve_full_rank_binary_prefix_owned<M: BinaryMatrix>(
                 col,
                 add_assign_path,
             );
+        } else if rows.height() != width
+            && width < OVERDETERMINED_NO_HDPC_PREFIX_BACKSUB_BATCH4_MAX_WIDTH
+        {
+            addassign_packed_row_sources_to_symbol::<4>(
+                &rows,
+                pivot,
+                col + 1,
+                &mut decoded,
+                col,
+                add_assign_path,
+            );
         } else {
             addassign_packed_row_sources_to_symbol::<8>(
                 &rows,
@@ -4501,6 +4513,14 @@ fn is_rfc_hdpc_shape(width: usize, h: usize, source_block_symbols: u32) -> bool 
         && h > 1
 }
 
+#[inline]
+fn rfc_hdpc_verify_rows_for_col(col: usize, h: usize) -> (usize, usize) {
+    let random = RfcRand::new((col + 1) as u32);
+    let row_a = random.get(6, h as u32) as usize;
+    let row_b = (row_a + random.get(7, h as u32 - 1) as usize + 1) % h;
+    (row_a, row_b)
+}
+
 fn rfc_hdpc_rows_satisfied_horner(decoded: &SymbolSlab, h: usize) -> bool {
     let width = decoded.len();
     let Some(gamma_width) = width.checked_sub(h) else {
@@ -4517,8 +4537,7 @@ fn rfc_hdpc_rows_satisfied_horner(decoded: &SymbolSlab, h: usize) -> bool {
     let mut checks = SymbolSlab::with_zeros(h, symbol_size);
 
     for col in 0..gamma_width {
-        mulassign_alpha(&mut prefix);
-        add_assign_path.apply(&mut prefix, decoded.get(col));
+        fused_mulassign_alpha_add_assign(&mut prefix, decoded.get(col));
 
         if col + 1 == gamma_width {
             for row in 0..h {
@@ -4526,9 +4545,7 @@ fn rfc_hdpc_rows_satisfied_horner(decoded: &SymbolSlab, h: usize) -> bool {
                 fused_mul_path.apply_nonzero(checks.get_mut(row), &prefix, &factor);
             }
         } else {
-            let random = RfcRand::new((col + 1) as u32);
-            let row_a = random.get(6, h as u32) as usize;
-            let row_b = (row_a + random.get(7, h as u32 - 1) as usize + 1) % h;
+            let (row_a, row_b) = rfc_hdpc_verify_rows_for_col(col, h);
             add_assign_path.apply(checks.get_mut(row_a), &prefix);
             add_assign_path.apply(checks.get_mut(row_b), &prefix);
         }

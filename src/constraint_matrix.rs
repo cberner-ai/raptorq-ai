@@ -57,10 +57,16 @@ pub fn generate_constraint_matrix_no_hdpc<M: BinaryMatrix>(
         if (l as usize) < UNSORTED_SPARSE_PACK_MIN_WIDTH {
             matrix.normalize_rows();
         }
-        matrix.mark_encoded_systematic_isis(s as usize, k_prime, encoded_isis);
+        if encoded_isis_have_systematic_rows(k_prime, encoded_isis) {
+            matrix.mark_encoded_systematic_isis(s as usize, k_prime, encoded_isis);
+        }
     }
 
     matrix
+}
+
+fn encoded_isis_have_systematic_rows(k_prime: u32, encoded_isis: &[u32]) -> bool {
+    encoded_isis.iter().any(|&isi| isi < k_prime)
 }
 
 fn encoded_isis_are_systematic(k_prime: u32, encoded_isis: &[u32]) -> bool {
@@ -551,7 +557,7 @@ mod tests {
         assert!(matrix.width() >= UNSORTED_SPARSE_PACK_MIN_WIDTH);
         assert!(!matrix.rows_normalized_for_test());
         assert_eq!(matrix.systematic_source_block_symbols(), None);
-        assert!(matrix.systematic_row_isis().is_some());
+        assert_eq!(matrix.systematic_row_isis(), None);
     }
 
     #[test]
@@ -566,7 +572,7 @@ mod tests {
         assert!(matrix.width() >= UNSORTED_SPARSE_PACK_MIN_WIDTH);
         assert!(!matrix.rows_normalized_for_test());
         assert_eq!(matrix.systematic_source_block_symbols(), None);
-        assert!(matrix.systematic_row_isis().is_some());
+        assert_eq!(matrix.systematic_row_isis(), None);
     }
 
     #[test]
@@ -642,6 +648,7 @@ mod tests {
             generate_constraint_matrix_no_hdpc::<SparseBinaryMatrix>(source_symbols, &indices);
 
         assert_eq!(matrix.systematic_source_block_symbols(), None);
+        assert!(matrix.systematic_row_isis().is_some());
         assert!(matrix.rows_normalized_for_test());
     }
 }
