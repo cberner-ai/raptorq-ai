@@ -92,6 +92,8 @@ const DIRECT_FORWARD_NO_ZERO_CHECK_MIN_WIDTH: usize = 10_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH: usize = 20_000;
 #[cfg(feature = "std")]
+const DIRECT_DECODE_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH: usize = 5_000;
+#[cfg(feature = "std")]
 const DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const CACHED_HDPC_FREE_SOLVE_MAX_WIDTH: usize = 10_000;
@@ -133,7 +135,7 @@ const HDPC_VERIFY_ROW_PAIRS_CACHE_CAPACITY: usize = 16;
 #[cfg(feature = "std")]
 const HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH: usize = 512;
 #[cfg(feature = "std")]
-const HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH: usize = HYBRID_MAX_WIDTH;
+const HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH: usize = 32_768;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 #[cfg(all(test, feature = "std"))]
@@ -1689,9 +1691,15 @@ fn use_direct_collect_sources_by_dest(
     binary_height: usize,
     h: usize,
     layout: DirectBackSubstitutionLayout,
+    trust_source_batch_bounds: bool,
 ) -> bool {
+    let min_width = if trust_source_batch_bounds {
+        DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH
+    } else {
+        DIRECT_DECODE_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH
+    };
     binary_height + h == width
-        && width >= DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH
+        && width >= min_width
         && matches!(layout, DirectBackSubstitutionLayout::SourcesByDest)
 }
 
@@ -1875,8 +1883,13 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
     let mut hdpc_update_ranges = Vec::with_capacity(pivot_count);
     let mut hdpc_update_entries = Vec::with_capacity(pivot_count.saturating_mul(h));
     let mut hdpc_update_unit_only = Vec::with_capacity(pivot_count);
-    let direct_collect_sources_by_dest =
-        use_direct_collect_sources_by_dest(width, binary_height, h, back_substitution_layout);
+    let direct_collect_sources_by_dest = use_direct_collect_sources_by_dest(
+        width,
+        binary_height,
+        h,
+        back_substitution_layout,
+        trust_source_batch_bounds,
+    );
     let mut back_substitution_counts = if direct_collect_sources_by_dest {
         Vec::new()
     } else {
@@ -9330,6 +9343,17 @@ mod tests {
     }
 
     #[test]
+    fn hdpc_verify_row_pair_cache_skips_50k_gamma_width() {
+        let gamma_width_for = |source_symbols| {
+            let k_prime = extended_source_block_symbols(source_symbols);
+            (k_prime + num_ldpc_symbols(k_prime)) as usize
+        };
+
+        assert!(gamma_width_for(20_000) <= HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH);
+        assert!(gamma_width_for(50_000) > HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH);
+    }
+
+    #[test]
     fn direct_forward_no_zero_check_starts_after_5k_encode_row() {
         let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
 
@@ -9700,25 +9724,46 @@ mod tests {
             width,
             square_binary_height,
             h,
-            DirectBackSubstitutionLayout::SourcesByDest
+            DirectBackSubstitutionLayout::SourcesByDest,
+            true,
         ));
         assert!(!use_direct_collect_sources_by_dest(
             width - 1,
             square_binary_height - 1,
             h,
-            DirectBackSubstitutionLayout::SourcesByDest
+            DirectBackSubstitutionLayout::SourcesByDest,
+            true,
         ));
         assert!(!use_direct_collect_sources_by_dest(
             width,
             square_binary_height + 1,
             h,
-            DirectBackSubstitutionLayout::SourcesByDest
+            DirectBackSubstitutionLayout::SourcesByDest,
+            true,
         ));
         assert!(!use_direct_collect_sources_by_dest(
             width,
             square_binary_height,
             h,
-            DirectBackSubstitutionLayout::DestsBySource
+            DirectBackSubstitutionLayout::DestsBySource,
+            true,
+        ));
+
+        let decode_width = DIRECT_DECODE_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH;
+        assert!(decode_width < DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH);
+        assert!(use_direct_collect_sources_by_dest(
+            decode_width,
+            decode_width - h,
+            h,
+            DirectBackSubstitutionLayout::SourcesByDest,
+            false,
+        ));
+        assert!(!use_direct_collect_sources_by_dest(
+            decode_width,
+            decode_width - h,
+            h,
+            DirectBackSubstitutionLayout::SourcesByDest,
+            true,
         ));
     }
 
