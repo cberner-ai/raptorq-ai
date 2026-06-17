@@ -69,6 +69,33 @@ impl AddAssignFastPath {
         add_assign_scalar(dest, src);
     }
 
+    /// Applies one source slice into two disjoint destination slices.
+    ///
+    /// # Safety
+    ///
+    /// `src` and both destination pointers must be valid for `len` bytes. Destinations must be
+    /// writable and must not overlap each other or `src`.
+    pub(crate) unsafe fn apply_same_len_raw_2(
+        self,
+        dests: [*mut u8; 2],
+        src: *const u8,
+        len: usize,
+    ) {
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_avx2 {
+            unsafe {
+                add_assign_2_avx2(dests, src, len);
+            }
+            return;
+        }
+
+        for dest in dests {
+            let dest = unsafe { core::slice::from_raw_parts_mut(dest, len) };
+            let src = unsafe { core::slice::from_raw_parts(src, len) };
+            add_assign_scalar(dest, src);
+        }
+    }
+
     /// Applies one source slice into four disjoint destination slices.
     ///
     /// # Safety
@@ -776,6 +803,35 @@ unsafe fn add_assign_avx2(dest: &mut [u8], src: &[u8]) {
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
+unsafe fn add_assign_2_avx2(dests: [*mut u8; 2], src: *const u8, len: usize) {
+    let mut offset = 0usize;
+    while offset + 128 <= len {
+        unsafe {
+            xor_2_32(dests, src, offset);
+            xor_2_32(dests, src, offset + 32);
+            xor_2_32(dests, src, offset + 64);
+            xor_2_32(dests, src, offset + 96);
+        }
+        offset += 128;
+    }
+    while offset + 32 <= len {
+        unsafe {
+            xor_2_32(dests, src, offset);
+        }
+        offset += 32;
+    }
+
+    if offset < len {
+        let src = unsafe { core::slice::from_raw_parts(src.add(offset), len - offset) };
+        for dest in dests {
+            let dest = unsafe { core::slice::from_raw_parts_mut(dest.add(offset), len - offset) };
+            add_assign_scalar(dest, src);
+        }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
 unsafe fn add_assign_4_avx2(dests: [*mut u8; 4], src: *const u8, len: usize) {
     let mut offset = 0usize;
     while offset + 128 <= len {
@@ -1023,6 +1079,19 @@ unsafe fn xor_32(dest: &mut [u8], src: &[u8], offset: usize) {
             _mm256_loadu_si256(src_ptr),
         );
         _mm256_storeu_si256(dest_ptr, updated);
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_2_32(dests: [*mut u8; 2], src: *const u8, offset: usize) {
+    let source = unsafe { _mm256_loadu_si256(src.add(offset).cast::<__m256i>()) };
+    for dest in dests {
+        let dest = unsafe { dest.add(offset).cast::<__m256i>() };
+        let updated = unsafe { _mm256_xor_si256(_mm256_loadu_si256(dest.cast_const()), source) };
+        unsafe {
+            _mm256_storeu_si256(dest, updated);
+        }
     }
 }
 
@@ -1543,6 +1612,43 @@ mod tests {
                     "direct AVX2 add_assign failed for length {len}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn add_assign_raw_2_matches_scalar_xor() {
+        for len in [31usize, 32, 64, 128, 129] {
+            let src = patterned_bytes(len)
+                .into_iter()
+                .map(|byte| byte.rotate_left(2) ^ 0x5a)
+                .collect::<Vec<_>>();
+            let mut bytes = vec![0u8; len * 3];
+            bytes[..len].copy_from_slice(&src);
+            let mut expected = bytes.clone();
+
+            for symbol in 1..3 {
+                let start = symbol * len;
+                let dest = patterned_bytes(len)
+                    .into_iter()
+                    .map(|byte| byte.wrapping_add(symbol as u8))
+                    .collect::<Vec<_>>();
+                bytes[start..start + len].copy_from_slice(&dest);
+                expected[start..start + len].copy_from_slice(&scalar_xor(dest, &src));
+            }
+
+            let ptr = bytes.as_mut_ptr();
+            unsafe {
+                AddAssignFastPath::new(len).apply_same_len_raw_2(
+                    [ptr.add(len), ptr.add(len * 2)],
+                    ptr.cast_const(),
+                    len,
+                );
+            }
+
+            assert_eq!(
+                bytes, expected,
+                "raw 2-way add_assign failed for length {len}"
+            );
         }
     }
 
