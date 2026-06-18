@@ -13,7 +13,7 @@ use core::arch::x86_64::{
 
 use crate::matrix::BinaryMatrix;
 
-const WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS: usize = 32;
+const WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS: usize = 4;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedBinaryRows {
     height: usize,
@@ -794,9 +794,11 @@ mod tests {
     #[test]
     fn popcount_gate_width_matches_fallback() {
         let width = WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS * u64::BITS as usize;
+        let mid = (width / 2).max(65);
+        let tail = width - 1;
         let rows = vec![
-            vec![7, 64, 511, width - 65],
-            vec![3, 7, 64, 1024, width - 65, width - 1],
+            vec![7, 64, mid, tail - 1],
+            vec![3, 7, 64, mid, tail - 1, tail],
         ];
         let mut expected = PackedBinaryRows::from_sparse(rows.clone(), width);
         let mut packed = PackedBinaryRows::from_sparse(rows, width);
