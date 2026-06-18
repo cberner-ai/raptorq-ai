@@ -5,13 +5,19 @@ use std::boxed::Box;
 use alloc::boxed::Box;
 
 use crate::octet::Octet;
-use crate::octets::{add_assign, bytes_are_zero, fused_addassign_mul_scalar, mulassign_scalar};
+use crate::octets::{
+    AddAssignFastPath, FusedAddAssignMulScalarFastPath, add_assign, bytes_are_zero,
+    fused_addassign_mul_scalar, mulassign_scalar,
+};
 #[cfg(feature = "std")]
 use crate::pi_solver::apply_cached_systematic_plan;
 use crate::pi_solver::apply_direct_systematic_solve;
 use crate::symbol_slab::SymbolSlab;
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
+
+const REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS: usize = 10_000;
+const REPLAY_BATCH_FAST_PATH_MAX_SYMBOLS: usize = 32_768;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
@@ -49,7 +55,7 @@ pub fn perform_op(op: &SymbolOps, symbols: &mut SymbolSlab) {
             fused_addassign_symbol(symbols, dest, src, scalar);
         }
         SymbolOps::FusedAddBatch { src, ref dests } => {
-            fused_addassign_symbol_batch(symbols, src, dests);
+            fused_addassign_symbol_batch_for_replay(symbols, src, dests);
         }
         #[cfg(feature = "std")]
         SymbolOps::ApplyCachedSystematicPlan {
@@ -91,11 +97,28 @@ pub(crate) fn fused_addassign_symbol_batch(
     src: usize,
     dests: &[(usize, Octet)],
 ) {
+    fused_addassign_symbol_batch_inner::<false>(symbols, src, dests);
+}
+
+fn fused_addassign_symbol_batch_for_replay(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    dests: &[(usize, Octet)],
+) {
+    fused_addassign_symbol_batch_inner::<true>(symbols, src, dests);
+}
+
+fn fused_addassign_symbol_batch_inner<const REUSE_FAST_PATHS: bool>(
+    symbols: &mut SymbolSlab,
+    src: usize,
+    dests: &[(usize, Octet)],
+) {
     if dests.is_empty() {
         return;
     }
 
     let symbol_size = symbols.symbol_size();
+    let symbol_count = symbols.len();
     let bytes = symbols.as_mut_bytes();
     let src_start = src * symbol_size;
     assert!(src_start + symbol_size <= bytes.len());
@@ -105,6 +128,34 @@ pub(crate) fn fused_addassign_symbol_batch(
         return;
     }
     let bytes_ptr = bytes.as_mut_ptr();
+
+    if REUSE_FAST_PATHS
+        && dests.len() > 1
+        && (REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS..=REPLAY_BATCH_FAST_PATH_MAX_SYMBOLS)
+            .contains(&symbol_count)
+    {
+        let add_fast_path = AddAssignFastPath::new(symbol_size);
+        let fused_fast_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
+
+        for &(dest, scalar) in dests {
+            if scalar.is_zero() {
+                continue;
+            }
+            assert_ne!(dest, src);
+            let dest_start = dest * symbol_size;
+            assert!(dest_start + symbol_size <= bytes.len());
+            unsafe {
+                let dest_symbol =
+                    core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
+                if scalar == Octet::one() {
+                    add_fast_path.apply_same_len(dest_symbol, src_symbol);
+                } else {
+                    fused_fast_path.apply_nonzero(dest_symbol, src_symbol, &scalar);
+                }
+            }
+        }
+        return;
+    }
 
     for &(dest, scalar) in dests {
         if scalar.is_zero() {
