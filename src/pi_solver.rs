@@ -27,6 +27,7 @@ use crate::operation_vector::SymbolOps;
 #[cfg(feature = "std")]
 use crate::operation_vector::fused_addassign_symbol_batch;
 use crate::rng::RfcRand;
+use crate::rng::SequentialRfcRand;
 use crate::sparse_matrix::SparseBinaryMatrix;
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::num_ldpc_symbols;
@@ -4684,8 +4685,21 @@ fn is_rfc_hdpc_shape(width: usize, h: usize, source_block_symbols: u32) -> bool 
 #[inline]
 fn rfc_hdpc_verify_rows_for_col(col: usize, h: usize) -> (usize, usize) {
     let random = RfcRand::new((col + 1) as u32);
-    let row_a = random.get(6, h as u32) as usize;
-    let row_b = row_a + random.get(7, h as u32 - 1) as usize + 1;
+    rfc_hdpc_verify_rows_for_random(random.get(6, h as u32), random.get(7, h as u32 - 1), h)
+}
+
+#[inline]
+fn rfc_hdpc_verify_rows_for_sequential_random(
+    random: SequentialRfcRand,
+    h: usize,
+) -> (usize, usize) {
+    rfc_hdpc_verify_rows_for_random(random.get(6, h as u32), random.get(7, h as u32 - 1), h)
+}
+
+#[inline]
+fn rfc_hdpc_verify_rows_for_random(row_a: u32, row_b_offset: u32, h: usize) -> (usize, usize) {
+    let row_a = row_a as usize;
+    let row_b = row_a + row_b_offset as usize + 1;
     let row_b = if row_b >= h { row_b - h } else { row_b };
     (row_a, row_b)
 }
@@ -4755,6 +4769,7 @@ fn rfc_hdpc_rows_satisfied_horner(
         hoist_alpha_add_path.then(|| FusedMulAssignAlphaAddAssignFastPath::new(symbol_size));
     let mut prefix = vec![0u8; symbol_size];
     let mut checks = SymbolSlab::with_zeros(h, symbol_size);
+    let mut verify_row_random = SequentialRfcRand::new(1);
     #[cfg(feature = "std")]
     let cache_verify_row_pairs = cache_verify_row_pairs
         && (HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH
@@ -4790,7 +4805,13 @@ fn rfc_hdpc_rows_satisfied_horner(
                 let (row_a, row_b) = verify_row_pairs[col];
                 (coefficient_col_index(row_a), coefficient_col_index(row_b))
             } else {
-                let (row_a, row_b) = rfc_hdpc_verify_rows_for_col(col, h);
+                let (row_a, row_b) = if requested_cached_verify_row_pairs {
+                    rfc_hdpc_verify_rows_for_col(col, h)
+                } else {
+                    let rows = rfc_hdpc_verify_rows_for_sequential_random(verify_row_random, h);
+                    verify_row_random.advance();
+                    rows
+                };
                 if cache_verify_row_pairs {
                     debug_assert!(CoefficientColumn::try_from(row_a).is_ok());
                     debug_assert!(CoefficientColumn::try_from(row_b).is_ok());
@@ -4800,7 +4821,11 @@ fn rfc_hdpc_rows_satisfied_horner(
                 (row_a, row_b)
             };
             #[cfg(not(feature = "std"))]
-            let (row_a, row_b) = rfc_hdpc_verify_rows_for_col(col, h);
+            let (row_a, row_b) = {
+                let rows = rfc_hdpc_verify_rows_for_sequential_random(verify_row_random, h);
+                verify_row_random.advance();
+                rows
+            };
             addassign_hdpc_check_pair(&mut checks, row_a, row_b, &prefix, add_assign_path);
         }
     }
@@ -8339,15 +8364,20 @@ mod recording_tests {
     #[test]
     fn rfc_hdpc_verify_row_pairs_match_modulo_formula() {
         for h in [2usize, 3, 7, 16, 17] {
+            let mut sequential = SequentialRfcRand::new(1);
             for col in 0..1024 {
                 let random = RfcRand::new((col + 1) as u32);
                 let expected_a = random.get(6, h as u32) as usize;
                 let expected_b = (expected_a + random.get(7, h as u32 - 1) as usize + 1) % h;
 
                 let (row_a, row_b) = rfc_hdpc_verify_rows_for_col(col, h);
+                let (sequential_a, sequential_b) =
+                    rfc_hdpc_verify_rows_for_sequential_random(sequential, h);
+                sequential.advance();
 
                 assert_eq!(row_a, expected_a);
                 assert_eq!(row_b, expected_b);
+                assert_eq!((sequential_a, sequential_b), (expected_a, expected_b));
                 assert_ne!(row_a, row_b);
             }
         }

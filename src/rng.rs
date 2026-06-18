@@ -61,6 +61,67 @@ impl RfcRand {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SequentialRfcRand {
+    x0: u32,
+    x1: u32,
+    x2: u32,
+    x3: u32,
+}
+
+impl SequentialRfcRand {
+    #[inline]
+    pub(crate) fn new(y: u32) -> SequentialRfcRand {
+        SequentialRfcRand {
+            x0: y & 0xff,
+            x1: (y >> 8) & 0xff,
+            x2: (y >> 16) & 0xff,
+            x3: (y >> 24) & 0xff,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_raw(self, i: u32) -> u32 {
+        debug_assert!(i < 256);
+
+        let x0 = ((self.x0 + i) & 0xff) as usize;
+        let x1 = ((self.x1 + i) & 0xff) as usize;
+        let x2 = ((self.x2 + i) & 0xff) as usize;
+        let x3 = ((self.x3 + i) & 0xff) as usize;
+
+        V0[x0] ^ V1[x1] ^ V2[x2] ^ V3[x3]
+    }
+
+    #[inline]
+    pub(crate) fn get(self, i: u32, m: u32) -> u32 {
+        debug_assert!(m > 0);
+
+        let value = self.get_raw(i);
+        match m {
+            DEGREE_RANDOM_MODULUS => value & (DEGREE_RANDOM_MODULUS - 1),
+            D1_RANDOM_MODULUS => value & (D1_RANDOM_MODULUS - 1),
+            _ => value % m,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn advance(&mut self) {
+        self.x0 = (self.x0 + 1) & 0xff;
+        if self.x0 != 0 {
+            return;
+        }
+        self.x1 = (self.x1 + 1) & 0xff;
+        if self.x1 != 0 {
+            return;
+        }
+        self.x2 = (self.x2 + 1) & 0xff;
+        if self.x2 != 0 {
+            return;
+        }
+        self.x3 = (self.x3 + 1) & 0xff;
+    }
+}
+
 const DEGREE_RANDOM_MODULUS: u32 = 1_048_576;
 const D1_RANDOM_MODULUS: u32 = 2;
 
@@ -235,5 +296,18 @@ mod tests {
             rand(y, i, D1_RANDOM_MODULUS),
             (V0[0x89] ^ V1[0x67] ^ V2[0x45] ^ V3[0x23]) % D1_RANDOM_MODULUS
         );
+    }
+
+    #[test]
+    fn sequential_rfc_rand_matches_independent_seeds_across_carries() {
+        let mut sequential = SequentialRfcRand::new(0x12ff_fff0);
+
+        for offset in 0..64 {
+            let y = 0x12ff_fff0_u32 + offset;
+            let independent = RfcRand::new(y);
+            assert_eq!(sequential.get_raw(6), independent.get_raw(6));
+            assert_eq!(sequential.get(7, 17), independent.get(7, 17));
+            sequential.advance();
+        }
     }
 }
