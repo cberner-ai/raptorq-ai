@@ -13,7 +13,7 @@ use core::arch::x86_64::{
 
 use crate::matrix::BinaryMatrix;
 
-const WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS: usize = 64;
+const WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS: usize = 32;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedBinaryRows {
     height: usize,
