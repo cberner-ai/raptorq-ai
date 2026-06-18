@@ -1,4 +1,6 @@
 #[cfg(feature = "std")]
+use std::cell::RefCell;
+#[cfg(feature = "std")]
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "std")]
 use std::sync::{Arc, Mutex, OnceLock};
@@ -66,6 +68,8 @@ const SINGLE_REPAIR_SYSTEMATIC_MIN_WIDTH: usize = 1;
 const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 #[cfg(feature = "std")]
 const DIRECT_SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
+#[cfg(feature = "std")]
+const DIRECT_PLAN_THREAD_CACHE_MAX_WIDTH: usize = 50_000;
 #[cfg(feature = "std")]
 const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH + 1;
 #[cfg(feature = "std")]
@@ -616,6 +620,12 @@ fn direct_systematic_plan_cache() -> &'static DirectSystematicPlanCacheLock {
 }
 
 #[cfg(feature = "std")]
+std::thread_local! {
+    static DIRECT_SYSTEMATIC_PLAN_THREAD_CACHE: RefCell<Option<(u32, Arc<DirectSystematicPlan>)>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(feature = "std")]
 #[derive(Default)]
 struct HdpcVerifyRowPairsCache {
     pairs: HashMap<HdpcVerifyRowPairsKey, HdpcVerifyRowPairs>,
@@ -879,15 +889,51 @@ fn insert_hybrid_systematic_plan(
 }
 
 #[cfg(feature = "std")]
+fn direct_systematic_plan_thread_cache_get(
+    source_block_symbols: u32,
+) -> Option<Arc<DirectSystematicPlan>> {
+    if num_intermediate_symbols(source_block_symbols) as usize >= DIRECT_PLAN_THREAD_CACHE_MAX_WIDTH
+    {
+        return None;
+    }
+
+    DIRECT_SYSTEMATIC_PLAN_THREAD_CACHE.with(|cache| {
+        cache.borrow().as_ref().and_then(|(cached_symbols, plan)| {
+            (*cached_symbols == source_block_symbols).then(|| Arc::clone(plan))
+        })
+    })
+}
+
+#[cfg(feature = "std")]
+fn direct_systematic_plan_thread_cache_store(
+    source_block_symbols: u32,
+    plan: &Arc<DirectSystematicPlan>,
+) {
+    if num_intermediate_symbols(source_block_symbols) as usize >= DIRECT_PLAN_THREAD_CACHE_MAX_WIDTH
+    {
+        return;
+    }
+
+    DIRECT_SYSTEMATIC_PLAN_THREAD_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some((source_block_symbols, Arc::clone(plan)));
+    });
+}
+
+#[cfg(feature = "std")]
 fn cached_direct_systematic_plan(source_block_symbols: u32) -> Arc<DirectSystematicPlan> {
     let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    if let Some(plan) = direct_systematic_plan_thread_cache_get(source_block_symbols) {
+        return plan;
+    }
     {
         let cache = direct_systematic_plan_cache();
         let guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(plan) = guard.plans.get(&source_block_symbols) {
-            return Arc::clone(plan);
+            let plan = Arc::clone(plan);
+            direct_systematic_plan_thread_cache_store(source_block_symbols, &plan);
+            return plan;
         }
     }
 
@@ -896,7 +942,9 @@ fn cached_direct_systematic_plan(source_block_symbols: u32) -> Arc<DirectSystema
     let mut guard = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    insert_direct_systematic_plan(&mut guard, source_block_symbols, generated)
+    let plan = insert_direct_systematic_plan(&mut guard, source_block_symbols, generated);
+    direct_systematic_plan_thread_cache_store(source_block_symbols, &plan);
+    plan
 }
 
 #[cfg(feature = "std")]
@@ -906,13 +954,18 @@ fn cached_direct_systematic_plan_from_matrix<M: BinaryMatrix>(
     hdpc_rows: &DenseOctetMatrix,
 ) -> Arc<DirectSystematicPlan> {
     let source_block_symbols = extended_source_block_symbols(source_block_symbols);
+    if let Some(plan) = direct_systematic_plan_thread_cache_get(source_block_symbols) {
+        return plan;
+    }
     {
         let cache = direct_systematic_plan_cache();
         let guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(plan) = guard.plans.get(&source_block_symbols) {
-            return Arc::clone(plan);
+            let plan = Arc::clone(plan);
+            direct_systematic_plan_thread_cache_store(source_block_symbols, &plan);
+            return plan;
         }
     }
 
@@ -924,7 +977,9 @@ fn cached_direct_systematic_plan_from_matrix<M: BinaryMatrix>(
     let mut guard = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    insert_direct_systematic_plan(&mut guard, source_block_symbols, generated)
+    let plan = insert_direct_systematic_plan(&mut guard, source_block_symbols, generated);
+    direct_systematic_plan_thread_cache_store(source_block_symbols, &plan);
+    plan
 }
 
 #[cfg(feature = "std")]
@@ -3671,7 +3726,10 @@ pub(crate) fn apply_direct_systematic_solve(source_block_symbols: u32, symbols: 
     let source_block_symbols = extended_source_block_symbols(source_block_symbols);
     #[cfg(feature = "std")]
     {
-        if let Some(plan) = cached_hybrid_systematic_plan_if_present(source_block_symbols) {
+        let width = num_intermediate_symbols(source_block_symbols) as usize;
+        if !use_trusted_direct_systematic_solve(width)
+            && let Some(plan) = cached_hybrid_systematic_plan_if_present(source_block_symbols)
+        {
             apply_cached_hybrid_systematic_plan(&plan, symbols);
             return;
         }
