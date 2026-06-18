@@ -12,6 +12,12 @@ pub(crate) struct FusedAddAssignMulScalarFastPath {
     use_avx2: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct FusedMulAssignAlphaAddAssignFastPath {
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    use_avx2: bool,
+}
+
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[inline]
 fn avx2_available() -> bool {
@@ -376,6 +382,36 @@ impl FusedAddAssignMulScalarFastPath {
     }
 }
 
+impl FusedMulAssignAlphaAddAssignFastPath {
+    pub(crate) fn new(symbol_len: usize) -> FusedMulAssignAlphaAddAssignFastPath {
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            return FusedMulAssignAlphaAddAssignFastPath {
+                use_avx2: symbol_len >= 32 && avx2_available(),
+            };
+        }
+
+        #[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
+        {
+            let _ = symbol_len;
+            FusedMulAssignAlphaAddAssignFastPath {}
+        }
+    }
+
+    pub(crate) fn apply(self, dest: &mut [u8], src: &[u8]) {
+        assert_eq!(dest.len(), src.len());
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_avx2 {
+            unsafe {
+                fused_mulassign_alpha_addassign_avx2(dest, src);
+            }
+            return;
+        }
+
+        fused_mulassign_alpha_addassign_scalar(dest, src);
+    }
+}
+
 pub fn add_assign(dest: &mut [u8], src: &[u8]) {
     AddAssignFastPath::new(dest.len()).apply(dest, src);
 }
@@ -419,11 +455,7 @@ pub fn mulassign_scalar(dest: &mut [u8], scalar: &Octet) {
 }
 
 pub(crate) fn fused_mulassign_alpha_add_assign(dest: &mut [u8], src: &[u8]) {
-    assert_eq!(dest.len(), src.len());
-    if try_fused_mulassign_alpha_addassign_avx2(dest, src) {
-        return;
-    }
-    fused_mulassign_alpha_addassign_scalar(dest, src);
+    FusedMulAssignAlphaAddAssignFastPath::new(dest.len()).apply(dest, src);
 }
 
 pub fn fused_addassign_mul_scalar(dest: &mut [u8], src: &[u8], scalar: &Octet) {
@@ -511,23 +543,6 @@ fn try_mulassign_scalar_avx2(dest: &mut [u8], scalar: &Octet) -> bool {
 
 #[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
 fn try_mulassign_scalar_avx2(_dest: &mut [u8], _scalar: &Octet) -> bool {
-    false
-}
-
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-fn try_fused_mulassign_alpha_addassign_avx2(dest: &mut [u8], src: &[u8]) -> bool {
-    if dest.len() < 32 || !avx2_available() {
-        return false;
-    }
-
-    unsafe {
-        fused_mulassign_alpha_addassign_avx2(dest, src);
-    }
-    true
-}
-
-#[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
-fn try_fused_mulassign_alpha_addassign_avx2(_dest: &mut [u8], _src: &[u8]) -> bool {
     false
 }
 

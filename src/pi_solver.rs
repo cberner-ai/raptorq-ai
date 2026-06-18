@@ -19,8 +19,9 @@ use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
 use crate::octets::{
-    AddAssignFastPath, FusedAddAssignMulScalarFastPath, add_assign, add_assign_and_check_zero,
-    bytes_are_zero, fused_addassign_mul_scalar, fused_mulassign_alpha_add_assign, mulassign_scalar,
+    AddAssignFastPath, FusedAddAssignMulScalarFastPath, FusedMulAssignAlphaAddAssignFastPath,
+    add_assign, add_assign_and_check_zero, bytes_are_zero, fused_addassign_mul_scalar,
+    fused_mulassign_alpha_add_assign, mulassign_scalar,
 };
 use crate::operation_vector::SymbolOps;
 #[cfg(feature = "std")]
@@ -147,6 +148,8 @@ const FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH: usize = 5_000;
 const FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH: usize = 32_768;
 const EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH: usize = 20_000;
 const EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH: usize = HYBRID_MAX_WIDTH;
+const EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH: usize = 10_000;
+const EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH: usize = 32_768;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
@@ -4731,6 +4734,7 @@ fn rfc_hdpc_rows_satisfied_horner(
 ) -> bool {
     #[cfg(not(feature = "std"))]
     let _ = cache_verify_row_pairs;
+    let requested_cached_verify_row_pairs = cache_verify_row_pairs;
 
     let width = decoded.len();
     let Some(gamma_width) = width.checked_sub(h) else {
@@ -4743,6 +4747,12 @@ fn rfc_hdpc_rows_satisfied_horner(
     let symbol_size = decoded.symbol_size();
     let add_assign_path = AddAssignFastPath::new(symbol_size);
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
+    let hoist_alpha_add_path = !requested_cached_verify_row_pairs
+        && (EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH
+            ..=EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH)
+            .contains(&gamma_width);
+    let alpha_add_path =
+        hoist_alpha_add_path.then(|| FusedMulAssignAlphaAddAssignFastPath::new(symbol_size));
     let mut prefix = vec![0u8; symbol_size];
     let mut checks = SymbolSlab::with_zeros(h, symbol_size);
     #[cfg(feature = "std")]
@@ -4763,7 +4773,11 @@ fn rfc_hdpc_rows_satisfied_horner(
         };
 
     for col in 0..gamma_width {
-        fused_mulassign_alpha_add_assign(&mut prefix, decoded.get(col));
+        if let Some(alpha_add_path) = alpha_add_path {
+            alpha_add_path.apply(&mut prefix, decoded.get(col));
+        } else {
+            fused_mulassign_alpha_add_assign(&mut prefix, decoded.get(col));
+        }
 
         if col + 1 == gamma_width {
             for row in 0..h {
@@ -9511,6 +9525,10 @@ mod tests {
         assert!(gamma_width_for(5_000) >= FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH);
         assert!(gamma_width_for(20_000) <= FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(50_000) > FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
+        assert!(gamma_width_for(5_000) < EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH);
+        assert!(gamma_width_for(10_000) >= EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH);
+        assert!(gamma_width_for(20_000) <= EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
+        assert!(gamma_width_for(50_000) > EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(10_000) < EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH);
         assert!(
             (EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH
