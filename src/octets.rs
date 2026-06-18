@@ -380,10 +380,27 @@ pub fn add_assign(dest: &mut [u8], src: &[u8]) {
     AddAssignFastPath::new(dest.len()).apply(dest, src);
 }
 
+pub(crate) fn add_assign_and_check_zero(dest: &mut [u8], src: &[u8]) -> bool {
+    assert_eq!(dest.len(), src.len());
+    if let Some(result) = try_add_assign_and_check_zero_avx2(dest, src) {
+        return result;
+    }
+    add_assign_and_check_zero_scalar(dest, src)
+}
+
 fn add_assign_scalar(dest: &mut [u8], src: &[u8]) {
     for (d, s) in dest.iter_mut().zip(src.iter()) {
         *d ^= *s;
     }
+}
+
+fn add_assign_and_check_zero_scalar(dest: &mut [u8], src: &[u8]) -> bool {
+    let mut combined = 0u8;
+    for (dest, src) in dest.iter_mut().zip(src.iter()) {
+        *dest ^= *src;
+        combined |= *dest;
+    }
+    combined == 0
 }
 
 pub fn mulassign_scalar(dest: &mut [u8], scalar: &Octet) {
@@ -525,6 +542,20 @@ fn try_bytes_are_zero_avx2(bytes: &[u8]) -> Option<bool> {
 
 #[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
 fn try_bytes_are_zero_avx2(_bytes: &[u8]) -> Option<bool> {
+    None
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+fn try_add_assign_and_check_zero_avx2(dest: &mut [u8], src: &[u8]) -> Option<bool> {
+    if dest.len() < 64 || !avx2_available() {
+        return None;
+    }
+
+    Some(unsafe { add_assign_and_check_zero_avx2(dest, src) })
+}
+
+#[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
+fn try_add_assign_and_check_zero_avx2(_dest: &mut [u8], _src: &[u8]) -> Option<bool> {
     None
 }
 
@@ -799,6 +830,38 @@ unsafe fn add_assign_avx2(dest: &mut [u8], src: &[u8]) {
         offset += 32;
     }
     add_assign_scalar(&mut dest[offset..], &src[offset..]);
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn add_assign_and_check_zero_avx2(dest: &mut [u8], src: &[u8]) -> bool {
+    let zero = _mm256_setzero_si256();
+    let mut combined = zero;
+    let mut offset = 0usize;
+
+    while offset + 128 <= dest.len() {
+        unsafe {
+            combined = xor_and_accumulate_32(dest, src, offset, combined);
+            combined = xor_and_accumulate_32(dest, src, offset + 32, combined);
+            combined = xor_and_accumulate_32(dest, src, offset + 64, combined);
+            combined = xor_and_accumulate_32(dest, src, offset + 96, combined);
+        }
+        offset += 128;
+    }
+    while offset + 32 <= dest.len() {
+        unsafe {
+            combined = xor_and_accumulate_32(dest, src, offset, combined);
+        }
+        offset += 32;
+    }
+
+    let mut tail_combined = 0u8;
+    for (dest, src) in dest[offset..].iter_mut().zip(src[offset..].iter()) {
+        *dest ^= *src;
+        tail_combined |= *dest;
+    }
+
+    _mm256_movemask_epi8(_mm256_cmpeq_epi8(combined, zero)) == -1 && tail_combined == 0
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -1079,6 +1142,26 @@ unsafe fn xor_32(dest: &mut [u8], src: &[u8], offset: usize) {
             _mm256_loadu_si256(src_ptr),
         );
         _mm256_storeu_si256(dest_ptr, updated);
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_and_accumulate_32(
+    dest: &mut [u8],
+    src: &[u8],
+    offset: usize,
+    combined: __m256i,
+) -> __m256i {
+    unsafe {
+        let dest_ptr = dest.as_mut_ptr().add(offset).cast::<__m256i>();
+        let src_ptr = src.as_ptr().add(offset).cast::<__m256i>();
+        let updated = _mm256_xor_si256(
+            _mm256_loadu_si256(dest_ptr.cast_const()),
+            _mm256_loadu_si256(src_ptr),
+        );
+        _mm256_storeu_si256(dest_ptr, updated);
+        _mm256_or_si256(combined, updated)
     }
 }
 
@@ -1612,6 +1695,36 @@ mod tests {
                     "direct AVX2 add_assign failed for length {len}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn add_assign_and_check_zero_matches_add_then_scan() {
+        for len in [0usize, 1, 31, 32, 63, 64, 95, 127, 128, 129] {
+            let src = patterned_bytes(len)
+                .into_iter()
+                .map(|byte| byte.rotate_left(3) ^ 0xa5)
+                .collect::<Vec<_>>();
+
+            let mut zero_result = src.clone();
+            let mut expected_zero_result = zero_result.clone();
+            add_assign(&mut expected_zero_result, &src);
+            assert_eq!(
+                add_assign_and_check_zero(&mut zero_result, &src),
+                bytes_are_zero(&expected_zero_result),
+                "zero result mismatch for length {len}"
+            );
+            assert_eq!(zero_result, expected_zero_result);
+
+            let mut nonzero_result = patterned_bytes(len);
+            let mut expected_nonzero_result = nonzero_result.clone();
+            add_assign(&mut expected_nonzero_result, &src);
+            assert_eq!(
+                add_assign_and_check_zero(&mut nonzero_result, &src),
+                bytes_are_zero(&expected_nonzero_result),
+                "nonzero result mismatch for length {len}"
+            );
+            assert_eq!(nonzero_result, expected_nonzero_result);
         }
     }
 

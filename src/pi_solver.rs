@@ -19,8 +19,8 @@ use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
 use crate::octets::{
-    AddAssignFastPath, FusedAddAssignMulScalarFastPath, add_assign, bytes_are_zero,
-    fused_addassign_mul_scalar, fused_mulassign_alpha_add_assign, mulassign_scalar,
+    AddAssignFastPath, FusedAddAssignMulScalarFastPath, add_assign, add_assign_and_check_zero,
+    bytes_are_zero, fused_addassign_mul_scalar, fused_mulassign_alpha_add_assign, mulassign_scalar,
 };
 use crate::operation_vector::SymbolOps;
 #[cfg(feature = "std")]
@@ -142,6 +142,8 @@ const HDPC_VERIFY_ROW_PAIRS_CACHE_CAPACITY: usize = 16;
 const HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH: usize = 512;
 #[cfg(feature = "std")]
 const HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH: usize = 32_768;
+const FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH: usize = 5_000;
+const FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH: usize = 32_768;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
@@ -4782,6 +4784,17 @@ fn rfc_hdpc_rows_satisfied_horner(
     #[cfg(feature = "std")]
     if cache_verify_row_pairs && cached_verify_row_pairs.is_none() {
         insert_rfc_hdpc_verify_row_pairs(gamma_width, h, generated_verify_row_pairs);
+    }
+
+    if (FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH..=FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
+        .contains(&gamma_width)
+    {
+        let mut checks_satisfied = true;
+        for row in 0..h {
+            checks_satisfied &=
+                add_assign_and_check_zero(checks.get_mut(row), decoded.get(gamma_width + row));
+        }
+        return checks_satisfied;
     }
 
     for row in 0..h {
@@ -9457,6 +9470,9 @@ mod tests {
 
         assert!(gamma_width_for(20_000) <= HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(50_000) > HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH);
+        assert!(gamma_width_for(5_000) >= FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH);
+        assert!(gamma_width_for(20_000) <= FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
+        assert!(gamma_width_for(50_000) > FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
     }
 
     #[test]
