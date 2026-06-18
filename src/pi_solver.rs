@@ -132,6 +132,7 @@ const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 4_096;
 #[cfg(test)]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
 const OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH: usize = 5_000;
+const OVERDETERMINED_NO_HDPC_PREFIX_MID_OWNED_MAX_WIDTH: usize = 10_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH: usize = 20_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 20_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_BACKSUB_BATCH4_MAX_WIDTH: usize = 32_768;
@@ -145,7 +146,7 @@ const HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH: usize = 32_768;
 const FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH: usize = 5_000;
 const FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH: usize = 32_768;
 const EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH: usize = 20_000;
-const EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH: usize = 32_768;
+const EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH: usize = HYBRID_MAX_WIDTH;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
@@ -195,6 +196,13 @@ fn use_trusted_direct_source_batch_back_substitution(width: usize) -> bool {
 #[inline]
 fn use_direct_forward_no_zero_check(width: usize) -> bool {
     width >= DIRECT_FORWARD_NO_ZERO_CHECK_MIN_WIDTH
+}
+
+#[inline]
+fn use_overdetermined_no_hdpc_prefix_owned(width: usize) -> bool {
+    (OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH..OVERDETERMINED_NO_HDPC_PREFIX_MID_OWNED_MAX_WIDTH)
+        .contains(&width)
+        || width >= OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH
 }
 
 fn coefficient_col(col: usize) -> CoefficientColumn {
@@ -4231,7 +4239,7 @@ pub fn fused_inverse_mul_symbols_no_hdpc<M: BinaryMatrix>(
     assert_eq!(symbols.len(), matrix.height());
     if matrix.width() >= OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH && matrix.height() > matrix.width()
     {
-        if matrix.width() >= OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH {
+        if use_overdetermined_no_hdpc_prefix_owned(matrix.width()) {
             match try_overdetermined_no_hdpc_prefix_solve_owned(
                 &matrix,
                 symbols,
@@ -9509,7 +9517,21 @@ mod tests {
                 ..=EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
                 .contains(&gamma_width_for(20_000))
         );
-        assert!(gamma_width_for(50_000) > EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
+        assert!(
+            (EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH
+                ..=EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
+                .contains(&gamma_width_for(50_000))
+        );
+    }
+
+    #[test]
+    fn overdetermined_prefix_owned_path_covers_5k_gap_only() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert!(!use_overdetermined_no_hdpc_prefix_owned(width_for(2_000)));
+        assert!(use_overdetermined_no_hdpc_prefix_owned(width_for(5_000)));
+        assert!(!use_overdetermined_no_hdpc_prefix_owned(width_for(10_000)));
+        assert!(use_overdetermined_no_hdpc_prefix_owned(width_for(20_000)));
     }
 
     #[test]
