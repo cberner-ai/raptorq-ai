@@ -4788,10 +4788,7 @@ fn rfc_hdpc_rows_satisfied_horner(
         add_assign_path.apply(checks.get_mut(row), decoded.get(gamma_width + row));
     }
 
-    checks
-        .as_bytes()
-        .chunks_exact(symbol_size)
-        .all(bytes_are_zero)
+    symbol_is_zero(checks.as_bytes())
 }
 
 fn addassign_hdpc_check_pair(
@@ -4864,7 +4861,7 @@ fn hdpc_rows_satisfied_column_major(decoded: &SymbolSlab, hdpc_rows: &DenseOctet
         }
     }
 
-    checks.chunks_exact(symbol_size).all(bytes_are_zero)
+    symbol_is_zero(&checks)
 }
 
 // Repair systems with at least L rows can often be reduced mostly over GF(2).
