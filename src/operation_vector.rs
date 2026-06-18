@@ -17,6 +17,8 @@ use crate::symbol_slab::SymbolSlab;
 use serde::{Deserialize, Serialize};
 
 const REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS: usize = 10_000;
+const REPLAY_BATCH_FAST_PATH_MIN_DESTS_FOR_LARGE_SYMBOLS: usize = 4;
+const REPLAY_BATCH_FAST_PATH_LARGE_SYMBOLS: usize = 20_000;
 const REPLAY_BATCH_FAST_PATH_MAX_SYMBOLS: usize = 32_768;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,9 +132,11 @@ fn fused_addassign_symbol_batch_inner<const REUSE_FAST_PATHS: bool>(
     let bytes_ptr = bytes.as_mut_ptr();
 
     if REUSE_FAST_PATHS
-        && dests.len() > 1
         && (REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS..=REPLAY_BATCH_FAST_PATH_MAX_SYMBOLS)
             .contains(&symbol_count)
+        && (dests.len() > 1
+            && (symbol_count < REPLAY_BATCH_FAST_PATH_LARGE_SYMBOLS
+                || dests.len() >= REPLAY_BATCH_FAST_PATH_MIN_DESTS_FOR_LARGE_SYMBOLS))
     {
         let add_fast_path = AddAssignFastPath::new(symbol_size);
         let fused_fast_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
