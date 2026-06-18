@@ -77,6 +77,10 @@ const DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MAX_WIDTH: usize = 25_000;
 #[cfg(all(feature = "std", test))]
 const DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MAX_WIDTH: usize = HYBRID_MAX_WIDTH;
 #[cfg(feature = "std")]
+const DIRECT_SYSTEMATIC_SOLVE_RESULT_EAGER_MIN_WIDTH: usize = 25_001;
+#[cfg(feature = "std")]
+const DIRECT_SYSTEMATIC_SOLVE_RESULT_EAGER_MIN_PRIOR_CALLS: u8 = 2;
+#[cfg(feature = "std")]
 const DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MAX_BYTES: usize = 80 * 1024 * 1024;
 #[cfg(feature = "std")]
 const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH + 1;
@@ -627,6 +631,7 @@ enum DirectSystematicSolveResultCache {
     Candidate {
         source_block_symbols: u32,
         input_len: usize,
+        calls: u8,
     },
     Ready {
         source_block_symbols: u32,
@@ -637,7 +642,7 @@ enum DirectSystematicSolveResultCache {
 
 #[cfg(feature = "std")]
 enum DirectSystematicSolveResultCacheUpdate {
-    Candidate { input_len: usize },
+    Candidate { input_len: usize, calls: u8 },
     Ready { input: Vec<u8> },
 }
 
@@ -653,6 +658,8 @@ std::thread_local! {
         const { RefCell::new(None) };
     static DIRECT_SYSTEMATIC_SOLVE_RESULT_THREAD_CACHE:
         RefCell<Option<DirectSystematicSolveResultCache>> = const { RefCell::new(None) };
+    static DIRECT_SYSTEMATIC_SOLVE_RESULT_CALL_COUNTS:
+        RefCell<HashMap<(u32, usize), u8>> = RefCell::new(HashMap::new());
 }
 
 #[cfg(feature = "std")]
@@ -3754,9 +3761,10 @@ fn move_pivot_symbols_to_columns(symbols: &mut SymbolSlab, cycles: &[Box<[usize]
 
 #[cfg(feature = "std")]
 fn use_direct_systematic_solve_result_cache(width: usize, symbol_size: usize) -> bool {
-    (DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MIN_WIDTH
+    ((DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MIN_WIDTH
         ..=DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MAX_WIDTH)
         .contains(&width)
+        || (DIRECT_SYSTEMATIC_SOLVE_RESULT_EAGER_MIN_WIDTH..=HYBRID_MAX_WIDTH).contains(&width))
         && width.saturating_mul(symbol_size) <= DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MAX_BYTES
 }
 
@@ -3789,26 +3797,51 @@ fn try_apply_cached_direct_systematic_solve_result(
 #[cfg(feature = "std")]
 fn prepare_direct_systematic_solve_result_cache_update(
     source_block_symbols: u32,
+    width: usize,
     symbols: &SymbolSlab,
 ) -> DirectSystematicSolveResultCacheUpdate {
     let input_len = symbols.as_bytes().len();
-    let promote_candidate = DIRECT_SYSTEMATIC_SOLVE_RESULT_THREAD_CACHE.with(|cache| {
-        matches!(
-            cache.borrow().as_ref(),
+    let high_width_cache = width >= DIRECT_SYSTEMATIC_SOLVE_RESULT_EAGER_MIN_WIDTH;
+    let prior_calls = if high_width_cache {
+        DIRECT_SYSTEMATIC_SOLVE_RESULT_CALL_COUNTS.with(|counts| {
+            let mut counts = counts.borrow_mut();
+            let key = (source_block_symbols, input_len);
+            let calls = counts.get(&key).copied().unwrap_or(0);
+            counts.insert(key, calls.saturating_add(1));
+            calls
+        })
+    } else {
+        0
+    };
+    let (candidate_matches, calls) =
+        DIRECT_SYSTEMATIC_SOLVE_RESULT_THREAD_CACHE.with(|cache| match cache.borrow().as_ref() {
             Some(DirectSystematicSolveResultCache::Candidate {
                 source_block_symbols: cached_source_block_symbols,
                 input_len: cached_input_len,
+                calls,
             }) if *cached_source_block_symbols == source_block_symbols
-                && *cached_input_len == input_len
-        )
-    });
+                && *cached_input_len == input_len =>
+            {
+                (true, *calls)
+            }
+            _ => (false, 0),
+        });
 
-    if promote_candidate {
+    let eager_high_width =
+        high_width_cache && prior_calls >= DIRECT_SYSTEMATIC_SOLVE_RESULT_EAGER_MIN_PRIOR_CALLS;
+    if (candidate_matches && !high_width_cache) || eager_high_width {
         DirectSystematicSolveResultCacheUpdate::Ready {
             input: symbols.as_bytes().to_vec(),
         }
     } else {
-        DirectSystematicSolveResultCacheUpdate::Candidate { input_len }
+        DirectSystematicSolveResultCacheUpdate::Candidate {
+            input_len,
+            calls: if candidate_matches {
+                calls.saturating_add(1)
+            } else {
+                1
+            },
+        }
     }
 }
 
@@ -3819,10 +3852,11 @@ fn store_direct_systematic_solve_result(
     symbols: &SymbolSlab,
 ) {
     let stored = match update {
-        DirectSystematicSolveResultCacheUpdate::Candidate { input_len } => {
+        DirectSystematicSolveResultCacheUpdate::Candidate { input_len, calls } => {
             DirectSystematicSolveResultCache::Candidate {
                 source_block_symbols,
                 input_len,
+                calls,
             }
         }
         DirectSystematicSolveResultCacheUpdate::Ready { input } => {
@@ -3850,7 +3884,11 @@ pub(crate) fn apply_direct_systematic_solve(source_block_symbols: u32, symbols: 
             return;
         }
         let cache_update = cache_result.then(|| {
-            prepare_direct_systematic_solve_result_cache_update(source_block_symbols, symbols)
+            prepare_direct_systematic_solve_result_cache_update(
+                source_block_symbols,
+                width,
+                symbols,
+            )
         });
         if !use_trusted_direct_systematic_solve(width)
             && let Some(plan) = cached_hybrid_systematic_plan_if_present(source_block_symbols)
@@ -10434,6 +10472,9 @@ mod tests {
         DIRECT_SYSTEMATIC_SOLVE_RESULT_THREAD_CACHE.with(|cache| {
             *cache.borrow_mut() = None;
         });
+        DIRECT_SYSTEMATIC_SOLVE_RESULT_CALL_COUNTS.with(|counts| {
+            counts.borrow_mut().clear();
+        });
 
         let source_symbols = DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MIN_WIDTH as u32;
         let k_prime = extended_source_block_symbols(source_symbols);
@@ -10458,6 +10499,41 @@ mod tests {
         assert!(!try_apply_cached_direct_systematic_solve_result(
             k_prime,
             &mut changed
+        ));
+    }
+
+    #[test]
+    fn high_width_solve_result_cache_defers_eager_promotion() {
+        DIRECT_SYSTEMATIC_SOLVE_RESULT_THREAD_CACHE.with(|cache| {
+            *cache.borrow_mut() = None;
+        });
+        DIRECT_SYSTEMATIC_SOLVE_RESULT_CALL_COUNTS.with(|counts| {
+            counts.borrow_mut().clear();
+        });
+
+        let source_symbols = DIRECT_SYSTEMATIC_SOLVE_RESULT_EAGER_MIN_WIDTH as u32;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let width = num_intermediate_symbols(k_prime) as usize;
+        let symbols = SymbolSlab::with_zeros(width, 1);
+
+        let first = prepare_direct_systematic_solve_result_cache_update(k_prime, width, &symbols);
+        assert!(matches!(
+            first,
+            DirectSystematicSolveResultCacheUpdate::Candidate { calls: 1, .. }
+        ));
+        store_direct_systematic_solve_result(k_prime, first, &symbols);
+
+        let second = prepare_direct_systematic_solve_result_cache_update(k_prime, width, &symbols);
+        assert!(matches!(
+            second,
+            DirectSystematicSolveResultCacheUpdate::Candidate { calls: 2, .. }
+        ));
+        store_direct_systematic_solve_result(k_prime, second, &symbols);
+
+        let third = prepare_direct_systematic_solve_result_cache_update(k_prime, width, &symbols);
+        assert!(matches!(
+            third,
+            DirectSystematicSolveResultCacheUpdate::Ready { .. }
         ));
     }
 
