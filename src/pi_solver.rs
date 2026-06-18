@@ -144,6 +144,8 @@ const HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH: usize = 512;
 const HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH: usize = 32_768;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
+const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
+const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH: usize = 32_768;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 
@@ -1720,13 +1722,29 @@ fn prepare_direct_systematic_plan_for_decode<M: BinaryMatrix>(
     hdpc_rows: &DenseOctetMatrix,
     source_block_symbols: u32,
 ) -> Option<DirectSystematicPlan> {
-    prepare_direct_systematic_plan_with_small_weight_max::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, M>(
-        matrix,
-        hdpc_rows,
-        source_block_symbols,
-        direct_decode_back_substitution_layout(matrix.width()),
-        false,
-    )
+    if matrix.width() >= HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH {
+        prepare_direct_systematic_plan_with_small_weight_max::<
+            HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+            M,
+        >(
+            matrix,
+            hdpc_rows,
+            source_block_symbols,
+            direct_decode_back_substitution_layout(matrix.width()),
+            false,
+        )
+    } else {
+        prepare_direct_systematic_plan_with_small_weight_max::<
+            DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+            M,
+        >(
+            matrix,
+            hdpc_rows,
+            source_block_symbols,
+            direct_decode_back_substitution_layout(matrix.width()),
+            false,
+        )
+    }
 }
 
 #[cfg(feature = "std")]
@@ -9410,6 +9428,16 @@ mod tests {
         assert!(width_for(100) >= DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH);
         assert!(width_for(250) >= DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH);
         assert!(width_for(500) >= DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH);
+    }
+
+    #[test]
+    fn high_decode_small_weight_bucket_threshold_only_covers_50k_ci_row() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert_eq!(DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 16);
+        assert_eq!(HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 31);
+        assert!(width_for(20_000) < HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
+        assert!(width_for(50_000) >= HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
     }
 
     #[test]
