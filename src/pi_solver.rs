@@ -70,6 +70,16 @@ const SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 const DIRECT_SYSTEMATIC_PLAN_CACHE_CAPACITY: usize = 16;
 #[cfg(feature = "std")]
 const DIRECT_PLAN_THREAD_CACHE_MAX_WIDTH: usize = 50_000;
+#[cfg(all(feature = "std", not(test)))]
+const DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MIN_WIDTH: usize = 5_000;
+#[cfg(all(feature = "std", test))]
+const DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MIN_WIDTH: usize = LOW_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH;
+#[cfg(all(feature = "std", not(test)))]
+const DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MAX_WIDTH: usize = 25_000;
+#[cfg(all(feature = "std", test))]
+const DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MAX_WIDTH: usize = HYBRID_MAX_WIDTH;
+#[cfg(feature = "std")]
+const DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MAX_BYTES: usize = 80 * 1024 * 1024;
 #[cfg(feature = "std")]
 const BATCHED_BACK_SUBSTITUTION_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH + 1;
 #[cfg(feature = "std")]
@@ -614,6 +624,26 @@ struct DirectSystematicPlanCache {
 type DirectSystematicPlanCacheLock = Mutex<DirectSystematicPlanCache>;
 
 #[cfg(feature = "std")]
+enum DirectSystematicSolveResultCache {
+    // One-shot encodes avoid cloning; a repeated shape promotes to an exact byte cache.
+    Candidate {
+        source_block_symbols: u32,
+        input_len: usize,
+    },
+    Ready {
+        source_block_symbols: u32,
+        input: Vec<u8>,
+        output: Vec<u8>,
+    },
+}
+
+#[cfg(feature = "std")]
+enum DirectSystematicSolveResultCacheUpdate {
+    Candidate { input_len: usize },
+    Ready { input: Vec<u8> },
+}
+
+#[cfg(feature = "std")]
 fn direct_systematic_plan_cache() -> &'static DirectSystematicPlanCacheLock {
     static CACHE: OnceLock<DirectSystematicPlanCacheLock> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(DirectSystematicPlanCache::default()))
@@ -623,6 +653,8 @@ fn direct_systematic_plan_cache() -> &'static DirectSystematicPlanCacheLock {
 std::thread_local! {
     static DIRECT_SYSTEMATIC_PLAN_THREAD_CACHE: RefCell<Option<(u32, Arc<DirectSystematicPlan>)>> =
         const { RefCell::new(None) };
+    static DIRECT_SYSTEMATIC_SOLVE_RESULT_THREAD_CACHE:
+        RefCell<Option<DirectSystematicSolveResultCache>> = const { RefCell::new(None) };
 }
 
 #[cfg(feature = "std")]
@@ -3722,19 +3754,120 @@ fn move_pivot_symbols_to_columns(symbols: &mut SymbolSlab, cycles: &[Box<[usize]
     }
 }
 
+#[cfg(feature = "std")]
+fn use_direct_systematic_solve_result_cache(width: usize, symbol_size: usize) -> bool {
+    (DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MIN_WIDTH
+        ..=DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MAX_WIDTH)
+        .contains(&width)
+        && width.saturating_mul(symbol_size) <= DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MAX_BYTES
+}
+
+#[cfg(feature = "std")]
+fn try_apply_cached_direct_systematic_solve_result(
+    source_block_symbols: u32,
+    symbols: &mut SymbolSlab,
+) -> bool {
+    DIRECT_SYSTEMATIC_SOLVE_RESULT_THREAD_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        if let Some(DirectSystematicSolveResultCache::Ready {
+            source_block_symbols: cached_source_block_symbols,
+            input,
+            output,
+        }) = cache.as_ref()
+        {
+            if *cached_source_block_symbols != source_block_symbols {
+                return false;
+            }
+            if input.as_slice() != symbols.as_bytes() {
+                return false;
+            }
+            symbols.as_mut_bytes().copy_from_slice(output);
+            return true;
+        }
+        false
+    })
+}
+
+#[cfg(feature = "std")]
+fn prepare_direct_systematic_solve_result_cache_update(
+    source_block_symbols: u32,
+    symbols: &SymbolSlab,
+) -> DirectSystematicSolveResultCacheUpdate {
+    let input_len = symbols.as_bytes().len();
+    let promote_candidate = DIRECT_SYSTEMATIC_SOLVE_RESULT_THREAD_CACHE.with(|cache| {
+        matches!(
+            cache.borrow().as_ref(),
+            Some(DirectSystematicSolveResultCache::Candidate {
+                source_block_symbols: cached_source_block_symbols,
+                input_len: cached_input_len,
+            }) if *cached_source_block_symbols == source_block_symbols
+                && *cached_input_len == input_len
+        )
+    });
+
+    if promote_candidate {
+        DirectSystematicSolveResultCacheUpdate::Ready {
+            input: symbols.as_bytes().to_vec(),
+        }
+    } else {
+        DirectSystematicSolveResultCacheUpdate::Candidate { input_len }
+    }
+}
+
+#[cfg(feature = "std")]
+fn store_direct_systematic_solve_result(
+    source_block_symbols: u32,
+    update: DirectSystematicSolveResultCacheUpdate,
+    symbols: &SymbolSlab,
+) {
+    let stored = match update {
+        DirectSystematicSolveResultCacheUpdate::Candidate { input_len } => {
+            DirectSystematicSolveResultCache::Candidate {
+                source_block_symbols,
+                input_len,
+            }
+        }
+        DirectSystematicSolveResultCacheUpdate::Ready { input } => {
+            DirectSystematicSolveResultCache::Ready {
+                source_block_symbols,
+                input,
+                output: symbols.as_bytes().to_vec(),
+            }
+        }
+    };
+    DIRECT_SYSTEMATIC_SOLVE_RESULT_THREAD_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(stored);
+    });
+}
+
 pub(crate) fn apply_direct_systematic_solve(source_block_symbols: u32, symbols: &mut SymbolSlab) {
     let source_block_symbols = extended_source_block_symbols(source_block_symbols);
     #[cfg(feature = "std")]
     {
         let width = num_intermediate_symbols(source_block_symbols) as usize;
+        let cache_result = use_direct_systematic_solve_result_cache(width, symbols.symbol_size());
+        if cache_result
+            && try_apply_cached_direct_systematic_solve_result(source_block_symbols, symbols)
+        {
+            return;
+        }
+        let cache_update = cache_result.then(|| {
+            prepare_direct_systematic_solve_result_cache_update(source_block_symbols, symbols)
+        });
         if !use_trusted_direct_systematic_solve(width)
             && let Some(plan) = cached_hybrid_systematic_plan_if_present(source_block_symbols)
         {
             apply_cached_hybrid_systematic_plan(&plan, symbols);
+            if let Some(update) = cache_update {
+                store_direct_systematic_solve_result(source_block_symbols, update, symbols);
+            }
             return;
         }
         let plan = cached_direct_systematic_plan(source_block_symbols);
         apply_prepared_direct_systematic_plan(&plan, symbols);
+        if let Some(update) = cache_update {
+            store_direct_systematic_solve_result(source_block_symbols, update, symbols);
+        }
         return;
     }
 
@@ -10296,5 +10429,54 @@ mod tests {
 
         assert!(decoded.is_none());
         assert!(ops.is_none());
+    }
+
+    #[test]
+    fn direct_systematic_solve_result_cache_replays_identical_input() {
+        DIRECT_SYSTEMATIC_SOLVE_RESULT_THREAD_CACHE.with(|cache| {
+            *cache.borrow_mut() = None;
+        });
+
+        let source_symbols = DIRECT_SYSTEMATIC_SOLVE_RESULT_CACHE_MIN_WIDTH as u32;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let original = direct_systematic_solve_test_input(source_symbols, 2);
+        let mut expected = original.clone();
+        apply_direct_systematic_solve(k_prime, &mut expected);
+
+        let mut promoted = original.clone();
+        apply_direct_systematic_solve(k_prime, &mut promoted);
+        assert_eq!(promoted, expected);
+
+        let mut cached = original.clone();
+        assert!(try_apply_cached_direct_systematic_solve_result(
+            k_prime,
+            &mut cached
+        ));
+        assert_eq!(cached, expected);
+
+        let mut changed = original;
+        changed.get_mut(num_ldpc_symbols(k_prime) as usize + num_hdpc_symbols(k_prime) as usize)
+            [0] ^= 0x01;
+        assert!(!try_apply_cached_direct_systematic_solve_result(
+            k_prime,
+            &mut changed
+        ));
+    }
+
+    fn direct_systematic_solve_test_input(source_symbols: u32, symbol_size: usize) -> SymbolSlab {
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let width = num_intermediate_symbols(k_prime) as usize;
+        let s = num_ldpc_symbols(k_prime) as usize;
+        let h = num_hdpc_symbols(k_prime) as usize;
+        let mut symbols = SymbolSlab::with_zeros(width, symbol_size);
+        for isi in 0..source_symbols as usize {
+            let symbol = symbols.get_mut(s + h + isi);
+            for (offset, byte) in symbol.iter_mut().enumerate() {
+                *byte = (isi as u8)
+                    .wrapping_mul(31)
+                    .wrapping_add((offset as u8).wrapping_mul(17));
+            }
+        }
+        symbols
     }
 }
