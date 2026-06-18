@@ -561,17 +561,15 @@ fn try_add_assign_and_check_zero_avx2(_dest: &mut [u8], _src: &[u8]) -> Option<b
 
 #[cfg(all(feature = "std", target_arch = "x86"))]
 use core::arch::x86::{
-    __m256i, _mm256_add_epi8, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
-    _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8,
-    _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_storeu_si256,
-    _mm256_xor_si256,
+    __m256i, _mm256_add_epi8, _mm256_and_si256, _mm256_cmpgt_epi8, _mm256_loadu_si256,
+    _mm256_or_si256, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8,
+    _mm256_srli_epi16, _mm256_storeu_si256, _mm256_testz_si256, _mm256_xor_si256,
 };
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 use core::arch::x86_64::{
-    __m256i, _mm256_add_epi8, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
-    _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8,
-    _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_storeu_si256,
-    _mm256_xor_si256,
+    __m256i, _mm256_add_epi8, _mm256_and_si256, _mm256_cmpgt_epi8, _mm256_loadu_si256,
+    _mm256_or_si256, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8,
+    _mm256_srli_epi16, _mm256_storeu_si256, _mm256_testz_si256, _mm256_xor_si256,
 };
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -835,8 +833,7 @@ unsafe fn add_assign_avx2(dest: &mut [u8], src: &[u8]) {
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
 unsafe fn add_assign_and_check_zero_avx2(dest: &mut [u8], src: &[u8]) -> bool {
-    let zero = _mm256_setzero_si256();
-    let mut combined = zero;
+    let mut combined = _mm256_setzero_si256();
     let mut offset = 0usize;
 
     while offset + 128 <= dest.len() {
@@ -861,7 +858,7 @@ unsafe fn add_assign_and_check_zero_avx2(dest: &mut [u8], src: &[u8]) -> bool {
         tail_combined |= *dest;
     }
 
-    _mm256_movemask_epi8(_mm256_cmpeq_epi8(combined, zero)) == -1 && tail_combined == 0
+    _mm256_testz_si256(combined, combined) != 0 && tail_combined == 0
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -1099,7 +1096,6 @@ unsafe fn add_assign_sources_16_avx2(dest: *mut u8, srcs: [*const u8; 16], len: 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
 unsafe fn bytes_are_zero_avx2(bytes: &[u8]) -> bool {
-    let zero = _mm256_setzero_si256();
     let mut offset = 0usize;
 
     while offset + 128 <= bytes.len() {
@@ -1114,7 +1110,7 @@ unsafe fn bytes_are_zero_avx2(bytes: &[u8]) -> bool {
             );
             _mm256_or_si256(first, second)
         };
-        if _mm256_movemask_epi8(_mm256_cmpeq_epi8(combined, zero)) != -1 {
+        if _mm256_testz_si256(combined, combined) == 0 {
             return false;
         }
         offset += 128;
@@ -1122,7 +1118,7 @@ unsafe fn bytes_are_zero_avx2(bytes: &[u8]) -> bool {
 
     while offset + 32 <= bytes.len() {
         let chunk = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(offset).cast::<__m256i>()) };
-        if _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, zero)) != -1 {
+        if _mm256_testz_si256(chunk, chunk) == 0 {
             return false;
         }
         offset += 32;
