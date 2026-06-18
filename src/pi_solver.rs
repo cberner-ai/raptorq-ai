@@ -2514,6 +2514,8 @@ fn binary_slices_from_counts(counts: Vec<usize>) -> CachedBinarySliceParts {
 fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut SymbolSlab) {
     assert_eq!(symbols.len(), plan.width);
 
+    let add_assign_path = AddAssignFastPath::new(symbols.symbol_size());
+    let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbols.symbol_size());
     for (step_index, step) in plan.forward_steps.iter().enumerate() {
         if let Some(scale) = step.scale {
             mulassign_scalar(symbols.get_mut(step.pivot), &scale);
@@ -2523,6 +2525,8 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
             step.pivot,
             plan.forward_dests.slice(step_index),
             plan.forward_dests.is_unit_only(step_index),
+            add_assign_path,
+            fused_mul_path,
         );
     }
 
@@ -2549,6 +2553,8 @@ fn apply_prepared_systematic_plan(plan: &CachedSystematicPlan, symbols: &mut Sym
                     src,
                     batches.slice(src),
                     batches.is_unit_only(src),
+                    add_assign_path,
+                    fused_mul_path,
                 );
             }
         }
@@ -2594,12 +2600,12 @@ fn try_apply_prepared_direct_systematic_plan(
         }
     }
 
-    let mut hdpc_symbols = SymbolSlab::with_zeros(plan.h, symbol_size);
-    for row in 0..plan.h {
-        hdpc_symbols
-            .get_mut(row)
-            .copy_from_slice(symbols.get(plan.s + row));
-    }
+    let hdpc_start = plan.s * symbol_size;
+    let hdpc_end = hdpc_start + plan.h * symbol_size;
+    let mut hdpc_symbols = SymbolSlab::from_bytes(
+        symbols.as_bytes()[hdpc_start..hdpc_end].to_vec(),
+        symbol_size,
+    );
     for (update_index, &pivot) in plan.hdpc_update_pivots.iter().enumerate() {
         let pivot_symbol = symbols.get(coefficient_col_index(pivot));
         let update_slice = plan.hdpc_updates.slice(update_index);
@@ -2902,6 +2908,8 @@ fn fused_addassign_cached_symbol_batch(
     src: usize,
     dests: &[(CoefficientColumn, Octet)],
     unit_only: bool,
+    add_assign_path: AddAssignFastPath,
+    fused_mul_path: FusedAddAssignMulScalarFastPath,
 ) {
     if dests.is_empty() {
         return;
@@ -2919,7 +2927,87 @@ fn fused_addassign_cached_symbol_batch(
     let bytes_ptr = bytes.as_mut_ptr();
 
     if unit_only {
-        for &(dest, _) in dests {
+        let mut dest_chunks = dests.chunks_exact(8);
+        for chunk in dest_chunks.by_ref() {
+            debug_assert!(chunk.iter().all(|&(_, factor)| factor == Octet::one()));
+            let dest0 = coefficient_col_index(chunk[0].0);
+            let dest1 = coefficient_col_index(chunk[1].0);
+            let dest2 = coefficient_col_index(chunk[2].0);
+            let dest3 = coefficient_col_index(chunk[3].0);
+            let dest4 = coefficient_col_index(chunk[4].0);
+            let dest5 = coefficient_col_index(chunk[5].0);
+            let dest6 = coefficient_col_index(chunk[6].0);
+            let dest7 = coefficient_col_index(chunk[7].0);
+            debug_assert_direct_batch_dests(
+                src,
+                &[dest0, dest1, dest2, dest3, dest4, dest5, dest6, dest7],
+            );
+            let dest0_start = dest0 * symbol_size;
+            let dest1_start = dest1 * symbol_size;
+            let dest2_start = dest2 * symbol_size;
+            let dest3_start = dest3 * symbol_size;
+            let dest4_start = dest4 * symbol_size;
+            let dest5_start = dest5 * symbol_size;
+            let dest6_start = dest6 * symbol_size;
+            let dest7_start = dest7 * symbol_size;
+            assert!(dest0_start + symbol_size <= bytes.len());
+            assert!(dest1_start + symbol_size <= bytes.len());
+            assert!(dest2_start + symbol_size <= bytes.len());
+            assert!(dest3_start + symbol_size <= bytes.len());
+            assert!(dest4_start + symbol_size <= bytes.len());
+            assert!(dest5_start + symbol_size <= bytes.len());
+            assert!(dest6_start + symbol_size <= bytes.len());
+            assert!(dest7_start + symbol_size <= bytes.len());
+            unsafe {
+                add_assign_path.apply_same_len_raw_8(
+                    [
+                        bytes_ptr.add(dest0_start),
+                        bytes_ptr.add(dest1_start),
+                        bytes_ptr.add(dest2_start),
+                        bytes_ptr.add(dest3_start),
+                        bytes_ptr.add(dest4_start),
+                        bytes_ptr.add(dest5_start),
+                        bytes_ptr.add(dest6_start),
+                        bytes_ptr.add(dest7_start),
+                    ],
+                    src_ptr,
+                    symbol_size,
+                );
+            }
+        }
+
+        let mut dest_chunks = dest_chunks.remainder().chunks_exact(4);
+        for chunk in dest_chunks.by_ref() {
+            debug_assert!(chunk.iter().all(|&(_, factor)| factor == Octet::one()));
+            let dest0 = coefficient_col_index(chunk[0].0);
+            let dest1 = coefficient_col_index(chunk[1].0);
+            let dest2 = coefficient_col_index(chunk[2].0);
+            let dest3 = coefficient_col_index(chunk[3].0);
+            debug_assert_direct_batch_dests(src, &[dest0, dest1, dest2, dest3]);
+            let dest0_start = dest0 * symbol_size;
+            let dest1_start = dest1 * symbol_size;
+            let dest2_start = dest2 * symbol_size;
+            let dest3_start = dest3 * symbol_size;
+            assert!(dest0_start + symbol_size <= bytes.len());
+            assert!(dest1_start + symbol_size <= bytes.len());
+            assert!(dest2_start + symbol_size <= bytes.len());
+            assert!(dest3_start + symbol_size <= bytes.len());
+            unsafe {
+                add_assign_path.apply_same_len_raw_4(
+                    [
+                        bytes_ptr.add(dest0_start),
+                        bytes_ptr.add(dest1_start),
+                        bytes_ptr.add(dest2_start),
+                        bytes_ptr.add(dest3_start),
+                    ],
+                    src_ptr,
+                    symbol_size,
+                );
+            }
+        }
+
+        for &(dest, factor) in dest_chunks.remainder() {
+            debug_assert_eq!(factor, Octet::one());
             let dest = coefficient_col_index(dest);
             assert_ne!(dest, src);
             let dest_start = dest * symbol_size;
@@ -2927,7 +3015,7 @@ fn fused_addassign_cached_symbol_batch(
             unsafe {
                 let dest_symbol =
                     core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
-                add_assign(dest_symbol, src_symbol);
+                add_assign_path.apply_same_len(dest_symbol, src_symbol);
             }
         }
         return;
@@ -2942,9 +3030,9 @@ fn fused_addassign_cached_symbol_batch(
             let dest_symbol =
                 core::slice::from_raw_parts_mut(bytes_ptr.add(dest_start), symbol_size);
             if scalar == Octet::one() {
-                add_assign(dest_symbol, src_symbol);
+                add_assign_path.apply_same_len(dest_symbol, src_symbol);
             } else {
-                fused_addassign_mul_scalar(dest_symbol, src_symbol, &scalar);
+                fused_mul_path.apply_nonzero(dest_symbol, src_symbol, &scalar);
             }
         }
     }
