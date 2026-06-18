@@ -1767,7 +1767,7 @@ fn prepare_direct_systematic_plan_for_decode<M: BinaryMatrix>(
 #[cfg(feature = "std")]
 fn direct_decode_back_substitution_layout(width: usize) -> DirectBackSubstitutionLayout {
     if width >= DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
-        || (MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH..TRUSTED_MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+        || (MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..TRUSTED_MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
             .contains(&width)
     {
         DirectBackSubstitutionLayout::SourcesByDest
@@ -9820,6 +9820,10 @@ mod tests {
         let k_prime = extended_source_block_symbols(source_symbols);
         let width = num_intermediate_symbols(source_symbols) as usize;
         assert!(use_direct_systematic_solve(width));
+        assert!(matches!(
+            direct_decode_back_substitution_layout(width),
+            DirectBackSubstitutionLayout::SourcesByDest
+        ));
 
         let symbols = SymbolSlab::with_zeros(width, 1);
         let indices: Vec<u32> = (0..k_prime).collect();
@@ -9945,6 +9949,18 @@ mod tests {
 
     #[test]
     fn source_batched_decode_plan_starts_at_large_width() {
+        assert!(matches!(
+            direct_decode_back_substitution_layout(MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH - 1),
+            DirectBackSubstitutionLayout::DestsBySource
+        ));
+        assert!(matches!(
+            direct_decode_back_substitution_layout(MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH),
+            DirectBackSubstitutionLayout::SourcesByDest
+        ));
+        assert!(matches!(
+            direct_decode_back_substitution_layout(TRUSTED_MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH),
+            DirectBackSubstitutionLayout::DestsBySource
+        ));
         assert!(matches!(
             direct_decode_back_substitution_layout(
                 DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH - 1
