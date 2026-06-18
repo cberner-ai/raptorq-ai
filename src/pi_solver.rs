@@ -144,6 +144,8 @@ const HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH: usize = 512;
 const HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH: usize = 32_768;
 const FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH: usize = 5_000;
 const FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH: usize = 32_768;
+const EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH: usize = 20_000;
+const EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH: usize = 32_768;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
@@ -4791,12 +4793,15 @@ fn rfc_hdpc_rows_satisfied_horner(
         && (FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH..=FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
             .contains(&gamma_width)
     {
-        for row in 0..h {
-            if checks.get(row) != decoded.get(gamma_width + row) {
-                return false;
-            }
-        }
-        return true;
+        return hdpc_final_checks_match(&checks, decoded, gamma_width, h);
+    }
+
+    if !cache_verify_row_pairs
+        && (EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH
+            ..=EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
+            .contains(&gamma_width)
+    {
+        return hdpc_final_checks_match(&checks, decoded, gamma_width, h);
     }
 
     if (FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH..=FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
@@ -4815,6 +4820,18 @@ fn rfc_hdpc_rows_satisfied_horner(
     }
 
     symbol_is_zero(checks.as_bytes())
+}
+
+fn hdpc_final_checks_match(
+    checks: &SymbolSlab,
+    decoded: &SymbolSlab,
+    gamma_width: usize,
+    h: usize,
+) -> bool {
+    let symbol_size = checks.symbol_size();
+    let start = gamma_width * symbol_size;
+    let len = h * symbol_size;
+    checks.as_bytes() == &decoded.as_bytes()[start..start + len]
 }
 
 fn addassign_hdpc_check_pair(
@@ -9486,6 +9503,13 @@ mod tests {
         assert!(gamma_width_for(5_000) >= FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH);
         assert!(gamma_width_for(20_000) <= FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(50_000) > FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
+        assert!(gamma_width_for(10_000) < EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH);
+        assert!(
+            (EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH
+                ..=EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
+                .contains(&gamma_width_for(20_000))
+        );
+        assert!(gamma_width_for(50_000) > EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
     }
 
     #[test]
