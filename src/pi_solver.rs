@@ -4786,6 +4786,19 @@ fn rfc_hdpc_rows_satisfied_horner(
         insert_rfc_hdpc_verify_row_pairs(gamma_width, h, generated_verify_row_pairs);
     }
 
+    #[cfg(feature = "std")]
+    if cache_verify_row_pairs
+        && (FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH..=FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
+            .contains(&gamma_width)
+    {
+        for row in 0..h {
+            if checks.get(row) != decoded.get(gamma_width + row) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     if (FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH..=FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
         .contains(&gamma_width)
     {
@@ -8261,7 +8274,7 @@ mod recording_tests {
 
     #[test]
     fn horner_hdpc_verification_matches_generated_rows() {
-        for source_symbols in [10, 100, 1000] {
+        for source_symbols in [10, 100, 1000, 5000] {
             let hdpc_rows = generate_hdpc_rows(source_symbols);
             let symbol_size = 3usize;
             let mut bytes = vec![0u8; hdpc_rows.width() * symbol_size];
