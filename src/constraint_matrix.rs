@@ -14,7 +14,9 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "std")]
 const HDPC_ROWS_CACHE_CAPACITY: usize = 16;
-const UNSORTED_SPARSE_PACK_MIN_WIDTH: usize = 4_097;
+// At this width the sparse matrices feed packed GF(2) solver paths directly; preserving append
+// order avoids sorting work that packing can already handle.
+const UNSORTED_SPARSE_PACK_MIN_WIDTH: usize = 512;
 
 pub fn generate_constraint_matrix<M: BinaryMatrix>(
     source_block_symbols: u32,
@@ -473,6 +475,21 @@ mod tests {
         entries.sort_unstable();
         entries.dedup();
         assert_eq!(entries.len(), len, "duplicate encoding index for ISI {isi}");
+    }
+
+    #[test]
+    fn mid_non_systematic_sparse_matrix_uses_unsorted_pack_path() {
+        let source_symbols = 500;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let indices = (k_prime..k_prime * 2).collect::<Vec<_>>();
+
+        let matrix =
+            generate_constraint_matrix_no_hdpc::<SparseBinaryMatrix>(source_symbols, &indices);
+
+        assert!(matrix.width() >= UNSORTED_SPARSE_PACK_MIN_WIDTH);
+        assert!(!matrix.rows_normalized_for_test());
+        assert_eq!(matrix.systematic_source_block_symbols(), None);
+        assert_eq!(matrix.systematic_row_isis(), None);
     }
 
     #[test]

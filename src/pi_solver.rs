@@ -104,6 +104,8 @@ const DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
+const LOW_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 256;
+#[cfg(feature = "std")]
 const DIRECT_FORWARD_NO_ZERO_CHECK_MIN_WIDTH: usize = 10_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH: usize = 20_000;
@@ -1767,6 +1769,9 @@ fn prepare_direct_systematic_plan_for_decode<M: BinaryMatrix>(
 #[cfg(feature = "std")]
 fn direct_decode_back_substitution_layout(width: usize) -> DirectBackSubstitutionLayout {
     if width >= DIRECT_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
+        || (LOW_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
+            ..LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+            .contains(&width)
         || (MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH..TRUSTED_MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
             .contains(&width)
     {
@@ -9921,6 +9926,33 @@ mod tests {
     }
 
     #[test]
+    fn ci_250_decode_plan_uses_low_width_source_batches() {
+        let source_symbols = 250;
+        let k_prime = extended_source_block_symbols(source_symbols);
+        let width = num_intermediate_symbols(source_symbols) as usize;
+        assert!(
+            (LOW_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
+                ..LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH)
+                .contains(&width)
+        );
+        assert!(matches!(
+            direct_decode_back_substitution_layout(width),
+            DirectBackSubstitutionLayout::SourcesByDest
+        ));
+
+        let indices: Vec<u32> = (0..k_prime).collect();
+        let (matrix, hdpc_rows) =
+            generate_constraint_matrix::<SparseBinaryMatrix>(source_symbols, &indices);
+        let decode_plan =
+            prepare_direct_systematic_plan_for_decode(&matrix, &hdpc_rows, source_symbols)
+                .expect("250-symbol direct decode plan should build");
+        assert!(matches!(
+            &decode_plan.back_substitution,
+            DirectSystematicBackSubstitution::SourcesByDest { .. }
+        ));
+    }
+
+    #[test]
     fn source_batched_direct_plan_starts_at_large_width() {
         let source_symbols = first_source_batched_direct_source_symbols();
         let k_prime = extended_source_block_symbols(source_symbols);
@@ -9950,8 +9982,20 @@ mod tests {
     #[test]
     fn source_batched_decode_plan_starts_at_large_width() {
         assert!(matches!(
-            direct_decode_back_substitution_layout(MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH - 1),
+            direct_decode_back_substitution_layout(
+                LOW_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH - 1
+            ),
             DirectBackSubstitutionLayout::DestsBySource
+        ));
+        assert!(matches!(
+            direct_decode_back_substitution_layout(
+                LOW_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH
+            ),
+            DirectBackSubstitutionLayout::SourcesByDest
+        ));
+        assert!(matches!(
+            direct_decode_back_substitution_layout(LOW_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH - 1),
+            DirectBackSubstitutionLayout::SourcesByDest
         ));
         assert!(matches!(
             direct_decode_back_substitution_layout(MID_DIRECT_SYSTEMATIC_SOLVE_MIN_WIDTH),
