@@ -410,6 +410,35 @@ impl FusedMulAssignAlphaAddAssignFastPath {
 
         fused_mulassign_alpha_addassign_scalar(dest, src);
     }
+
+    /// Updates `prefix` as `alpha * prefix + src`, then XORs the updated prefix into two rows.
+    ///
+    /// # Safety
+    ///
+    /// Each destination pointer must be valid for `len` writable bytes. Destinations must be
+    /// disjoint from each other and from `prefix` and `src`.
+    pub(crate) unsafe fn apply_and_add_assign_raw_2(
+        self,
+        prefix: &mut [u8],
+        src: &[u8],
+        dests: [*mut u8; 2],
+        len: usize,
+    ) {
+        assert_eq!(prefix.len(), len);
+        assert_eq!(src.len(), len);
+
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_avx2 {
+            unsafe {
+                fused_mulassign_alpha_addassign_xor_2_avx2(prefix, src, dests, len);
+            }
+            return;
+        }
+
+        unsafe {
+            fused_mulassign_alpha_addassign_xor_2_scalar(prefix, src, dests, 0, len);
+        }
+    }
 }
 
 pub fn add_assign(dest: &mut [u8], src: &[u8]) {
@@ -529,6 +558,30 @@ fn fused_mulassign_alpha_addassign_scalar(dest: &mut [u8], src: &[u8]) {
     }
 }
 
+unsafe fn fused_mulassign_alpha_addassign_xor_2_scalar(
+    prefix: &mut [u8],
+    src: &[u8],
+    dests: [*mut u8; 2],
+    start: usize,
+    end: usize,
+) {
+    let dest0 = dests[0];
+    let dest1 = dests[1];
+    for offset in start..end {
+        let carry = prefix[offset] & 0x80;
+        let mut updated = prefix[offset] << 1;
+        if carry != 0 {
+            updated ^= 0x1d;
+        }
+        updated ^= src[offset];
+        prefix[offset] = updated;
+        unsafe {
+            *dest0.add(offset) ^= updated;
+            *dest1.add(offset) ^= updated;
+        }
+    }
+}
+
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 fn try_mulassign_scalar_avx2(dest: &mut [u8], scalar: &Octet) -> bool {
     if dest.len() < 32 || !avx2_available() {
@@ -645,6 +698,63 @@ unsafe fn fused_mulassign_alpha_addassign_avx2(dest: &mut [u8], src: &[u8]) {
     }
 
     fused_mulassign_alpha_addassign_scalar(&mut dest[offset..], &src[offset..]);
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn fused_mulassign_alpha_addassign_xor_2_avx2(
+    prefix: &mut [u8],
+    src: &[u8],
+    dests: [*mut u8; 2],
+    len: usize,
+) {
+    let zero = _mm256_setzero_si256();
+    let reduction = _mm256_set1_epi8(0x1d);
+    let mut offset = 0usize;
+    let vector_len = len / 32 * 32;
+
+    while offset + 128 <= vector_len {
+        unsafe {
+            fused_mulassign_alpha_addassign_xor_2_32(prefix, src, dests, offset, zero, reduction);
+            fused_mulassign_alpha_addassign_xor_2_32(
+                prefix,
+                src,
+                dests,
+                offset + 32,
+                zero,
+                reduction,
+            );
+            fused_mulassign_alpha_addassign_xor_2_32(
+                prefix,
+                src,
+                dests,
+                offset + 64,
+                zero,
+                reduction,
+            );
+            fused_mulassign_alpha_addassign_xor_2_32(
+                prefix,
+                src,
+                dests,
+                offset + 96,
+                zero,
+                reduction,
+            );
+        }
+        offset += 128;
+    }
+    while offset < vector_len {
+        unsafe {
+            fused_mulassign_alpha_addassign_xor_2_32(prefix, src, dests, offset, zero, reduction);
+        }
+        offset += 32;
+    }
+
+    if offset < len {
+        unsafe {
+            fused_mulassign_alpha_addassign_xor_2_scalar(prefix, src, dests, offset, len);
+        }
+    }
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -1414,6 +1524,34 @@ unsafe fn fused_mulassign_alpha_addassign_32(
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
+unsafe fn fused_mulassign_alpha_addassign_xor_2_32(
+    prefix: &mut [u8],
+    src: &[u8],
+    dests: [*mut u8; 2],
+    offset: usize,
+    zero: __m256i,
+    reduction: __m256i,
+) {
+    unsafe {
+        let prefix_ptr = prefix.as_mut_ptr().add(offset).cast::<__m256i>();
+        let value = _mm256_loadu_si256(prefix_ptr.cast_const());
+        let doubled = _mm256_add_epi8(value, value);
+        let carry_mask = _mm256_cmpgt_epi8(zero, value);
+        let reduced = _mm256_xor_si256(doubled, _mm256_and_si256(carry_mask, reduction));
+        let source = _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>());
+        let updated = _mm256_xor_si256(reduced, source);
+        _mm256_storeu_si256(prefix_ptr, updated);
+
+        for dest in dests {
+            let dest_ptr = dest.add(offset).cast::<__m256i>();
+            let current = _mm256_loadu_si256(dest_ptr.cast_const());
+            _mm256_storeu_si256(dest_ptr, _mm256_xor_si256(current, updated));
+        }
+    }
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
 unsafe fn fused_addassign_mul_32(
     dest: &mut [u8],
     src: &[u8],
@@ -1586,6 +1724,46 @@ mod tests {
             fused_mulassign_alpha_add_assign(&mut fused, &src);
 
             assert_eq!(fused, expected, "fused alpha add failed for length {len}");
+        }
+    }
+
+    #[test]
+    fn fused_alpha_add_assign_raw_2_matches_split_ops() {
+        for len in [0usize, 1, 31, 32, 33, 64, 129, 1280] {
+            let src = patterned_bytes(len)
+                .into_iter()
+                .map(|byte| byte.rotate_left(1) ^ 0x53)
+                .collect::<Vec<_>>();
+            let mut prefix = patterned_bytes(len);
+            let mut expected_prefix = prefix.clone();
+            fused_mulassign_alpha_addassign_scalar(&mut expected_prefix, &src);
+
+            let mut dests = Vec::new();
+            let mut expected_dests = Vec::new();
+            for row in 0..2 {
+                let dest = patterned_bytes(len)
+                    .into_iter()
+                    .map(|byte| byte.wrapping_add(row as u8 * 31))
+                    .collect::<Vec<_>>();
+                let mut expected_dest = dest.clone();
+                add_assign_scalar(&mut expected_dest, &expected_prefix);
+                dests.extend_from_slice(&dest);
+                expected_dests.extend_from_slice(&expected_dest);
+            }
+
+            unsafe {
+                let dest0 = dests.as_mut_ptr();
+                let dest1 = dest0.add(len);
+                FusedMulAssignAlphaAddAssignFastPath::new(len).apply_and_add_assign_raw_2(
+                    &mut prefix,
+                    &src,
+                    [dest0, dest1],
+                    len,
+                );
+            }
+
+            assert_eq!(prefix, expected_prefix, "prefix mismatch for length {len}");
+            assert_eq!(dests, expected_dests, "dest mismatch for length {len}");
         }
     }
 

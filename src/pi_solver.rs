@@ -151,6 +151,7 @@ const EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH: usize = 20_000;
 const EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH: usize = HYBRID_MAX_WIDTH;
 const EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH: usize = 10_000;
 const EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH: usize = HYBRID_MAX_WIDTH;
+const FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH: usize = 32_768;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
@@ -4846,6 +4847,17 @@ fn rfc_hdpc_rows_satisfied_horner(
         return false;
     }
 
+    #[cfg(feature = "std")]
+    let cache_verify_row_pairs = cache_verify_row_pairs
+        && (HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH
+            ..=HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH)
+            .contains(&gamma_width);
+    #[cfg(not(feature = "std"))]
+    let cache_verify_row_pairs = {
+        let _ = cache_verify_row_pairs;
+        false
+    };
+
     let symbol_size = decoded.symbol_size();
     let add_assign_path = AddAssignFastPath::new(symbol_size);
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
@@ -4855,14 +4867,11 @@ fn rfc_hdpc_rows_satisfied_horner(
             .contains(&gamma_width);
     let alpha_add_path =
         hoist_alpha_add_path.then(|| FusedMulAssignAlphaAddAssignFastPath::new(symbol_size));
+    let fuse_alpha_check_pair =
+        hoist_alpha_add_path && gamma_width <= FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH;
     let mut prefix = vec![0u8; symbol_size];
     let mut checks = SymbolSlab::with_zeros(h, symbol_size);
     let mut verify_row_random = SequentialRfcRand::new(1);
-    #[cfg(feature = "std")]
-    let cache_verify_row_pairs = cache_verify_row_pairs
-        && (HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH
-            ..=HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH)
-            .contains(&gamma_width);
     #[cfg(feature = "std")]
     let cached_verify_row_pairs = cache_verify_row_pairs
         .then(|| cached_rfc_hdpc_verify_row_pairs_if_present(gamma_width, h))
@@ -4876,13 +4885,12 @@ fn rfc_hdpc_rows_satisfied_horner(
         };
 
     for col in 0..gamma_width {
-        if let Some(alpha_add_path) = alpha_add_path {
-            alpha_add_path.apply(&mut prefix, decoded.get(col));
-        } else {
-            fused_mulassign_alpha_add_assign(&mut prefix, decoded.get(col));
-        }
-
         if col + 1 == gamma_width {
+            if let Some(alpha_add_path) = alpha_add_path {
+                alpha_add_path.apply(&mut prefix, decoded.get(col));
+            } else {
+                fused_mulassign_alpha_add_assign(&mut prefix, decoded.get(col));
+            }
             for row in 0..h {
                 let factor = Octet::alpha_pow(row);
                 fused_mul_path.apply_nonzero(checks.get_mut(row), &prefix, &factor);
@@ -4914,7 +4922,25 @@ fn rfc_hdpc_rows_satisfied_horner(
                 verify_row_random.advance();
                 rows
             };
-            addassign_hdpc_check_pair(&mut checks, row_a, row_b, &prefix, add_assign_path);
+            if let Some(alpha_add_path) = alpha_add_path
+                && fuse_alpha_check_pair
+            {
+                alpha_update_and_addassign_hdpc_check_pair(
+                    &mut checks,
+                    row_a,
+                    row_b,
+                    &mut prefix,
+                    decoded.get(col),
+                    alpha_add_path,
+                );
+            } else {
+                if let Some(alpha_add_path) = alpha_add_path {
+                    alpha_add_path.apply(&mut prefix, decoded.get(col));
+                } else {
+                    fused_mulassign_alpha_add_assign(&mut prefix, decoded.get(col));
+                }
+                addassign_hdpc_check_pair(&mut checks, row_a, row_b, &prefix, add_assign_path);
+            }
         }
     }
 
@@ -4989,6 +5015,34 @@ fn addassign_hdpc_check_pair(
         add_assign_path.apply_same_len_raw_2(
             [bytes_ptr.add(row_a_start), bytes_ptr.add(row_b_start)],
             prefix.as_ptr(),
+            symbol_size,
+        );
+    }
+}
+
+fn alpha_update_and_addassign_hdpc_check_pair(
+    checks: &mut SymbolSlab,
+    row_a: usize,
+    row_b: usize,
+    prefix: &mut [u8],
+    src: &[u8],
+    alpha_add_path: FusedMulAssignAlphaAddAssignFastPath,
+) {
+    debug_assert_ne!(row_a, row_b);
+    let symbol_size = checks.symbol_size();
+    assert_eq!(prefix.len(), symbol_size);
+    assert_eq!(src.len(), symbol_size);
+    let bytes = checks.as_mut_bytes();
+    let row_a_start = row_a * symbol_size;
+    let row_b_start = row_b * symbol_size;
+    assert!(row_a_start + symbol_size <= bytes.len());
+    assert!(row_b_start + symbol_size <= bytes.len());
+    let bytes_ptr = bytes.as_mut_ptr();
+    unsafe {
+        alpha_add_path.apply_and_add_assign_raw_2(
+            prefix,
+            src,
+            [bytes_ptr.add(row_a_start), bytes_ptr.add(row_b_start)],
             symbol_size,
         );
     }
@@ -9647,6 +9701,8 @@ mod tests {
         assert!(gamma_width_for(10_000) >= EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH);
         assert!(gamma_width_for(20_000) <= EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(50_000) <= EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
+        assert!(gamma_width_for(20_000) <= FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH);
+        assert!(gamma_width_for(50_000) > FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(10_000) < EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH);
         assert!(
             (EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH
