@@ -151,6 +151,8 @@ const EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH: usize = 20_000;
 const EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH: usize = HYBRID_MAX_WIDTH;
 const EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH: usize = 10_000;
 const EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH: usize = HYBRID_MAX_WIDTH;
+const CACHED_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH: usize = 5_000;
+const CACHED_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH: usize = 8_192;
 const FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH: usize = 32_768;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
@@ -4861,10 +4863,15 @@ fn rfc_hdpc_rows_satisfied_horner(
     let symbol_size = decoded.symbol_size();
     let add_assign_path = AddAssignFastPath::new(symbol_size);
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
-    let hoist_alpha_add_path = !requested_cached_verify_row_pairs
+    let hoist_exact_alpha_add_path = !requested_cached_verify_row_pairs
         && (EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH
             ..=EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH)
             .contains(&gamma_width);
+    let hoist_cached_alpha_add_path = cache_verify_row_pairs
+        && (CACHED_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH
+            ..=CACHED_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH)
+            .contains(&gamma_width);
+    let hoist_alpha_add_path = hoist_exact_alpha_add_path || hoist_cached_alpha_add_path;
     let alpha_add_path =
         hoist_alpha_add_path.then(|| FusedMulAssignAlphaAddAssignFastPath::new(symbol_size));
     let fuse_alpha_check_pair =
@@ -9701,6 +9708,10 @@ mod tests {
         assert!(gamma_width_for(10_000) >= EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH);
         assert!(gamma_width_for(20_000) <= EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(50_000) <= EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
+        assert!(gamma_width_for(2_000) < CACHED_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH);
+        assert!(gamma_width_for(5_000) >= CACHED_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH);
+        assert!(gamma_width_for(5_000) <= CACHED_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
+        assert!(gamma_width_for(10_000) > CACHED_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(20_000) <= FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(50_000) > FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(10_000) < EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH);
