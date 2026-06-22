@@ -57,6 +57,7 @@ const SPARSE_SOURCE_MERGE_MAX_SOURCE_LEN: usize = 512;
 const SPARSE_SOURCE_LINEAR_SCAN_LIMIT: usize = 24;
 const SHORT_ROW_LINEAR_SCAN_LIMIT: usize = 8;
 const BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH: usize = 512;
+const OVERDETERMINED_BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH: usize = 256;
 const BINARY_SOURCE_BATCH_16_MIN_WIDTH: usize = 10_000;
 const TRIANGULAR_RECORDING_MIN_WIDTH: usize = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize + 1;
 const HYBRID_MAX_WIDTH: usize = u16::MAX as usize;
@@ -210,6 +211,12 @@ fn use_overdetermined_no_hdpc_prefix_owned(width: usize) -> bool {
     (OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH..OVERDETERMINED_NO_HDPC_PREFIX_MID_OWNED_MAX_WIDTH)
         .contains(&width)
         || width >= OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH
+}
+
+#[inline]
+fn use_binary_forward_symbol_batch(width: usize, height: usize) -> bool {
+    width >= BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH
+        || (height > width && width >= OVERDETERMINED_BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH)
 }
 
 fn coefficient_col(col: usize) -> CoefficientColumn {
@@ -4521,7 +4528,7 @@ fn solve_full_rank_binary_prefix_owned<M: BinaryMatrix>(
     let mut forward_ranges = Vec::with_capacity(width);
     let mut forward_entries = Vec::with_capacity(width.saturating_mul(4));
     let add_assign_path = AddAssignFastPath::new(symbol_size);
-    let batch_forward_symbols = width >= BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH;
+    let batch_forward_symbols = use_binary_forward_symbol_batch(width, prefix_height);
     let mut forward_symbol_dests = Vec::new();
     for col in 0..width {
         let pivot = if use_weighted_buckets {
@@ -7083,7 +7090,7 @@ fn solve_binary_with_initial_metadata(
     }
 
     let add_assign_path = AddAssignFastPath::new(symbols.symbol_size());
-    let batch_forward_symbols = width >= BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH;
+    let batch_forward_symbols = use_binary_forward_symbol_batch(width, height);
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut small_weight_buckets = SmallWeightBinaryBuckets::<u16>::new(
         if use_weighted_buckets { width } else { 0 },
@@ -9729,6 +9736,23 @@ mod tests {
         assert!(width_for(500) >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
         assert!(width_for(1_000) >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
         assert!(width_for(2_000) >= COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH);
+    }
+
+    #[test]
+    fn overdetermined_forward_symbol_batching_includes_250_overhead_only() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+        let width_100 = width_for(100);
+        let width_250 = width_for(250);
+        let width_500 = width_for(500);
+
+        assert!(width_100 < OVERDETERMINED_BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH);
+        assert!(width_250 >= OVERDETERMINED_BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH);
+        assert!(width_250 < BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH);
+        assert!(width_500 >= BINARY_FORWARD_SYMBOL_BATCH_MIN_WIDTH);
+
+        assert!(!use_binary_forward_symbol_batch(width_250, width_250));
+        assert!(use_binary_forward_symbol_batch(width_250, width_250 + 1));
+        assert!(use_binary_forward_symbol_batch(width_500, width_500));
     }
 
     #[test]
