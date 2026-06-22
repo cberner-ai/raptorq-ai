@@ -99,7 +99,9 @@ const LOW_DECODE_SOURCE_BATCH_BACK_SUBSTITUTION_MIN_WIDTH: usize = 256;
 #[cfg(feature = "std")]
 const DIRECT_FORWARD_NO_ZERO_CHECK_MIN_WIDTH: usize = 10_000;
 #[cfg(feature = "std")]
-const DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH: usize = 20_000;
+// Trusted encode batches keep the scatter/counts representation; direct
+// collection remains available for decode-only widths below.
+const DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH: usize = HYBRID_MAX_WIDTH + 1;
 #[cfg(feature = "std")]
 const DIRECT_DECODE_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
@@ -10217,37 +10219,39 @@ mod tests {
     }
 
     #[test]
-    fn direct_collect_source_batches_stays_on_square_source_by_dest_plans() {
-        let width = DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH;
+    fn direct_collect_source_batches_skip_trusted_encode_widths() {
         let h = 10;
-        let square_binary_height = width - h;
+        let max_supported_width = HYBRID_MAX_WIDTH;
+        let square_binary_height = max_supported_width - h;
 
-        assert!(use_direct_collect_sources_by_dest(
-            width,
+        assert!(!use_direct_collect_sources_by_dest(
+            max_supported_width,
             square_binary_height,
             h,
             DirectBackSubstitutionLayout::SourcesByDest,
             true,
         ));
         assert!(!use_direct_collect_sources_by_dest(
-            width - 1,
-            square_binary_height - 1,
-            h,
-            DirectBackSubstitutionLayout::SourcesByDest,
-            true,
-        ));
-        assert!(!use_direct_collect_sources_by_dest(
-            width,
+            max_supported_width,
             square_binary_height + 1,
             h,
             DirectBackSubstitutionLayout::SourcesByDest,
             true,
         ));
         assert!(!use_direct_collect_sources_by_dest(
-            width,
+            max_supported_width,
             square_binary_height,
             h,
             DirectBackSubstitutionLayout::DestsBySource,
+            true,
+        ));
+        let unsupported_encode_width = DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH;
+        assert!(unsupported_encode_width > HYBRID_MAX_WIDTH);
+        assert!(!use_direct_collect_sources_by_dest(
+            unsupported_encode_width - 1,
+            unsupported_encode_width - 1 - h,
+            h,
+            DirectBackSubstitutionLayout::SourcesByDest,
             true,
         ));
 
