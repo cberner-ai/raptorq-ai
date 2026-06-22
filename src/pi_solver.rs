@@ -2727,7 +2727,23 @@ fn direct_binary_symbol_index(row: usize, s: usize, h: usize) -> usize {
 
 #[cfg(feature = "std")]
 fn move_direct_pivot_symbols_to_columns(plan: &DirectSystematicPlan, symbols: &mut SymbolSlab) {
-    let mut scratch = vec![0u8; symbols.symbol_size()];
+    const STACK_SCRATCH_CAPACITY: usize = 2048;
+    const STACK_SCRATCH_MIN_WIDTH: usize = 10_000;
+    let symbol_size = symbols.symbol_size();
+    if plan.trust_source_batch_bounds
+        && plan.width >= STACK_SCRATCH_MIN_WIDTH
+        && symbol_size <= STACK_SCRATCH_CAPACITY
+    {
+        let mut scratch = [0u8; STACK_SCRATCH_CAPACITY];
+        move_direct_pivot_symbols_to_columns_with_scratch(
+            plan,
+            symbols,
+            &mut scratch[..symbol_size],
+        );
+        return;
+    }
+
+    let mut scratch = vec![0u8; symbol_size];
     for symbol_move in &plan.pivot_symbol_moves {
         let (&source, rest) = symbol_move
             .split_first()
@@ -2741,6 +2757,29 @@ fn move_direct_pivot_symbols_to_columns(plan: &DirectSystematicPlan, symbols: &m
             scratch.swap_with_slice(symbols.get_mut(position));
         }
         symbols.get_mut(dest).copy_from_slice(&scratch);
+    }
+}
+
+#[cfg(feature = "std")]
+#[inline(always)]
+fn move_direct_pivot_symbols_to_columns_with_scratch(
+    plan: &DirectSystematicPlan,
+    symbols: &mut SymbolSlab,
+    scratch: &mut [u8],
+) {
+    for symbol_move in &plan.pivot_symbol_moves {
+        let (&source, rest) = symbol_move
+            .split_first()
+            .expect("direct symbol moves are non-empty");
+        let (&dest, swap_positions) = rest
+            .split_last()
+            .expect("direct symbol moves include a destination");
+
+        scratch.copy_from_slice(symbols.get(source));
+        for &position in swap_positions {
+            scratch.swap_with_slice(symbols.get_mut(position));
+        }
+        symbols.get_mut(dest).copy_from_slice(scratch);
     }
 }
 
