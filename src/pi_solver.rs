@@ -3500,7 +3500,7 @@ fn addassign_symbol_source_batch(
     );
 }
 
-fn addassign_symbol_sources_to_slice(
+fn addassign_symbol_sources_to_slice_trusted(
     dest: &mut [u8],
     symbols: &SymbolSlab,
     sources: &[usize],
@@ -3512,7 +3512,7 @@ fn addassign_symbol_sources_to_slice(
 
     let symbol_size = symbols.symbol_size();
     assert_eq!(dest.len(), symbol_size);
-    addassign_symbol_sources_raw(
+    addassign_symbol_sources_raw_trusted(
         dest.as_mut_ptr(),
         symbols.as_bytes().as_ptr(),
         symbols.as_bytes().len(),
@@ -4778,15 +4778,20 @@ fn addassign_binary_row_sources_to_slice<const BATCH: usize, M: BinaryMatrix>(
 ) {
     let mut source_batch = [0usize; BATCH];
     let mut source_batch_len = 0usize;
-    matrix.visit_row_entries(row, |col| {
+    matrix.visit_row_entries_unordered(row, |col| {
         source_batch[source_batch_len] = col;
         source_batch_len += 1;
         if source_batch_len == source_batch.len() {
-            addassign_symbol_sources_to_slice(check, decoded, &source_batch, add_assign_path);
+            addassign_symbol_sources_to_slice_trusted(
+                check,
+                decoded,
+                &source_batch,
+                add_assign_path,
+            );
             source_batch_len = 0;
         }
     });
-    addassign_symbol_sources_to_slice(
+    addassign_symbol_sources_to_slice_trusted(
         check,
         decoded,
         &source_batch[..source_batch_len],

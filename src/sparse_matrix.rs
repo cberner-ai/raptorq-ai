@@ -315,6 +315,16 @@ impl BinaryMatrix for SparseBinaryMatrix {
         }
     }
 
+    fn visit_row_entries_unordered<F>(&self, row: usize, mut visit: F)
+    where
+        F: FnMut(usize),
+    {
+        assert!(row < self.rows.len());
+        for &col in &self.rows[row] {
+            visit(col);
+        }
+    }
+
     fn row_entries(&self, row: usize) -> Vec<usize> {
         assert!(row < self.rows.len());
         let mut entries = self.rows[row].clone();
@@ -354,6 +364,10 @@ mod tests {
         let mut visited = Vec::new();
         matrix.visit_row_entries(0, |col| visited.push(col));
         assert_eq!(visited, vec![3, 5, 7]);
+        let mut unordered = Vec::new();
+        matrix.visit_row_entries_unordered(0, |col| unordered.push(col));
+        unordered.sort_unstable();
+        assert_eq!(unordered, vec![3, 5, 7]);
 
         matrix.normalize_rows();
         assert!(matrix.rows_normalized);

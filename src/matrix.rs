@@ -107,6 +107,13 @@ pub trait BinaryMatrix: Clone {
         }
     }
 
+    fn visit_row_entries_unordered<F>(&self, row: usize, visit: F)
+    where
+        F: FnMut(usize),
+    {
+        self.visit_row_entries(row, visit);
+    }
+
     fn row_entries(&self, row: usize) -> Vec<usize> {
         let mut entries = Vec::new();
         self.visit_row_entries(row, |col| entries.push(col));
