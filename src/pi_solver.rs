@@ -4731,7 +4731,7 @@ fn binary_row_suffixes_satisfied<M: BinaryMatrix>(
     let add_assign_path = AddAssignFastPath::new(decoded.symbol_size());
     for row in start_row..matrix.height() {
         check.fill(0);
-        addassign_binary_row_sources_to_slice::<8, M>(
+        addassign_binary_row_sources_to_slice::<16, M>(
             matrix,
             row,
             &mut check,
@@ -4755,7 +4755,7 @@ fn binary_rows_satisfied<M: BinaryMatrix>(
     let add_assign_path = AddAssignFastPath::new(decoded.symbol_size());
     for row in start_row..matrix.height() {
         check.fill(0);
-        addassign_binary_row_sources_to_slice::<8, M>(
+        addassign_binary_row_sources_to_slice::<16, M>(
             matrix,
             row,
             &mut check,
