@@ -16,8 +16,8 @@ use crate::symbol_slab::SymbolSlab;
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
 
-const REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS: usize = 10_000;
-const REPLAY_BATCH_FAST_PATH_MIN_DESTS_FOR_LARGE_SYMBOLS: usize = 4;
+const REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS: usize = 1_000;
+const REPLAY_BATCH_FAST_PATH_MIN_DESTS_FOR_LARGE_SYMBOLS: usize = 2;
 const REPLAY_BATCH_FAST_PATH_LARGE_SYMBOLS: usize = 20_000;
 const REPLAY_BATCH_FAST_PATH_MAX_SYMBOLS: usize = 32_768;
 
@@ -110,6 +110,15 @@ fn fused_addassign_symbol_batch_for_replay(
     fused_addassign_symbol_batch_inner::<true>(symbols, src, dests);
 }
 
+#[inline]
+fn use_replay_batch_fast_paths(symbol_count: usize, dest_count: usize) -> bool {
+    (REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS..=REPLAY_BATCH_FAST_PATH_MAX_SYMBOLS)
+        .contains(&symbol_count)
+        && dest_count > 1
+        && (symbol_count < REPLAY_BATCH_FAST_PATH_LARGE_SYMBOLS
+            || dest_count >= REPLAY_BATCH_FAST_PATH_MIN_DESTS_FOR_LARGE_SYMBOLS)
+}
+
 fn fused_addassign_symbol_batch_inner<const REUSE_FAST_PATHS: bool>(
     symbols: &mut SymbolSlab,
     src: usize,
@@ -131,13 +140,7 @@ fn fused_addassign_symbol_batch_inner<const REUSE_FAST_PATHS: bool>(
     }
     let bytes_ptr = bytes.as_mut_ptr();
 
-    if REUSE_FAST_PATHS
-        && (REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS..=REPLAY_BATCH_FAST_PATH_MAX_SYMBOLS)
-            .contains(&symbol_count)
-        && (dests.len() > 1
-            && (symbol_count < REPLAY_BATCH_FAST_PATH_LARGE_SYMBOLS
-                || dests.len() >= REPLAY_BATCH_FAST_PATH_MIN_DESTS_FOR_LARGE_SYMBOLS))
-    {
+    if REUSE_FAST_PATHS && use_replay_batch_fast_paths(symbol_count, dests.len()) {
         let add_fast_path = AddAssignFastPath::new(symbol_size);
         let fused_fast_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
 
@@ -249,5 +252,17 @@ mod tests {
         );
 
         assert_eq!(expected, symbols);
+    }
+
+    #[test]
+    fn replay_batch_fast_path_covers_mid_ci_rows() {
+        assert!(!use_replay_batch_fast_paths(10, 2));
+        assert!(!use_replay_batch_fast_paths(100, 2));
+        assert!(!use_replay_batch_fast_paths(250, 2));
+        assert!(!use_replay_batch_fast_paths(500, 2));
+        assert!(use_replay_batch_fast_paths(1_000, 2));
+        assert!(use_replay_batch_fast_paths(5_000, 2));
+        assert!(use_replay_batch_fast_paths(20_000, 2));
+        assert!(!use_replay_batch_fast_paths(50_000, 4));
     }
 }
