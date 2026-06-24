@@ -30,6 +30,8 @@ impl PackedBinaryRows {
     pub(crate) fn new(height: usize, width: usize) -> PackedBinaryRows {
         let words_per_row = width.div_ceil(u64::BITS as usize);
         let use_wide_popcount = words_per_row >= WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS;
+        #[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
+        let _ = use_wide_popcount;
         PackedBinaryRows {
             height,
             width,
