@@ -3738,6 +3738,55 @@ fn addassign_symbol_sources_raw_impl<
         && USE_32_SOURCE_BATCH
         && source_len >= CHECKED_TINY_SOURCE_BATCH_MIN_SYMBOLS * symbol_size
     {
+        macro_rules! checked_source_ptr {
+            ($index:expr) => {{
+                let source_start = sources[$index].symbol_source_index() * symbol_size;
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(source_start, symbol_size, source_len);
+                source_base.add(source_start)
+            }};
+        }
+        macro_rules! source_ptrs_2 {
+            ($offset:expr) => {
+                [
+                    checked_source_ptr!($offset),
+                    checked_source_ptr!($offset + 1),
+                ]
+            };
+        }
+        macro_rules! source_ptrs_3 {
+            ($offset:expr) => {
+                [
+                    checked_source_ptr!($offset),
+                    checked_source_ptr!($offset + 1),
+                    checked_source_ptr!($offset + 2),
+                ]
+            };
+        }
+        macro_rules! source_ptrs_4 {
+            ($offset:expr) => {
+                [
+                    checked_source_ptr!($offset),
+                    checked_source_ptr!($offset + 1),
+                    checked_source_ptr!($offset + 2),
+                    checked_source_ptr!($offset + 3),
+                ]
+            };
+        }
+        macro_rules! source_ptrs_8 {
+            ($offset:expr) => {
+                [
+                    checked_source_ptr!($offset),
+                    checked_source_ptr!($offset + 1),
+                    checked_source_ptr!($offset + 2),
+                    checked_source_ptr!($offset + 3),
+                    checked_source_ptr!($offset + 4),
+                    checked_source_ptr!($offset + 5),
+                    checked_source_ptr!($offset + 6),
+                    checked_source_ptr!($offset + 7),
+                ]
+            };
+        }
+
         match sources.len() {
             0 => return,
             1 => {
@@ -3937,6 +3986,124 @@ fn addassign_symbol_sources_raw_impl<
                             source_base.add(src6_start),
                             source_base.add(src7_start),
                         ],
+                        symbol_size,
+                    );
+                }
+                return;
+            }
+            9 => {
+                unsafe {
+                    let src8 = checked_source_ptr!(8);
+                    add_assign_path.apply_sources_same_len_raw_8(
+                        dest_ptr,
+                        source_ptrs_8!(0),
+                        symbol_size,
+                    );
+                    let dest_symbol = core::slice::from_raw_parts_mut(dest_ptr, symbol_size);
+                    let source_symbol = core::slice::from_raw_parts(src8, symbol_size);
+                    add_assign_path.apply_same_len(dest_symbol, source_symbol);
+                }
+                return;
+            }
+            10 => {
+                unsafe {
+                    add_assign_path.apply_sources_same_len_raw_8(
+                        dest_ptr,
+                        source_ptrs_8!(0),
+                        symbol_size,
+                    );
+                    add_assign_path.apply_sources_same_len_raw_2(
+                        dest_ptr,
+                        source_ptrs_2!(8),
+                        symbol_size,
+                    );
+                }
+                return;
+            }
+            11 => {
+                unsafe {
+                    add_assign_path.apply_sources_same_len_raw_8(
+                        dest_ptr,
+                        source_ptrs_8!(0),
+                        symbol_size,
+                    );
+                    add_assign_path.apply_sources_same_len_raw_3(
+                        dest_ptr,
+                        source_ptrs_3!(8),
+                        symbol_size,
+                    );
+                }
+                return;
+            }
+            12 => {
+                unsafe {
+                    add_assign_path.apply_sources_same_len_raw_8(
+                        dest_ptr,
+                        source_ptrs_8!(0),
+                        symbol_size,
+                    );
+                    add_assign_path.apply_sources_same_len_raw_4(
+                        dest_ptr,
+                        source_ptrs_4!(8),
+                        symbol_size,
+                    );
+                }
+                return;
+            }
+            13 => {
+                unsafe {
+                    let src12 = checked_source_ptr!(12);
+                    add_assign_path.apply_sources_same_len_raw_8(
+                        dest_ptr,
+                        source_ptrs_8!(0),
+                        symbol_size,
+                    );
+                    add_assign_path.apply_sources_same_len_raw_4(
+                        dest_ptr,
+                        source_ptrs_4!(8),
+                        symbol_size,
+                    );
+                    let dest_symbol = core::slice::from_raw_parts_mut(dest_ptr, symbol_size);
+                    let source_symbol = core::slice::from_raw_parts(src12, symbol_size);
+                    add_assign_path.apply_same_len(dest_symbol, source_symbol);
+                }
+                return;
+            }
+            14 => {
+                unsafe {
+                    add_assign_path.apply_sources_same_len_raw_8(
+                        dest_ptr,
+                        source_ptrs_8!(0),
+                        symbol_size,
+                    );
+                    add_assign_path.apply_sources_same_len_raw_4(
+                        dest_ptr,
+                        source_ptrs_4!(8),
+                        symbol_size,
+                    );
+                    add_assign_path.apply_sources_same_len_raw_2(
+                        dest_ptr,
+                        source_ptrs_2!(12),
+                        symbol_size,
+                    );
+                }
+                return;
+            }
+            15 => {
+                unsafe {
+                    add_assign_path.apply_sources_same_len_raw_8(
+                        dest_ptr,
+                        source_ptrs_8!(0),
+                        symbol_size,
+                    );
+                    add_assign_path.apply_sources_same_len_raw_4(
+                        dest_ptr,
+                        source_ptrs_4!(8),
+                        symbol_size,
+                    );
+                    add_assign_path.apply_sources_same_len_raw_3(
+                        dest_ptr,
+                        source_ptrs_3!(12),
                         symbol_size,
                     );
                 }
@@ -9797,7 +9964,7 @@ mod tests {
         let symbol_count = CHECKED_TINY_SOURCE_BATCH_MIN_SYMBOLS;
         let add_assign_path = AddAssignFastPath::new(symbol_size);
 
-        for source_count in 1..=8 {
+        for source_count in 1..=15 {
             let mut bytes = Vec::new();
             for symbol in 0..symbol_count {
                 let symbol = symbol as u8;
