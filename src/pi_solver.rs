@@ -142,7 +142,7 @@ const OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH: usize = 20_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 10_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_BACKSUB_BATCH4_MAX_WIDTH: usize = 32_768;
 const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MIN_WIDTH: usize = 5_000;
-const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MAX_WIDTH: usize = 20_000;
+const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MAX_WIDTH: usize = 32_768;
 const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS: usize = 4;
 const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 256;
 #[cfg(feature = "std")]
@@ -3521,7 +3521,7 @@ fn addassign_symbol_source_batch(
     );
 }
 
-fn addassign_symbol_sources_to_slice_trusted(
+fn addassign_symbol_sources_to_slice(
     dest: &mut [u8],
     symbols: &SymbolSlab,
     sources: &[usize],
@@ -3533,7 +3533,7 @@ fn addassign_symbol_sources_to_slice_trusted(
 
     let symbol_size = symbols.symbol_size();
     assert_eq!(dest.len(), symbol_size);
-    addassign_symbol_sources_raw_trusted(
+    addassign_symbol_sources_raw(
         dest.as_mut_ptr(),
         symbols.as_bytes().as_ptr(),
         symbols.as_bytes().len(),
@@ -4801,16 +4801,11 @@ fn addassign_binary_row_sources_to_slice<const BATCH: usize, M: BinaryMatrix>(
         source_batch[source_batch_len] = col;
         source_batch_len += 1;
         if source_batch_len == source_batch.len() {
-            addassign_symbol_sources_to_slice_trusted(
-                check,
-                decoded,
-                &source_batch,
-                add_assign_path,
-            );
+            addassign_symbol_sources_to_slice(check, decoded, &source_batch, add_assign_path);
             source_batch_len = 0;
         }
     });
-    addassign_symbol_sources_to_slice_trusted(
+    addassign_symbol_sources_to_slice(
         check,
         decoded,
         &source_batch[..source_batch_len],
@@ -8666,6 +8661,54 @@ mod tests {
     use crate::sparse_matrix::SparseBinaryMatrix;
     use crate::systematic_constants::num_hdpc_symbols;
 
+    #[derive(Clone)]
+    struct OutOfBoundsRowMatrix {
+        width: usize,
+    }
+
+    impl BinaryMatrix for OutOfBoundsRowMatrix {
+        fn new(_height: usize, width: usize) -> Self {
+            OutOfBoundsRowMatrix { width }
+        }
+
+        fn height(&self) -> usize {
+            1
+        }
+
+        fn width(&self) -> usize {
+            self.width
+        }
+
+        fn get(&self, _row: usize, _col: usize) -> Octet {
+            Octet::zero()
+        }
+
+        fn set(&mut self, _row: usize, _col: usize, _value: bool) {}
+
+        fn visit_row_entries_unordered<F>(&self, _row: usize, mut visit: F)
+        where
+            F: FnMut(usize),
+        {
+            visit(self.width);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn generic_binary_row_source_verifier_checks_public_matrix_columns() {
+        let matrix = OutOfBoundsRowMatrix::new(1, 1);
+        let decoded = SymbolSlab::with_zeros(1, 8);
+        let mut check = vec![0u8; decoded.symbol_size()];
+
+        addassign_binary_row_sources_to_slice::<16, _>(
+            &matrix,
+            0,
+            &mut check,
+            &decoded,
+            AddAssignFastPath::new(decoded.symbol_size()),
+        );
+    }
+
     #[test]
     fn large_non_planning_matrix_uses_non_recording_solver_without_ops() {
         let width = MAX_SUPPORTED_INTERMEDIATE_SYMBOLS as usize;
@@ -9852,7 +9895,10 @@ mod tests {
             prefix_extra_for(10_000),
             OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS
         );
-        assert_eq!(prefix_extra_for(20_000), num_hdpc_symbols(20_000) as usize);
+        assert_eq!(
+            prefix_extra_for(20_000),
+            OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS
+        );
     }
 
     #[test]
