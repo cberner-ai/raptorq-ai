@@ -4750,14 +4750,13 @@ fn binary_row_suffixes_satisfied<M: BinaryMatrix>(
     let add_assign_path = AddAssignFastPath::new(decoded.symbol_size());
     for row in start_row..matrix.height() {
         check.copy_from_slice(suffix_symbols.get(row - start_row));
-        addassign_binary_row_sources_to_slice::<16, M>(
+        if !addassign_binary_row_sources_to_slice_and_check_zero::<16, M>(
             matrix,
             row,
             &mut check,
             decoded,
             add_assign_path,
-        );
-        if !symbol_is_zero(&check) {
+        ) {
             return false;
         }
     }
@@ -4811,6 +4810,42 @@ fn addassign_binary_row_sources_to_slice<const BATCH: usize, M: BinaryMatrix>(
         &source_batch[..source_batch_len],
         add_assign_path,
     );
+}
+
+fn addassign_binary_row_sources_to_slice_and_check_zero<const BATCH: usize, M: BinaryMatrix>(
+    matrix: &M,
+    row: usize,
+    check: &mut [u8],
+    decoded: &SymbolSlab,
+    add_assign_path: AddAssignFastPath,
+) -> bool {
+    let mut source_batch = [0usize; BATCH];
+    let mut source_batch_len = 0usize;
+    let mut pending_source = NO_BUCKET_ROW;
+    matrix.visit_row_entries_unordered(row, |col| {
+        if pending_source == NO_BUCKET_ROW {
+            pending_source = col;
+        } else {
+            source_batch[source_batch_len] = pending_source;
+            source_batch_len += 1;
+            if source_batch_len == source_batch.len() {
+                addassign_symbol_sources_to_slice(check, decoded, &source_batch, add_assign_path);
+                source_batch_len = 0;
+            }
+            pending_source = col;
+        }
+    });
+    addassign_symbol_sources_to_slice(
+        check,
+        decoded,
+        &source_batch[..source_batch_len],
+        add_assign_path,
+    );
+    if pending_source != NO_BUCKET_ROW {
+        add_assign_and_check_zero(check, decoded.get(pending_source))
+    } else {
+        symbol_is_zero(check)
+    }
 }
 
 fn verify_no_hdpc_solution(
