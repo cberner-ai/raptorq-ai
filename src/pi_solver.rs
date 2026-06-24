@@ -168,6 +168,8 @@ const CACHED_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH: usize = 32_768;
 const FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH: usize = 32_768;
 const TRUSTED_SUFFIX_VERIFY_MIN_WIDTH: usize = 20_000;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
+const WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 24;
+const WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH: usize = 20_000;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 24;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH: usize = 32_768;
@@ -1520,7 +1522,7 @@ fn generate_direct_systematic_plan(source_block_symbols: u32) -> DirectSystemati
     let indices: Vec<u32> = (0..source_block_symbols).collect();
     let (matrix, hdpc_rows) =
         generate_constraint_matrix::<SparseBinaryMatrix>(source_block_symbols, &indices);
-    prepare_direct_systematic_plan(&matrix, &hdpc_rows, source_block_symbols)
+    prepare_cached_direct_systematic_plan(&matrix, &hdpc_rows, source_block_symbols)
         .expect("systematic direct plan generation failed")
 }
 
@@ -1786,6 +1788,28 @@ fn prepare_direct_systematic_plan<M: BinaryMatrix>(
         DirectBackSubstitutionLayout::SourcesByDest,
         true,
     )
+}
+
+#[cfg(feature = "std")]
+fn prepare_cached_direct_systematic_plan<M: BinaryMatrix>(
+    matrix: &M,
+    hdpc_rows: &DenseOctetMatrix,
+    source_block_symbols: u32,
+) -> Option<DirectSystematicPlan> {
+    if matrix.width() >= WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH {
+        return prepare_direct_systematic_plan_with_small_weight_max::<
+            WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+            M,
+        >(
+            matrix,
+            hdpc_rows,
+            source_block_symbols,
+            DirectBackSubstitutionLayout::SourcesByDest,
+            true,
+        );
+    }
+
+    prepare_direct_systematic_plan(matrix, hdpc_rows, source_block_symbols)
 }
 
 #[cfg(feature = "std")]
@@ -11062,6 +11086,10 @@ mod tests {
 
         assert_eq!(DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 16);
         assert_eq!(HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 24);
+        assert_eq!(PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX, 31);
+        assert_eq!(WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX, 24);
+        assert!(width_for(10_000) < WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
+        assert!(width_for(20_000) >= WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
         assert!(width_for(20_000) < HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
         assert!(width_for(50_000) >= HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
     }
