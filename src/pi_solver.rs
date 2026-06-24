@@ -3571,6 +3571,145 @@ fn addassign_symbol_sources_to_slice(
     );
 }
 
+fn addassign_symbol_source_ptrs_to_slice_tiny_fast(
+    dest: &mut [u8],
+    sources: &[*const u8],
+    add_assign_path: AddAssignFastPath,
+) {
+    if sources.is_empty() {
+        return;
+    }
+
+    let symbol_size = dest.len();
+    let dest_ptr = dest.as_mut_ptr();
+
+    macro_rules! ptrs_2 {
+        ($offset:expr) => {
+            [sources[$offset], sources[$offset + 1]]
+        };
+    }
+    macro_rules! ptrs_3 {
+        ($offset:expr) => {
+            [sources[$offset], sources[$offset + 1], sources[$offset + 2]]
+        };
+    }
+    macro_rules! ptrs_4 {
+        ($offset:expr) => {
+            [
+                sources[$offset],
+                sources[$offset + 1],
+                sources[$offset + 2],
+                sources[$offset + 3],
+            ]
+        };
+    }
+    macro_rules! ptrs_8 {
+        ($offset:expr) => {
+            [
+                sources[$offset],
+                sources[$offset + 1],
+                sources[$offset + 2],
+                sources[$offset + 3],
+                sources[$offset + 4],
+                sources[$offset + 5],
+                sources[$offset + 6],
+                sources[$offset + 7],
+            ]
+        };
+    }
+    macro_rules! ptrs_16 {
+        ($offset:expr) => {
+            [
+                sources[$offset],
+                sources[$offset + 1],
+                sources[$offset + 2],
+                sources[$offset + 3],
+                sources[$offset + 4],
+                sources[$offset + 5],
+                sources[$offset + 6],
+                sources[$offset + 7],
+                sources[$offset + 8],
+                sources[$offset + 9],
+                sources[$offset + 10],
+                sources[$offset + 11],
+                sources[$offset + 12],
+                sources[$offset + 13],
+                sources[$offset + 14],
+                sources[$offset + 15],
+            ]
+        };
+    }
+
+    match sources.len() {
+        1 => unsafe {
+            let source = core::slice::from_raw_parts(sources[0], symbol_size);
+            add_assign_path.apply_same_len(dest, source);
+        },
+        2 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_2(dest_ptr, ptrs_2!(0), symbol_size);
+        },
+        3 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_3(dest_ptr, ptrs_3!(0), symbol_size);
+        },
+        4 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_4(dest_ptr, ptrs_4!(0), symbol_size);
+        },
+        5 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_4(dest_ptr, ptrs_4!(0), symbol_size);
+            let source = core::slice::from_raw_parts(sources[4], symbol_size);
+            add_assign_path.apply_same_len(dest, source);
+        },
+        6 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_4(dest_ptr, ptrs_4!(0), symbol_size);
+            add_assign_path.apply_sources_same_len_raw_2(dest_ptr, ptrs_2!(4), symbol_size);
+        },
+        7 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_4(dest_ptr, ptrs_4!(0), symbol_size);
+            add_assign_path.apply_sources_same_len_raw_3(dest_ptr, ptrs_3!(4), symbol_size);
+        },
+        8 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_8(dest_ptr, ptrs_8!(0), symbol_size);
+        },
+        9 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_8(dest_ptr, ptrs_8!(0), symbol_size);
+            let source = core::slice::from_raw_parts(sources[8], symbol_size);
+            add_assign_path.apply_same_len(dest, source);
+        },
+        10 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_8(dest_ptr, ptrs_8!(0), symbol_size);
+            add_assign_path.apply_sources_same_len_raw_2(dest_ptr, ptrs_2!(8), symbol_size);
+        },
+        11 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_8(dest_ptr, ptrs_8!(0), symbol_size);
+            add_assign_path.apply_sources_same_len_raw_3(dest_ptr, ptrs_3!(8), symbol_size);
+        },
+        12 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_8(dest_ptr, ptrs_8!(0), symbol_size);
+            add_assign_path.apply_sources_same_len_raw_4(dest_ptr, ptrs_4!(8), symbol_size);
+        },
+        13 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_8(dest_ptr, ptrs_8!(0), symbol_size);
+            add_assign_path.apply_sources_same_len_raw_4(dest_ptr, ptrs_4!(8), symbol_size);
+            let source = core::slice::from_raw_parts(sources[12], symbol_size);
+            add_assign_path.apply_same_len(dest, source);
+        },
+        14 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_8(dest_ptr, ptrs_8!(0), symbol_size);
+            add_assign_path.apply_sources_same_len_raw_4(dest_ptr, ptrs_4!(8), symbol_size);
+            add_assign_path.apply_sources_same_len_raw_2(dest_ptr, ptrs_2!(12), symbol_size);
+        },
+        15 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_8(dest_ptr, ptrs_8!(0), symbol_size);
+            add_assign_path.apply_sources_same_len_raw_4(dest_ptr, ptrs_4!(8), symbol_size);
+            add_assign_path.apply_sources_same_len_raw_3(dest_ptr, ptrs_3!(12), symbol_size);
+        },
+        16 => unsafe {
+            add_assign_path.apply_sources_same_len_raw_16(dest_ptr, ptrs_16!(0), symbol_size);
+        },
+        _ => addassign_symbol_source_ptrs_to_slice(dest, sources, add_assign_path),
+    }
+}
+
 fn addassign_symbol_source_ptrs_to_slice(
     dest: &mut [u8],
     sources: &[*const u8],
@@ -5376,13 +5515,23 @@ fn binary_row_suffixes_satisfied<M: BinaryMatrix>(
     for row in start_row..matrix.height() {
         check.copy_from_slice(suffix_symbols.get(row - start_row));
         let satisfied = if use_trusted_sources {
-            addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, M>(
-                matrix,
-                row,
-                &mut check,
-                decoded,
-                add_assign_path,
-            )
+            if decoded.len() <= SUFFIX_VERIFY_PENDING_COMPARE_MAX_WIDTH {
+                addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, M, true>(
+                    matrix,
+                    row,
+                    &mut check,
+                    decoded,
+                    add_assign_path,
+                )
+            } else {
+                addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, M, false>(
+                    matrix,
+                    row,
+                    &mut check,
+                    decoded,
+                    add_assign_path,
+                )
+            }
         } else {
             addassign_binary_row_sources_to_slice_and_check_zero::<16, M>(
                 matrix,
@@ -5480,6 +5629,7 @@ fn addassign_binary_row_entries_to_slice<const BATCH: usize>(
 fn addassign_binary_row_sources_to_slice_and_check_zero_trusted<
     const BATCH: usize,
     M: BinaryMatrix,
+    const USE_TINY_FAST_PATH: bool,
 >(
     matrix: &M,
     row: usize,
@@ -5488,12 +5638,10 @@ fn addassign_binary_row_sources_to_slice_and_check_zero_trusted<
     add_assign_path: AddAssignFastPath,
 ) -> bool {
     if let Some(entries) = matrix.row_entries_unordered_slice(row) {
-        return addassign_binary_row_entries_to_slice_and_check_zero_trusted::<BATCH>(
-            entries,
-            check,
-            decoded,
-            add_assign_path,
-        );
+        return addassign_binary_row_entries_to_slice_and_check_zero_trusted::<
+            BATCH,
+            USE_TINY_FAST_PATH,
+        >(entries, check, decoded, add_assign_path);
     }
 
     let symbol_size = decoded.symbol_size();
@@ -5510,17 +5658,33 @@ fn addassign_binary_row_sources_to_slice_and_check_zero_trusted<
             source_batch[source_batch_len] = pending_source;
             source_batch_len += 1;
             if source_batch_len == source_batch.len() {
-                addassign_symbol_source_ptrs_to_slice(check, &source_batch, add_assign_path);
+                if USE_TINY_FAST_PATH {
+                    addassign_symbol_source_ptrs_to_slice_tiny_fast(
+                        check,
+                        &source_batch,
+                        add_assign_path,
+                    );
+                } else {
+                    addassign_symbol_source_ptrs_to_slice(check, &source_batch, add_assign_path);
+                }
                 source_batch_len = 0;
             }
             pending_source = source;
         }
     });
-    addassign_symbol_source_ptrs_to_slice(
-        check,
-        &source_batch[..source_batch_len],
-        add_assign_path,
-    );
+    if USE_TINY_FAST_PATH {
+        addassign_symbol_source_ptrs_to_slice_tiny_fast(
+            check,
+            &source_batch[..source_batch_len],
+            add_assign_path,
+        );
+    } else {
+        addassign_symbol_source_ptrs_to_slice(
+            check,
+            &source_batch[..source_batch_len],
+            add_assign_path,
+        );
+    }
     if pending_source.is_null() {
         return symbol_is_zero(check);
     }
@@ -5532,7 +5696,10 @@ fn addassign_binary_row_sources_to_slice_and_check_zero_trusted<
     add_assign_and_check_zero(check, pending_source)
 }
 
-fn addassign_binary_row_entries_to_slice_and_check_zero_trusted<const BATCH: usize>(
+fn addassign_binary_row_entries_to_slice_and_check_zero_trusted<
+    const BATCH: usize,
+    const USE_TINY_FAST_PATH: bool,
+>(
     entries: &[usize],
     check: &mut [u8],
     decoded: &SymbolSlab,
@@ -5552,17 +5719,33 @@ fn addassign_binary_row_entries_to_slice_and_check_zero_trusted<const BATCH: usi
             source_batch[source_batch_len] = pending_source;
             source_batch_len += 1;
             if source_batch_len == source_batch.len() {
-                addassign_symbol_source_ptrs_to_slice(check, &source_batch, add_assign_path);
+                if USE_TINY_FAST_PATH {
+                    addassign_symbol_source_ptrs_to_slice_tiny_fast(
+                        check,
+                        &source_batch,
+                        add_assign_path,
+                    );
+                } else {
+                    addassign_symbol_source_ptrs_to_slice(check, &source_batch, add_assign_path);
+                }
                 source_batch_len = 0;
             }
             pending_source = source;
         }
     }
-    addassign_symbol_source_ptrs_to_slice(
-        check,
-        &source_batch[..source_batch_len],
-        add_assign_path,
-    );
+    if USE_TINY_FAST_PATH {
+        addassign_symbol_source_ptrs_to_slice_tiny_fast(
+            check,
+            &source_batch[..source_batch_len],
+            add_assign_path,
+        );
+    } else {
+        addassign_symbol_source_ptrs_to_slice(
+            check,
+            &source_batch[..source_batch_len],
+            add_assign_path,
+        );
+    }
     if pending_source.is_null() {
         return symbol_is_zero(check);
     }
@@ -9700,7 +9883,7 @@ mod tests {
         let add_assign_path = AddAssignFastPath::new(symbol_size);
         let mut single_check = decoded.get(3).to_vec();
         assert!(
-            addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, _>(
+            addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, _, true>(
                 &matrix,
                 0,
                 &mut single_check,
@@ -9712,7 +9895,7 @@ mod tests {
         let mut single_check = decoded.get(3).to_vec();
         single_check[0] ^= 1;
         assert!(
-            !addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, _>(
+            !addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, _, true>(
                 &matrix,
                 0,
                 &mut single_check,
@@ -9740,7 +9923,7 @@ mod tests {
             add_assign(&mut buffered_check, decoded.get(col));
         }
         assert!(
-            addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, _>(
+            addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, _, true>(
                 &matrix,
                 2,
                 &mut buffered_check,
