@@ -1,4 +1,6 @@
 #[cfg(feature = "std")]
+use std::sync::Arc;
+#[cfg(feature = "std")]
 use std::vec::Vec;
 
 #[cfg(not(feature = "std"))]
@@ -6,14 +8,68 @@ use alloc::vec::Vec;
 
 use crate::octet::Octet;
 #[cfg(feature = "serde_support")]
-use serde::{Deserialize, Serialize};
+use serde::de;
+#[cfg(feature = "serde_support")]
+use serde::ser::SerializeStruct;
+#[cfg(feature = "serde_support")]
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
+#[cfg(feature = "std")]
+#[derive(Debug, PartialEq, Eq)]
+enum DenseOctetMatrixData {
+    Owned(Vec<Octet>),
+    Shared(Arc<[Octet]>),
+}
+
+#[cfg(not(feature = "std"))]
+type DenseOctetMatrixData = Vec<Octet>;
+
+#[cfg(feature = "std")]
+const SHARED_DENSE_OCTET_MATRIX_MIN_LEN: usize = 100_000;
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct DenseOctetMatrix {
     height: usize,
     width: usize,
-    data: Vec<Octet>,
+    data: DenseOctetMatrixData,
+}
+
+impl Clone for DenseOctetMatrix {
+    fn clone(&self) -> DenseOctetMatrix {
+        #[cfg(feature = "std")]
+        {
+            let data = match &self.data {
+                DenseOctetMatrixData::Owned(data)
+                    if data.len() >= SHARED_DENSE_OCTET_MATRIX_MIN_LEN =>
+                {
+                    DenseOctetMatrixData::Shared(Arc::from(data.as_slice()))
+                }
+                DenseOctetMatrixData::Owned(data) => DenseOctetMatrixData::Owned(data.clone()),
+                DenseOctetMatrixData::Shared(data)
+                    if data.len() >= SHARED_DENSE_OCTET_MATRIX_MIN_LEN =>
+                {
+                    DenseOctetMatrixData::Shared(Arc::clone(data))
+                }
+                DenseOctetMatrixData::Shared(data) => {
+                    DenseOctetMatrixData::Owned(data.as_ref().to_vec())
+                }
+            };
+            DenseOctetMatrix {
+                height: self.height,
+                width: self.width,
+                data,
+            }
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            DenseOctetMatrix {
+                height: self.height,
+                width: self.width,
+                data: self.data.clone(),
+            }
+        }
+    }
 }
 
 impl DenseOctetMatrix {
@@ -21,7 +77,17 @@ impl DenseOctetMatrix {
         DenseOctetMatrix {
             height,
             width,
-            data: vec![Octet::zero(); height * width],
+            data: dense_octet_matrix_data_from_vec(vec![Octet::zero(); height * width]),
+        }
+    }
+
+    #[cfg(feature = "serde_support")]
+    fn from_vec(height: usize, width: usize, data: Vec<Octet>) -> DenseOctetMatrix {
+        assert_eq!(data.len(), height * width);
+        DenseOctetMatrix {
+            height,
+            width,
+            data: dense_octet_matrix_data_from_vec(data),
         }
     }
 
@@ -36,30 +102,110 @@ impl DenseOctetMatrix {
     pub(crate) fn row(&self, row: usize) -> &[Octet] {
         assert!(row < self.height);
         let start = row * self.width;
-        &self.data[start..start + self.width]
+        &self.as_slice()[start..start + self.width]
     }
 
     pub(crate) fn row_mut(&mut self, row: usize) -> &mut [Octet] {
         assert!(row < self.height);
         let start = row * self.width;
-        &mut self.data[start..start + self.width]
+        let end = start + self.width;
+        let data = self.data_mut();
+        &mut data[start..end]
     }
 
     pub(crate) fn as_slice(&self) -> &[Octet] {
-        &self.data
+        #[cfg(feature = "std")]
+        {
+            match &self.data {
+                DenseOctetMatrixData::Owned(data) => data.as_slice(),
+                DenseOctetMatrixData::Shared(data) => data.as_ref(),
+            }
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            self.data.as_slice()
+        }
+    }
+
+    fn data_mut(&mut self) -> &mut [Octet] {
+        #[cfg(feature = "std")]
+        {
+            match &mut self.data {
+                DenseOctetMatrixData::Owned(data) => data.as_mut_slice(),
+                DenseOctetMatrixData::Shared(data) => Arc::make_mut(data),
+            }
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            self.data.as_mut_slice()
+        }
     }
 
     #[allow(dead_code)]
     pub fn get(&self, row: usize, col: usize) -> Octet {
         assert!(row < self.height);
         assert!(col < self.width);
-        self.data[row * self.width + col]
+        self.as_slice()[row * self.width + col]
     }
 
     pub fn set(&mut self, row: usize, col: usize, value: Octet) {
         assert!(row < self.height);
         assert!(col < self.width);
-        self.data[row * self.width + col] = value;
+        let index = row * self.width + col;
+        self.data_mut()[index] = value;
+    }
+}
+
+#[cfg(feature = "std")]
+fn dense_octet_matrix_data_from_vec(data: Vec<Octet>) -> DenseOctetMatrixData {
+    DenseOctetMatrixData::Owned(data)
+}
+
+#[cfg(not(feature = "std"))]
+fn dense_octet_matrix_data_from_vec(data: Vec<Octet>) -> DenseOctetMatrixData {
+    data
+}
+
+#[cfg(feature = "serde_support")]
+impl Serialize for DenseOctetMatrix {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("DenseOctetMatrix", 3)?;
+        state.serialize_field("height", &self.height)?;
+        state.serialize_field("width", &self.width)?;
+        state.serialize_field("data", self.as_slice())?;
+        state.end()
+    }
+}
+
+#[cfg(feature = "serde_support")]
+impl<'de> Deserialize<'de> for DenseOctetMatrix {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct DenseOctetMatrixFields {
+            height: usize,
+            width: usize,
+            data: Vec<Octet>,
+        }
+
+        let fields = DenseOctetMatrixFields::deserialize(deserializer)?;
+        if fields.data.len() != fields.height * fields.width {
+            return Err(de::Error::custom(
+                "DenseOctetMatrix data length does not match dimensions",
+            ));
+        }
+        Ok(DenseOctetMatrix::from_vec(
+            fields.height,
+            fields.width,
+            fields.data,
+        ))
     }
 }
 
@@ -90,5 +236,42 @@ mod tests {
             ]
         );
         assert_eq!(matrix.get(1, 1), Octet::new(5));
+    }
+
+    #[test]
+    fn cloned_matrix_mutation_does_not_change_original() {
+        let mut original = DenseOctetMatrix::new(2, 3);
+        original.set(0, 1, Octet::new(7));
+
+        let mut cloned = original.clone();
+        cloned.set(0, 1, Octet::new(9));
+        cloned
+            .row_mut(1)
+            .copy_from_slice(&[Octet::new(1), Octet::new(2), Octet::new(3)]);
+
+        assert_eq!(original.get(0, 1), Octet::new(7));
+        assert_eq!(
+            original.row(1),
+            &[Octet::zero(), Octet::zero(), Octet::zero()]
+        );
+        assert_eq!(cloned.get(0, 1), Octet::new(9));
+        assert_eq!(
+            cloned.row(1),
+            &[Octet::new(1), Octet::new(2), Octet::new(3)]
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn large_cloned_matrix_mutation_does_not_change_original() {
+        let width = SHARED_DENSE_OCTET_MATRIX_MIN_LEN + 1;
+        let mut original = DenseOctetMatrix::new(1, width);
+        original.set(0, width - 1, Octet::new(7));
+
+        let mut cloned = original.clone();
+        cloned.set(0, width - 1, Octet::new(9));
+
+        assert_eq!(original.get(0, width - 1), Octet::new(7));
+        assert_eq!(cloned.get(0, width - 1), Octet::new(9));
     }
 }
