@@ -544,6 +544,31 @@ impl PackedBinaryRows {
         (weight, first_one)
     }
 
+    pub(crate) fn xor_u16_columns_apply_known_state(
+        &mut self,
+        dest: usize,
+        cols: &[u16],
+        weight: u32,
+        first_one: Option<usize>,
+    ) -> (u32, Option<usize>) {
+        let Some(&start_col) = cols.first() else {
+            return (weight, first_one);
+        };
+        let start_col = start_col as usize;
+        debug_assert!(self.contains(dest, start_col));
+
+        for &col in cols {
+            let col = col as usize;
+            debug_assert!(col < self.width);
+            let word = self.word_index(dest, col);
+            self.words[word] ^= bit_mask(col);
+        }
+
+        debug_assert_eq!(weight, self.weight_at_or_after(dest, start_col));
+        debug_assert_eq!(first_one, self.first_one_at_or_after(dest, start_col));
+        (weight, first_one)
+    }
+
     pub(crate) fn weight_at_or_after(&self, row: usize, start_col: usize) -> u32 {
         #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
         if self.use_popcnt {
@@ -883,6 +908,23 @@ mod tests {
         assert!(packed.contains(0, 65));
         assert!(!packed.contains(0, 70));
         assert!(packed.contains(0, 95));
+    }
+
+    #[test]
+    fn u16_column_xor_can_reuse_known_row_state() {
+        let rows = vec![vec![3, 8, 13]];
+        let mut packed = PackedBinaryRows::from_sparse(rows, 32);
+        let cols = [3u16, 5, 13, 21];
+
+        let (weight, first_one) = packed.xor_u16_columns_apply_known_state(0, &cols, 3, Some(5));
+
+        assert_eq!(weight, 3);
+        assert_eq!(first_one, Some(5));
+        assert!(!packed.contains(0, 3));
+        assert!(packed.contains(0, 5));
+        assert!(packed.contains(0, 8));
+        assert!(!packed.contains(0, 13));
+        assert!(packed.contains(0, 21));
     }
 
     #[cfg(feature = "std")]
