@@ -5187,7 +5187,7 @@ fn addassign_binary_row_sources_to_slice_and_check_zero_trusted<
     }
 
     let pending_source = unsafe { core::slice::from_raw_parts(pending_source, symbol_size) };
-    if source_batch_len == 0 && decoded.len() <= SUFFIX_VERIFY_PENDING_COMPARE_MAX_WIDTH {
+    if decoded.len() <= SUFFIX_VERIFY_PENDING_COMPARE_MAX_WIDTH {
         return check == pending_source;
     }
     add_assign_and_check_zero(check, pending_source)
@@ -5223,9 +5223,8 @@ fn addassign_binary_row_sources_to_slice_and_check_zero<const BATCH: usize, M: B
         add_assign_path,
     );
     if pending_source != NO_BUCKET_ROW {
-        if source_batch_len == 0
-            && (SUFFIX_VERIFY_PENDING_COMPARE_MIN_WIDTH..=SUFFIX_VERIFY_PENDING_COMPARE_MAX_WIDTH)
-                .contains(&decoded.len())
+        if (SUFFIX_VERIFY_PENDING_COMPARE_MIN_WIDTH..=SUFFIX_VERIFY_PENDING_COMPARE_MAX_WIDTH)
+            .contains(&decoded.len())
         {
             return check == decoded.get(pending_source);
         }
@@ -9247,7 +9246,7 @@ mod tests {
     }
 
     #[test]
-    fn suffix_row_verifier_accepts_single_pending_source_without_xor_scan() {
+    fn suffix_row_verifier_accepts_pending_source_compare() {
         let symbol_size = 3;
         let mut decoded =
             SymbolSlab::with_zeros(SUFFIX_VERIFY_PENDING_COMPARE_MIN_WIDTH, symbol_size);
@@ -9259,10 +9258,13 @@ mod tests {
             ]);
         }
 
-        let mut matrix = SparseBinaryMatrix::new(2, decoded.len());
+        let mut matrix = SparseBinaryMatrix::new(3, decoded.len());
         matrix.set(0, 3, true);
         for col in 0..17 {
             matrix.set(1, col, true);
+        }
+        for &col in &[4, 7, 9] {
+            matrix.set(2, col, true);
         }
 
         let add_assign_path = AddAssignFastPath::new(symbol_size);
@@ -9298,6 +9300,34 @@ mod tests {
                 &matrix,
                 1,
                 &mut batch_boundary_check,
+                &decoded,
+                add_assign_path,
+            )
+        );
+
+        let mut buffered_check = vec![0u8; symbol_size];
+        for &col in &[4, 7, 9] {
+            add_assign(&mut buffered_check, decoded.get(col));
+        }
+        assert!(
+            addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, _>(
+                &matrix,
+                2,
+                &mut buffered_check,
+                &decoded,
+                add_assign_path,
+            )
+        );
+
+        let mut buffered_check = vec![0u8; symbol_size];
+        for &col in &[4, 7, 9] {
+            add_assign(&mut buffered_check, decoded.get(col));
+        }
+        assert!(
+            addassign_binary_row_sources_to_slice_and_check_zero::<16, _>(
+                &matrix,
+                2,
+                &mut buffered_check,
                 &decoded,
                 add_assign_path,
             )
