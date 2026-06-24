@@ -3815,6 +3815,16 @@ fn addassign_symbol_source_ptrs_to_slice(
     }
 }
 
+#[allow(clippy::uninit_vec)]
+fn symbol_slab_with_uninit(symbols: usize, symbol_size: usize) -> SymbolSlab {
+    let mut bytes = Vec::with_capacity(symbols * symbol_size);
+    // Callers only use this when every symbol is overwritten before any read.
+    unsafe {
+        bytes.set_len(symbols * symbol_size);
+    }
+    SymbolSlab::from_bytes(bytes, symbol_size)
+}
+
 trait SymbolSourceIndex {
     fn symbol_source_index(self) -> usize;
 }
@@ -4811,7 +4821,7 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
             .expect("cached hybrid systematic free-column solve failed")
     };
 
-    let mut decoded = SymbolSlab::with_zeros(plan.width, symbol_size);
+    let mut decoded = symbol_slab_with_uninit(plan.width, symbol_size);
     for (free_index, &col) in plan.free_cols.iter().enumerate() {
         decoded
             .get_mut(col)
@@ -4913,7 +4923,7 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
         return true;
     }
 
-    let mut decoded = SymbolSlab::with_zeros(plan.width, symbol_size);
+    let mut decoded = symbol_slab_with_uninit(plan.width, symbol_size);
     for (free_index, &col) in plan.free_cols.iter().enumerate() {
         decoded
             .get_mut(col)
