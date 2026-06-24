@@ -20,16 +20,25 @@ pub struct PackedBinaryRows {
     width: usize,
     words_per_row: usize,
     words: Vec<u64>,
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    use_avx2_popcount: bool,
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    use_popcnt: bool,
 }
 
 impl PackedBinaryRows {
     pub(crate) fn new(height: usize, width: usize) -> PackedBinaryRows {
         let words_per_row = width.div_ceil(u64::BITS as usize);
+        let use_wide_popcount = words_per_row >= WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS;
         PackedBinaryRows {
             height,
             width,
             words_per_row,
             words: vec![0; height * words_per_row],
+            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            use_avx2_popcount: use_wide_popcount && std::arch::is_x86_feature_detected!("avx2"),
+            #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+            use_popcnt: use_wide_popcount && std::arch::is_x86_feature_detected!("popcnt"),
         }
     }
 
@@ -142,19 +151,17 @@ impl PackedBinaryRows {
         src: usize,
         start_col: usize,
     ) -> (u32, Option<usize>) {
-        if self.words_per_row >= WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS {
-            #[cfg(all(feature = "std", target_arch = "x86_64"))]
-            if std::arch::is_x86_feature_detected!("avx2") {
-                unsafe {
-                    return self.xor_suffix_count_ones_and_first_one_avx2(dest, src, start_col);
-                }
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if self.use_avx2_popcount {
+            unsafe {
+                return self.xor_suffix_count_ones_and_first_one_avx2(dest, src, start_col);
             }
+        }
 
-            #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-            if std::arch::is_x86_feature_detected!("popcnt") {
-                unsafe {
-                    return self.xor_suffix_count_ones_and_first_one_popcnt(dest, src, start_col);
-                }
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_popcnt {
+            unsafe {
+                return self.xor_suffix_count_ones_and_first_one_popcnt(dest, src, start_col);
             }
         }
 
@@ -538,12 +545,10 @@ impl PackedBinaryRows {
     }
 
     pub(crate) fn weight_at_or_after(&self, row: usize, start_col: usize) -> u32 {
-        if self.words_per_row >= WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS {
-            #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-            if std::arch::is_x86_feature_detected!("popcnt") {
-                unsafe {
-                    return self.weight_at_or_after_popcnt(row, start_col);
-                }
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        if self.use_popcnt {
+            unsafe {
+                return self.weight_at_or_after_popcnt(row, start_col);
             }
         }
 
