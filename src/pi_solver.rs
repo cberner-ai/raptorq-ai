@@ -3533,7 +3533,7 @@ fn addassign_symbol_sources_to_slice(
 
     let symbol_size = symbols.symbol_size();
     assert_eq!(dest.len(), symbol_size);
-    addassign_symbol_sources_raw(
+    addassign_symbol_sources_raw_wide(
         dest.as_mut_ptr(),
         symbols.as_bytes().as_ptr(),
         symbols.as_bytes().len(),
@@ -3567,7 +3567,25 @@ fn addassign_symbol_sources_raw<T: Copy + SymbolSourceIndex>(
     sources: &[T],
     add_assign_path: AddAssignFastPath,
 ) {
-    addassign_symbol_sources_raw_impl::<true, T>(
+    addassign_symbol_sources_raw_impl::<true, false, T>(
+        dest_ptr,
+        source_base,
+        source_len,
+        symbol_size,
+        sources,
+        add_assign_path,
+    );
+}
+
+fn addassign_symbol_sources_raw_wide<T: Copy + SymbolSourceIndex>(
+    dest_ptr: *mut u8,
+    source_base: *const u8,
+    source_len: usize,
+    symbol_size: usize,
+    sources: &[T],
+    add_assign_path: AddAssignFastPath,
+) {
+    addassign_symbol_sources_raw_impl::<true, true, T>(
         dest_ptr,
         source_base,
         source_len,
@@ -3585,7 +3603,7 @@ fn addassign_symbol_sources_raw_trusted<T: Copy + SymbolSourceIndex>(
     sources: &[T],
     add_assign_path: AddAssignFastPath,
 ) {
-    addassign_symbol_sources_raw_impl::<false, T>(
+    addassign_symbol_sources_raw_impl::<false, false, T>(
         dest_ptr,
         source_base,
         source_len,
@@ -3597,6 +3615,7 @@ fn addassign_symbol_sources_raw_trusted<T: Copy + SymbolSourceIndex>(
 
 fn addassign_symbol_sources_raw_impl<
     const CHECK_SOURCE_BOUNDS: bool,
+    const USE_32_SOURCE_BATCH: bool,
     T: Copy + SymbolSourceIndex,
 >(
     dest_ptr: *mut u8,
@@ -3606,6 +3625,119 @@ fn addassign_symbol_sources_raw_impl<
     sources: &[T],
     add_assign_path: AddAssignFastPath,
 ) {
+    let sources = if USE_32_SOURCE_BATCH {
+        let mut source_chunks = sources.chunks_exact(32);
+        for chunk in source_chunks.by_ref() {
+            let src0_start = chunk[0].symbol_source_index() * symbol_size;
+            let src1_start = chunk[1].symbol_source_index() * symbol_size;
+            let src2_start = chunk[2].symbol_source_index() * symbol_size;
+            let src3_start = chunk[3].symbol_source_index() * symbol_size;
+            let src4_start = chunk[4].symbol_source_index() * symbol_size;
+            let src5_start = chunk[5].symbol_source_index() * symbol_size;
+            let src6_start = chunk[6].symbol_source_index() * symbol_size;
+            let src7_start = chunk[7].symbol_source_index() * symbol_size;
+            let src8_start = chunk[8].symbol_source_index() * symbol_size;
+            let src9_start = chunk[9].symbol_source_index() * symbol_size;
+            let src10_start = chunk[10].symbol_source_index() * symbol_size;
+            let src11_start = chunk[11].symbol_source_index() * symbol_size;
+            let src12_start = chunk[12].symbol_source_index() * symbol_size;
+            let src13_start = chunk[13].symbol_source_index() * symbol_size;
+            let src14_start = chunk[14].symbol_source_index() * symbol_size;
+            let src15_start = chunk[15].symbol_source_index() * symbol_size;
+            let src16_start = chunk[16].symbol_source_index() * symbol_size;
+            let src17_start = chunk[17].symbol_source_index() * symbol_size;
+            let src18_start = chunk[18].symbol_source_index() * symbol_size;
+            let src19_start = chunk[19].symbol_source_index() * symbol_size;
+            let src20_start = chunk[20].symbol_source_index() * symbol_size;
+            let src21_start = chunk[21].symbol_source_index() * symbol_size;
+            let src22_start = chunk[22].symbol_source_index() * symbol_size;
+            let src23_start = chunk[23].symbol_source_index() * symbol_size;
+            let src24_start = chunk[24].symbol_source_index() * symbol_size;
+            let src25_start = chunk[25].symbol_source_index() * symbol_size;
+            let src26_start = chunk[26].symbol_source_index() * symbol_size;
+            let src27_start = chunk[27].symbol_source_index() * symbol_size;
+            let src28_start = chunk[28].symbol_source_index() * symbol_size;
+            let src29_start = chunk[29].symbol_source_index() * symbol_size;
+            let src30_start = chunk[30].symbol_source_index() * symbol_size;
+            let src31_start = chunk[31].symbol_source_index() * symbol_size;
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src0_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src1_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src2_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src3_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src4_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src5_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src6_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src7_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src8_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src9_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src10_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src11_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src12_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src13_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src14_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src15_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src16_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src17_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src18_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src19_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src20_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src21_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src22_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src23_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src24_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src25_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src26_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src27_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src28_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src29_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src30_start, symbol_size, source_len);
+            check_source_bounds::<CHECK_SOURCE_BOUNDS>(src31_start, symbol_size, source_len);
+            unsafe {
+                add_assign_path.apply_sources_same_len_raw_32(
+                    dest_ptr,
+                    [
+                        source_base.add(src0_start),
+                        source_base.add(src1_start),
+                        source_base.add(src2_start),
+                        source_base.add(src3_start),
+                        source_base.add(src4_start),
+                        source_base.add(src5_start),
+                        source_base.add(src6_start),
+                        source_base.add(src7_start),
+                        source_base.add(src8_start),
+                        source_base.add(src9_start),
+                        source_base.add(src10_start),
+                        source_base.add(src11_start),
+                        source_base.add(src12_start),
+                        source_base.add(src13_start),
+                        source_base.add(src14_start),
+                        source_base.add(src15_start),
+                        source_base.add(src16_start),
+                        source_base.add(src17_start),
+                        source_base.add(src18_start),
+                        source_base.add(src19_start),
+                        source_base.add(src20_start),
+                        source_base.add(src21_start),
+                        source_base.add(src22_start),
+                        source_base.add(src23_start),
+                        source_base.add(src24_start),
+                        source_base.add(src25_start),
+                        source_base.add(src26_start),
+                        source_base.add(src27_start),
+                        source_base.add(src28_start),
+                        source_base.add(src29_start),
+                        source_base.add(src30_start),
+                        source_base.add(src31_start),
+                    ],
+                    symbol_size,
+                );
+            }
+        }
+        source_chunks.remainder()
+    } else {
+        sources
+    };
+
     let mut source_chunks = sources.chunks_exact(16);
     for chunk in source_chunks.by_ref() {
         let src0_start = chunk[0].symbol_source_index() * symbol_size;
