@@ -16,7 +16,7 @@ use crate::symbol_slab::SymbolSlab;
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
 
-const REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS: usize = 1_000;
+const REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS: usize = 500;
 const REPLAY_BATCH_FAST_PATH_MIN_DESTS_FOR_LARGE_SYMBOLS: usize = 2;
 const REPLAY_BATCH_FAST_PATH_LARGE_SYMBOLS: usize = 20_000;
 const REPLAY_BATCH_FAST_PATH_MAX_SYMBOLS: usize = 32_768;
@@ -259,7 +259,7 @@ mod tests {
         assert!(!use_replay_batch_fast_paths(10, 2));
         assert!(!use_replay_batch_fast_paths(100, 2));
         assert!(!use_replay_batch_fast_paths(250, 2));
-        assert!(!use_replay_batch_fast_paths(500, 2));
+        assert!(use_replay_batch_fast_paths(500, 2));
         assert!(use_replay_batch_fast_paths(1_000, 2));
         assert!(use_replay_batch_fast_paths(5_000, 2));
         assert!(use_replay_batch_fast_paths(20_000, 2));
