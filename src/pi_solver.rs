@@ -21,7 +21,7 @@ use crate::octet_matrix::DenseOctetMatrix;
 use crate::octets::{
     AddAssignFastPath, FusedAddAssignMulScalarFastPath, FusedMulAssignAlphaAddAssignFastPath,
     add_assign, add_assign_and_check_zero, bytes_are_zero, fused_addassign_mul_scalar,
-    fused_mulassign_alpha_add_assign, mulassign_scalar,
+    fused_mulassign_alpha_add_assign, mulassign_scalar, xor_slices_are_zero,
 };
 use crate::operation_vector::SymbolOps;
 #[cfg(feature = "std")]
@@ -5537,7 +5537,17 @@ fn binary_row_suffixes_satisfied<M: BinaryMatrix>(
     let add_assign_path = AddAssignFastPath::new(decoded.symbol_size());
     let use_trusted_sources = decoded.len() >= TRUSTED_SUFFIX_VERIFY_MIN_WIDTH;
     for row in start_row..matrix.height() {
-        check.copy_from_slice(suffix_symbols.get(row - start_row));
+        let expected = suffix_symbols.get(row - start_row);
+        if let Some(entries) = matrix.row_entries_unordered_slice(row)
+            && let Some(satisfied) = small_binary_row_entries_satisfied(entries, decoded, expected)
+        {
+            if !satisfied {
+                return false;
+            }
+            continue;
+        }
+
+        check.copy_from_slice(expected);
         let satisfied = if use_trusted_sources {
             if decoded.len() <= SUFFIX_VERIFY_PENDING_COMPARE_MAX_WIDTH {
                 addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, M, true>(
@@ -5570,6 +5580,54 @@ fn binary_row_suffixes_satisfied<M: BinaryMatrix>(
         }
     }
     true
+}
+
+fn small_binary_row_entries_satisfied(
+    entries: &[usize],
+    decoded: &SymbolSlab,
+    expected: &[u8],
+) -> Option<bool> {
+    match *entries {
+        [] => Some(symbol_is_zero(expected)),
+        [a] => {
+            assert!(a < decoded.len());
+            Some(expected == decoded.get(a))
+        }
+        [a, b] => {
+            assert!(a < decoded.len());
+            assert!(b < decoded.len());
+            Some(xor_slices_are_zero([
+                expected,
+                decoded.get(a),
+                decoded.get(b),
+            ]))
+        }
+        [a, b, c] => {
+            assert!(a < decoded.len());
+            assert!(b < decoded.len());
+            assert!(c < decoded.len());
+            Some(xor_slices_are_zero([
+                expected,
+                decoded.get(a),
+                decoded.get(b),
+                decoded.get(c),
+            ]))
+        }
+        [a, b, c, d] => {
+            assert!(a < decoded.len());
+            assert!(b < decoded.len());
+            assert!(c < decoded.len());
+            assert!(d < decoded.len());
+            Some(xor_slices_are_zero([
+                expected,
+                decoded.get(a),
+                decoded.get(b),
+                decoded.get(c),
+                decoded.get(d),
+            ]))
+        }
+        _ => None,
+    }
 }
 
 fn binary_rows_satisfied<M: BinaryMatrix>(
@@ -9890,6 +9948,44 @@ mod tests {
         let suffix_symbols = SymbolSlab::with_zeros(1, 1);
 
         binary_row_suffixes_satisfied(&matrix, &decoded, &suffix_symbols, 0);
+    }
+
+    #[test]
+    fn suffix_verifier_accepts_short_row_direct_checks() {
+        let symbol_size = 129;
+        let mut decoded = SymbolSlab::with_zeros(8, symbol_size);
+        for col in 0..decoded.len() {
+            for (offset, byte) in decoded.get_mut(col).iter_mut().enumerate() {
+                *byte = (offset as u8)
+                    .wrapping_mul(31)
+                    .wrapping_add((col as u8).wrapping_mul(17));
+            }
+        }
+
+        let rows: [&[usize]; 5] = [&[], &[3], &[1, 4], &[0, 2, 6], &[1, 3, 5, 7]];
+        let mut matrix = SparseBinaryMatrix::new(rows.len(), decoded.len());
+        let mut suffix_symbols = SymbolSlab::with_zeros(rows.len(), symbol_size);
+        for (row, entries) in rows.iter().enumerate() {
+            for &col in *entries {
+                matrix.set(row, col, true);
+                add_assign(suffix_symbols.get_mut(row), decoded.get(col));
+            }
+        }
+
+        assert!(binary_row_suffixes_satisfied(
+            &matrix,
+            &decoded,
+            &suffix_symbols,
+            0
+        ));
+
+        suffix_symbols.get_mut(3)[0] ^= 1;
+        assert!(!binary_row_suffixes_satisfied(
+            &matrix,
+            &decoded,
+            &suffix_symbols,
+            0
+        ));
     }
 
     #[test]
