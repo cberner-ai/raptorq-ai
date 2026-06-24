@@ -4749,7 +4749,7 @@ fn binary_row_suffixes_satisfied<M: BinaryMatrix>(
     let mut check = vec![0u8; decoded.symbol_size()];
     let add_assign_path = AddAssignFastPath::new(decoded.symbol_size());
     for row in start_row..matrix.height() {
-        check.fill(0);
+        check.copy_from_slice(suffix_symbols.get(row - start_row));
         addassign_binary_row_sources_to_slice::<16, M>(
             matrix,
             row,
@@ -4757,7 +4757,7 @@ fn binary_row_suffixes_satisfied<M: BinaryMatrix>(
             decoded,
             add_assign_path,
         );
-        if !add_assign_and_check_zero(&mut check, suffix_symbols.get(row - start_row)) {
+        if !symbol_is_zero(&check) {
             return false;
         }
     }
