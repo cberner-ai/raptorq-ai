@@ -5073,7 +5073,6 @@ fn rfc_hdpc_rows_satisfied_horner(
 ) -> bool {
     #[cfg(not(feature = "std"))]
     let _ = cache_verify_row_pairs;
-    let requested_cached_verify_row_pairs = cache_verify_row_pairs;
 
     let width = decoded.len();
     let Some(gamma_width) = width.checked_sub(h) else {
@@ -5084,10 +5083,8 @@ fn rfc_hdpc_rows_satisfied_horner(
     }
 
     #[cfg(feature = "std")]
-    let cache_verify_row_pairs = cache_verify_row_pairs
-        && (HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH
-            ..=HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH)
-            .contains(&gamma_width);
+    let cache_verify_row_pairs =
+        use_cached_rfc_hdpc_verify_row_pairs(cache_verify_row_pairs, gamma_width);
     #[cfg(not(feature = "std"))]
     let cache_verify_row_pairs = {
         let _ = cache_verify_row_pairs;
@@ -5097,7 +5094,7 @@ fn rfc_hdpc_rows_satisfied_horner(
     let symbol_size = decoded.symbol_size();
     let add_assign_path = AddAssignFastPath::new(symbol_size);
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
-    let hoist_exact_alpha_add_path = !requested_cached_verify_row_pairs
+    let hoist_exact_alpha_add_path = !cache_verify_row_pairs
         && (EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH
             ..=EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH)
             .contains(&gamma_width);
@@ -5142,7 +5139,7 @@ fn rfc_hdpc_rows_satisfied_horner(
                 let (row_a, row_b) = verify_row_pairs[col];
                 (coefficient_col_index(row_a), coefficient_col_index(row_b))
             } else {
-                let (row_a, row_b) = if requested_cached_verify_row_pairs {
+                let (row_a, row_b) = if cache_verify_row_pairs {
                     rfc_hdpc_verify_rows_for_col(col, h)
                 } else {
                     let rows = rfc_hdpc_verify_rows_for_sequential_random(verify_row_random, h);
@@ -5222,6 +5219,15 @@ fn rfc_hdpc_rows_satisfied_horner(
     }
 
     symbol_is_zero(checks.as_bytes())
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn use_cached_rfc_hdpc_verify_row_pairs(cache_requested: bool, gamma_width: usize) -> bool {
+    cache_requested
+        && (HDPC_VERIFY_ROW_PAIRS_CACHE_MIN_GAMMA_WIDTH
+            ..=HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH)
+            .contains(&gamma_width)
 }
 
 fn hdpc_final_checks_match(
@@ -9997,31 +10003,36 @@ mod tests {
             let k_prime = extended_source_block_symbols(source_symbols);
             (k_prime + num_ldpc_symbols(k_prime)) as usize
         };
+        let gamma_20k = gamma_width_for(20_000);
+        let gamma_50k = gamma_width_for(50_000);
 
-        assert!(gamma_width_for(20_000) <= HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH);
-        assert!(gamma_width_for(50_000) > HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH);
+        assert!(gamma_20k <= HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH);
+        assert!(gamma_50k > HDPC_VERIFY_ROW_PAIRS_CACHE_MAX_GAMMA_WIDTH);
+        assert!(use_cached_rfc_hdpc_verify_row_pairs(true, gamma_20k));
+        assert!(!use_cached_rfc_hdpc_verify_row_pairs(false, gamma_20k));
+        assert!(!use_cached_rfc_hdpc_verify_row_pairs(true, gamma_50k));
         assert!(gamma_width_for(5_000) >= FUSED_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH);
-        assert!(gamma_width_for(20_000) <= FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
-        assert!(gamma_width_for(50_000) > FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
+        assert!(gamma_20k <= FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
+        assert!(gamma_50k > FUSED_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(5_000) >= EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH);
         assert!(gamma_width_for(10_000) >= EXACT_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH);
-        assert!(gamma_width_for(20_000) <= EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
-        assert!(gamma_width_for(50_000) <= EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
+        assert!(gamma_20k <= EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
+        assert!(gamma_50k <= EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(2_000) < CACHED_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH);
         assert!(gamma_width_for(5_000) >= CACHED_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH);
-        assert!(gamma_width_for(20_000) <= CACHED_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
-        assert!(gamma_width_for(20_000) <= FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH);
-        assert!(gamma_width_for(50_000) > FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH);
+        assert!(gamma_20k <= CACHED_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH);
+        assert!(gamma_20k <= FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH);
+        assert!(gamma_50k > FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH);
         assert!(gamma_width_for(10_000) < EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH);
         assert!(
             (EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH
                 ..=EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
-                .contains(&gamma_width_for(20_000))
+                .contains(&gamma_20k)
         );
         assert!(
             (EXACT_COMPARE_HDPC_FINAL_CHECK_MIN_GAMMA_WIDTH
                 ..=EXACT_COMPARE_HDPC_FINAL_CHECK_MAX_GAMMA_WIDTH)
-                .contains(&gamma_width_for(50_000))
+                .contains(&gamma_50k)
         );
     }
 
