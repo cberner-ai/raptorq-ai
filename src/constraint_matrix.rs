@@ -2,7 +2,7 @@ use crate::base::deg;
 use crate::matrix::BinaryMatrix;
 use crate::octet::Octet;
 use crate::octet_matrix::DenseOctetMatrix;
-use crate::rng::RfcRand;
+use crate::rng::{RfcRand, SequentialRfcRand};
 use crate::systematic_constants::{
     calculate_p1, extended_source_block_symbols, num_hdpc_symbols, num_intermediate_symbols,
     num_ldpc_symbols, num_lt_symbols, num_pi_symbols, systematic_index,
@@ -152,21 +152,24 @@ fn fill_encoded_rows<M: BinaryMatrix>(
     encoded_isis: &[u32],
 ) {
     let tuple_params = EncodingTupleParameters::new(k_prime);
-    let mut previous_isi_and_y: Option<(u32, u32)> = None;
+    let mut previous_isi_y_and_rand: Option<(u32, u32, SequentialRfcRand)> = None;
 
     for (row, isi) in encoded_isis.iter().enumerate() {
-        let y = match previous_isi_and_y {
-            Some((previous_isi, previous_y)) if *isi == previous_isi.wrapping_add(1) => {
-                previous_y.wrapping_add(tuple_params.a)
+        let (y, isi_rand) = match previous_isi_y_and_rand {
+            Some((previous_isi, previous_y, mut previous_rand))
+                if *isi == previous_isi.wrapping_add(1) =>
+            {
+                previous_rand.advance();
+                (previous_y.wrapping_add(tuple_params.a), previous_rand)
             }
-            _ => tuple_params.y(*isi),
+            _ => (tuple_params.y(*isi), SequentialRfcRand::new(*isi)),
         };
-        previous_isi_and_y = Some((*isi, y));
+        previous_isi_y_and_rand = Some((*isi, y, isi_rand));
         fill_encoded_row(
             matrix,
             row_offset + row,
             tuple_params,
-            tuple_params.tuple_from_y(*isi, y),
+            tuple_params.tuple_from_y_and_isi_rand(y, isi_rand),
         );
     }
 }
@@ -209,13 +212,22 @@ impl EncodingTupleParameters {
         self.tuple_from_y(internal_symbol_id, self.y(internal_symbol_id))
     }
 
+    #[cfg(test)]
     #[inline]
     fn tuple_from_y(self, internal_symbol_id: u32, y: u32) -> (u32, u32, u32, u32, u32, u32) {
+        self.tuple_from_y_and_isi_rand(y, SequentialRfcRand::new(internal_symbol_id))
+    }
+
+    #[inline]
+    fn tuple_from_y_and_isi_rand(
+        self,
+        y: u32,
+        isi_rand: SequentialRfcRand,
+    ) -> (u32, u32, u32, u32, u32, u32) {
         let y_rand = RfcRand::new(y);
         let d = deg(y_rand.get_raw(0u32) & (1_048_576 - 1), self.lt_symbols);
         let a = 1 + y_rand.get_raw(1u32) % (self.lt_symbols - 1);
         let b = y_rand.get_raw(2u32) % self.lt_symbols;
-        let isi_rand = RfcRand::new(internal_symbol_id);
         let d1 = if d < 4 {
             2 + (isi_rand.get_raw(3u32) & 1)
         } else {

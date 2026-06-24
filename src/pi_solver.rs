@@ -165,7 +165,7 @@ const FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH: usize = 32_768;
 const TRUSTED_SUFFIX_VERIFY_MIN_WIDTH: usize = 20_000;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
-const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
+const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 24;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH: usize = 32_768;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
@@ -212,6 +212,12 @@ fn use_trusted_direct_source_batch_back_substitution(width: usize) -> bool {
 #[inline]
 fn use_direct_forward_no_zero_check(width: usize) -> bool {
     width >= DIRECT_FORWARD_NO_ZERO_CHECK_MIN_WIDTH
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn use_direct_decode_forward_no_zero_check(width: usize) -> bool {
+    width >= MID_DIRECT_SYSTEMATIC_SOLVE_MAX_WIDTH
 }
 
 #[inline]
@@ -2616,7 +2622,12 @@ fn try_apply_prepared_direct_systematic_plan(
     let add_assign_path = AddAssignFastPath::new(symbol_size);
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
 
-    if use_direct_forward_no_zero_check(plan.width) {
+    let skip_forward_zero_check = if plan.trust_source_batch_bounds {
+        use_direct_forward_no_zero_check(plan.width)
+    } else {
+        use_direct_decode_forward_no_zero_check(plan.width)
+    };
+    if skip_forward_zero_check {
         for (step_index, step) in plan.forward_steps.iter().enumerate() {
             addassign_direct_symbol_batch_no_zero_check(
                 symbols,
@@ -10172,7 +10183,7 @@ mod tests {
         let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
 
         assert_eq!(DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 16);
-        assert_eq!(HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 31);
+        assert_eq!(HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 24);
         assert!(width_for(20_000) < HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
         assert!(width_for(50_000) >= HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
     }
@@ -10304,6 +10315,9 @@ mod tests {
         assert!(use_direct_forward_no_zero_check(width_for(10_000)));
         assert!(use_direct_forward_no_zero_check(width_for(20_000)));
         assert!(use_direct_forward_no_zero_check(width_for(50_000)));
+        assert!(use_direct_decode_forward_no_zero_check(width_for(2_000)));
+        assert!(use_direct_decode_forward_no_zero_check(width_for(5_000)));
+        assert!(use_direct_decode_forward_no_zero_check(width_for(10_000)));
     }
 
     #[test]
