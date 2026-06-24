@@ -142,7 +142,7 @@ const OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH: usize = 20_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 10_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_BACKSUB_BATCH4_MAX_WIDTH: usize = 32_768;
 const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MIN_WIDTH: usize = 5_000;
-const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MAX_WIDTH: usize = 32_768;
+const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MAX_WIDTH: usize = HYBRID_MAX_WIDTH + 1;
 const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS: usize = 4;
 const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 256;
 #[cfg(feature = "std")]
@@ -9879,7 +9879,7 @@ mod tests {
     }
 
     #[test]
-    fn overdetermined_prefix_short_extra_rows_cover_mid_overhead() {
+    fn overdetermined_prefix_short_extra_rows_cover_mid_and_wide_overhead() {
         let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
         let prefix_extra_for = |source_symbols| {
             let width = width_for(source_symbols);
@@ -9897,6 +9897,10 @@ mod tests {
         );
         assert_eq!(
             prefix_extra_for(20_000),
+            OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS
+        );
+        assert_eq!(
+            prefix_extra_for(50_000),
             OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS
         );
     }
