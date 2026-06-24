@@ -144,6 +144,10 @@ const OVERDETERMINED_NO_HDPC_PREFIX_BACKSUB_BATCH4_MAX_WIDTH: usize = 32_768;
 const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MIN_WIDTH: usize = 5_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MAX_WIDTH: usize = HYBRID_MAX_WIDTH + 1;
 const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS: usize = 4;
+const OVERDETERMINED_SMALL_ROW_HINT_MIN_WIDTH: usize = 2_000;
+const OVERDETERMINED_SMALL_ROW_HINT_LOW_MAX_WIDTH: usize = 10_000;
+const OVERDETERMINED_SMALL_ROW_HINT_HIGH_MIN_WIDTH: usize = 20_000;
+const OVERDETERMINED_SMALL_ROW_HINT_HIGH_MAX_WIDTH: usize = 32_768;
 const SUFFIX_VERIFY_PENDING_COMPARE_MIN_WIDTH: usize = 5_000;
 const SUFFIX_VERIFY_PENDING_COMPARE_MAX_WIDTH: usize = 32_768;
 const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 256;
@@ -243,6 +247,15 @@ fn overdetermined_no_hdpc_prefix_height(
         h
     };
     (width + extra).min(matrix_height)
+}
+
+#[inline]
+fn use_overdetermined_small_row_first_one_hint(width: usize) -> bool {
+    (OVERDETERMINED_SMALL_ROW_HINT_MIN_WIDTH..OVERDETERMINED_SMALL_ROW_HINT_LOW_MAX_WIDTH)
+        .contains(&width)
+        || (OVERDETERMINED_SMALL_ROW_HINT_HIGH_MIN_WIDTH
+            ..OVERDETERMINED_SMALL_ROW_HINT_HIGH_MAX_WIDTH)
+            .contains(&width)
 }
 
 #[inline]
@@ -4828,7 +4841,9 @@ fn solve_full_rank_binary_prefix_owned<M: BinaryMatrix>(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let next_col = eliminate_weighted_binary_row::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX>(
+                let next_col = eliminate_weighted_binary_row_with_small_row_hint::<
+                    DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+                >(
                     &mut rows,
                     &mut row_weights,
                     &mut small_row_cache,
@@ -6056,6 +6071,87 @@ fn eliminate_weighted_binary_row<const SMALL_WEIGHT_MAX: usize>(
     row_weights[row] = weight;
     small_row_cache.invalidate(row);
     next_col
+}
+
+fn eliminate_weighted_binary_row_with_small_row_hint<const SMALL_WEIGHT_MAX: usize>(
+    rows: &mut PackedBinaryRows,
+    row_weights: &mut [u32],
+    small_row_cache: &mut SmallBinaryRowCache<SMALL_WEIGHT_MAX>,
+    row: usize,
+    pivot: usize,
+    col: usize,
+    pivot_weight: u32,
+) -> Option<usize> {
+    if (pivot_weight as usize) <= SMALL_WEIGHT_MAX
+        && use_overdetermined_small_row_first_one_hint(rows.width())
+        && (row_weights[row] as usize) <= SMALL_WEIGHT_MAX
+    {
+        debug_assert_ne!(row_weights[row], 0);
+        let pivot_entries = small_row_cache.entry_snapshot(rows, pivot, col);
+        let row_entries = small_row_cache.entry_snapshot(rows, row, col);
+        let (weight, next_col) = sorted_u16_symmetric_difference_weight_and_first_one(
+            row_entries.as_slice(),
+            pivot_entries.as_slice(),
+        );
+        let (weight, next_col) =
+            rows.xor_u16_columns_apply_known_state(row, pivot_entries.as_slice(), weight, next_col);
+        row_weights[row] = weight;
+        small_row_cache.invalidate(row);
+        return next_col;
+    }
+
+    eliminate_weighted_binary_row::<SMALL_WEIGHT_MAX>(
+        rows,
+        row_weights,
+        small_row_cache,
+        row,
+        pivot,
+        col,
+        pivot_weight,
+    )
+}
+
+fn sorted_u16_symmetric_difference_weight_and_first_one(
+    left: &[CoefficientColumn],
+    right: &[CoefficientColumn],
+) -> (u32, Option<usize>) {
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+    let mut weight = 0u32;
+    let mut first_one = None;
+
+    while left_index < left.len() || right_index < right.len() {
+        let col = match (left.get(left_index), right.get(right_index)) {
+            (Some(&left_col), Some(&right_col)) if left_col == right_col => {
+                left_index += 1;
+                right_index += 1;
+                continue;
+            }
+            (Some(&left_col), Some(&right_col)) if left_col < right_col => {
+                left_index += 1;
+                left_col
+            }
+            (Some(_), Some(&right_col)) => {
+                right_index += 1;
+                right_col
+            }
+            (Some(&left_col), None) => {
+                left_index += 1;
+                left_col
+            }
+            (None, Some(&right_col)) => {
+                right_index += 1;
+                right_col
+            }
+            (None, None) => break,
+        };
+        weight += 1;
+        if first_one.is_none() {
+            first_one = Some(coefficient_col_index(col));
+        }
+    }
+
+    (weight, first_one)
 }
 
 fn dense_hdpc_coefficients(matrix: &DenseOctetMatrix) -> Vec<Octet> {
@@ -7812,6 +7908,12 @@ impl<const CAPACITY: usize> Default for SmallBinaryRowEntries<CAPACITY> {
     }
 }
 
+impl<const CAPACITY: usize> SmallBinaryRowEntries<CAPACITY> {
+    fn as_slice(&self) -> &[CoefficientColumn] {
+        &self.cols[..self.len as usize]
+    }
+}
+
 struct SmallBinaryRowCache<const CAPACITY: usize> {
     entries: Vec<SmallBinaryRowEntries<CAPACITY>>,
 }
@@ -7842,7 +7944,17 @@ impl<const CAPACITY: usize> SmallBinaryRowCache<CAPACITY> {
             entry.valid = true;
         }
         let entry = &self.entries[row];
-        &entry.cols[..entry.len as usize]
+        entry.as_slice()
+    }
+
+    fn entry_snapshot(
+        &mut self,
+        rows: &PackedBinaryRows,
+        row: usize,
+        start_col: usize,
+    ) -> SmallBinaryRowEntries<CAPACITY> {
+        let _ = self.entries(rows, row, start_col);
+        self.entries[row]
     }
 
     fn invalidate(&mut self, row: usize) {
@@ -9025,6 +9137,18 @@ mod tests {
         {
             visit(self.width);
         }
+    }
+
+    #[test]
+    fn sorted_symmetric_difference_reports_weight_and_first_one() {
+        assert_eq!(
+            sorted_u16_symmetric_difference_weight_and_first_one(&[3, 8, 13], &[3, 5, 13, 21]),
+            (3, Some(5))
+        );
+        assert_eq!(
+            sorted_u16_symmetric_difference_weight_and_first_one(&[2, 7], &[2, 7]),
+            (0, None)
+        );
     }
 
     #[test]
@@ -10214,6 +10338,30 @@ mod tests {
         assert!(!use_binary_forward_symbol_batch(width_250, width_250));
         assert!(use_binary_forward_symbol_batch(width_250, width_250 + 1));
         assert!(use_binary_forward_symbol_batch(width_500, width_500));
+    }
+
+    #[test]
+    fn overdetermined_small_row_hint_skips_noisy_mid_and_50k_widths() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert!(!use_overdetermined_small_row_first_one_hint(width_for(
+            1_000
+        )));
+        assert!(use_overdetermined_small_row_first_one_hint(width_for(
+            2_000
+        )));
+        assert!(use_overdetermined_small_row_first_one_hint(width_for(
+            5_000
+        )));
+        assert!(!use_overdetermined_small_row_first_one_hint(width_for(
+            10_000
+        )));
+        assert!(use_overdetermined_small_row_first_one_hint(width_for(
+            20_000
+        )));
+        assert!(!use_overdetermined_small_row_first_one_hint(width_for(
+            50_000
+        )));
     }
 
     #[test]
