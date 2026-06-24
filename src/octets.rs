@@ -531,8 +531,35 @@ pub(crate) fn bytes_are_zero(bytes: &[u8]) -> bool {
     bytes_are_zero_scalar(rest)
 }
 
+pub(crate) fn xor_slices_are_zero<const N: usize>(slices: [&[u8]; N]) -> bool {
+    assert!(N > 0);
+    let len = slices[0].len();
+    for slice in slices.iter().skip(1) {
+        assert_eq!(slice.len(), len);
+    }
+
+    if let Some(result) = try_xor_slices_are_zero_avx2(slices) {
+        return result;
+    }
+    xor_slices_are_zero_scalar(slices, 0)
+}
+
 fn bytes_are_zero_scalar(bytes: &[u8]) -> bool {
     bytes.iter().all(|&byte| byte == 0)
+}
+
+fn xor_slices_are_zero_scalar<const N: usize>(slices: [&[u8]; N], start: usize) -> bool {
+    let len = slices[0].len();
+    for offset in start..len {
+        let mut combined = 0u8;
+        for slice in slices {
+            combined ^= slice[offset];
+        }
+        if combined != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 fn mulassign_table(dest: &mut [u8], table: &[u8; 256]) {
@@ -651,6 +678,20 @@ fn try_add_assign_and_check_zero_avx2(dest: &mut [u8], src: &[u8]) -> Option<boo
 
 #[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
 fn try_add_assign_and_check_zero_avx2(_dest: &mut [u8], _src: &[u8]) -> Option<bool> {
+    None
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+fn try_xor_slices_are_zero_avx2<const N: usize>(slices: [&[u8]; N]) -> Option<bool> {
+    if slices[0].len() < 64 || !avx2_available() {
+        return None;
+    }
+
+    Some(unsafe { xor_slices_are_zero_avx2(slices) })
+}
+
+#[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
+fn try_xor_slices_are_zero_avx2<const N: usize>(_slices: [&[u8]; N]) -> Option<bool> {
     None
 }
 
@@ -1306,6 +1347,57 @@ unsafe fn bytes_are_zero_avx2(bytes: &[u8]) -> bool {
     }
 
     bytes_are_zero_scalar(&bytes[offset..])
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_slices_are_zero_avx2<const N: usize>(slices: [&[u8]; N]) -> bool {
+    let mut offset = 0usize;
+    let len = slices[0].len();
+    let vector_len = len / 32 * 32;
+
+    while offset + 128 <= vector_len {
+        let combined = unsafe {
+            let first = _mm256_or_si256(
+                xor_slices_32(slices, offset),
+                xor_slices_32(slices, offset + 32),
+            );
+            let second = _mm256_or_si256(
+                xor_slices_32(slices, offset + 64),
+                xor_slices_32(slices, offset + 96),
+            );
+            _mm256_or_si256(first, second)
+        };
+        if _mm256_testz_si256(combined, combined) == 0 {
+            return false;
+        }
+        offset += 128;
+    }
+
+    while offset < vector_len {
+        let chunk = unsafe { xor_slices_32(slices, offset) };
+        if _mm256_testz_si256(chunk, chunk) == 0 {
+            return false;
+        }
+        offset += 32;
+    }
+
+    xor_slices_are_zero_scalar(slices, offset)
+}
+
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_slices_32<const N: usize>(slices: [&[u8]; N], offset: usize) -> __m256i {
+    unsafe {
+        let mut combined = _mm256_loadu_si256(slices[0].as_ptr().add(offset).cast::<__m256i>());
+        for slice in slices.iter().skip(1) {
+            combined = _mm256_xor_si256(
+                combined,
+                _mm256_loadu_si256(slice.as_ptr().add(offset).cast::<__m256i>()),
+            );
+        }
+        combined
+    }
 }
 
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -2428,6 +2520,36 @@ mod tests {
                 assert!(
                     !bytes_are_zero(&bytes),
                     "nonzero byte at {index} was missed for length {len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn xor_slices_are_zero_matches_scalar_for_boundary_lengths() {
+        for len in [0usize, 1, 31, 32, 63, 64, 65, 127, 128, 129] {
+            let first = patterned_bytes(len);
+            let second = patterned_bytes(len)
+                .into_iter()
+                .map(|byte| byte.rotate_left(1) ^ 0x3d)
+                .collect::<Vec<_>>();
+            let third = scalar_xor(first.clone(), &second);
+
+            assert!(
+                xor_slices_are_zero([first.as_slice(), second.as_slice(), third.as_slice()]),
+                "xor zero check failed for length {len}"
+            );
+
+            if len > 0 {
+                let mut corrupted = third.clone();
+                corrupted[len / 2] ^= 1;
+                assert!(
+                    !xor_slices_are_zero([
+                        first.as_slice(),
+                        second.as_slice(),
+                        corrupted.as_slice()
+                    ]),
+                    "xor zero check missed corruption for length {len}"
                 );
             }
         }
