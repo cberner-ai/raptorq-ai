@@ -173,7 +173,7 @@ const WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH: usize = 20_000;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 24;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH: usize = 32_768;
-const CHECKED_TINY_SOURCE_BATCH_MIN_SYMBOLS: usize = 1_000;
+const CHECKED_TINY_SOURCE_BATCH_MIN_SYMBOLS: usize = 500;
 #[cfg(all(test, feature = "std"))]
 const SINGLE_REPAIR_BASIS_CACHE_CAPACITY: usize = 64;
 
@@ -5674,7 +5674,7 @@ fn addassign_binary_row_sources_to_slice_and_check_zero_trusted<
     let mut source_batch_len = 0usize;
     let mut pending_source: *const u8 = core::ptr::null();
     matrix.visit_row_entries_unordered(row, |col| {
-        debug_assert!(col < decoded.len());
+        assert!(col < decoded.len());
         let source = unsafe { source_base.add(col * symbol_size) };
         if pending_source.is_null() {
             pending_source = source;
@@ -5735,7 +5735,7 @@ fn addassign_binary_row_entries_to_slice_and_check_zero_trusted<
     let mut source_batch_len = 0usize;
     let mut pending_source: *const u8 = core::ptr::null();
     for &col in entries {
-        debug_assert!(col < decoded.len());
+        assert!(col < decoded.len());
         let source = unsafe { source_base.add(col * symbol_size) };
         if pending_source.is_null() {
             pending_source = source;
@@ -9880,6 +9880,16 @@ mod tests {
             &decoded,
             AddAssignFastPath::new(decoded.symbol_size()),
         );
+    }
+
+    #[test]
+    #[should_panic]
+    fn suffix_verifier_checks_public_matrix_columns_before_trusted_path() {
+        let matrix = OutOfBoundsRowMatrix::new(1, TRUSTED_SUFFIX_VERIFY_MIN_WIDTH);
+        let decoded = SymbolSlab::with_zeros(TRUSTED_SUFFIX_VERIFY_MIN_WIDTH, 1);
+        let suffix_symbols = SymbolSlab::with_zeros(1, 1);
+
+        binary_row_suffixes_satisfied(&matrix, &decoded, &suffix_symbols, 0);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[cfg(feature = "std")]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum DenseOctetMatrixData {
     Owned(Vec<Octet>),
     Shared(Arc<[Octet]>),
@@ -27,12 +27,22 @@ type DenseOctetMatrixData = Vec<Octet>;
 #[cfg(feature = "std")]
 const SHARED_DENSE_OCTET_MATRIX_MIN_LEN: usize = 100_000;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct DenseOctetMatrix {
     height: usize,
     width: usize,
     data: DenseOctetMatrixData,
 }
+
+impl PartialEq for DenseOctetMatrix {
+    fn eq(&self, other: &Self) -> bool {
+        self.height == other.height
+            && self.width == other.width
+            && self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for DenseOctetMatrix {}
 
 impl Clone for DenseOctetMatrix {
     fn clone(&self) -> DenseOctetMatrix {
@@ -196,17 +206,24 @@ impl<'de> Deserialize<'de> for DenseOctetMatrix {
         }
 
         let fields = DenseOctetMatrixFields::deserialize(deserializer)?;
-        if fields.data.len() != fields.height * fields.width {
-            return Err(de::Error::custom(
-                "DenseOctetMatrix data length does not match dimensions",
-            ));
-        }
-        Ok(DenseOctetMatrix::from_vec(
-            fields.height,
-            fields.width,
-            fields.data,
-        ))
+        dense_octet_matrix_from_deserialized_parts(fields.height, fields.width, fields.data)
+            .map_err(de::Error::custom)
     }
+}
+
+#[cfg(feature = "serde_support")]
+fn dense_octet_matrix_from_deserialized_parts(
+    height: usize,
+    width: usize,
+    data: Vec<Octet>,
+) -> Result<DenseOctetMatrix, &'static str> {
+    let Some(expected_len) = height.checked_mul(width) else {
+        return Err("DenseOctetMatrix data length does not match dimensions");
+    };
+    if data.len() != expected_len {
+        return Err("DenseOctetMatrix data length does not match dimensions");
+    }
+    Ok(DenseOctetMatrix::from_vec(height, width, data))
 }
 
 #[cfg(test)]
@@ -273,5 +290,30 @@ mod tests {
 
         assert_eq!(original.get(0, width - 1), Octet::new(7));
         assert_eq!(cloned.get(0, width - 1), Octet::new(9));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn large_cloned_matrix_compares_by_contents_not_storage() {
+        let width = SHARED_DENSE_OCTET_MATRIX_MIN_LEN + 1;
+        let mut original = DenseOctetMatrix::new(1, width);
+        original.set(0, width - 1, Octet::new(7));
+
+        let mut cloned = original.clone();
+        assert_eq!(original, cloned);
+
+        cloned.set(0, width - 1, Octet::new(9));
+        assert_ne!(original, cloned);
+    }
+
+    #[cfg(feature = "serde_support")]
+    #[test]
+    fn deserialized_matrix_rejects_overflowing_dimensions() {
+        let result = dense_octet_matrix_from_deserialized_parts(usize::MAX, 2, Vec::<Octet>::new());
+
+        assert_eq!(
+            result.unwrap_err(),
+            "DenseOctetMatrix data length does not match dimensions"
+        );
     }
 }
