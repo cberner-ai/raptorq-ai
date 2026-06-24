@@ -141,6 +141,9 @@ const OVERDETERMINED_NO_HDPC_PREFIX_MID_OWNED_MAX_WIDTH: usize = 20_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH: usize = 20_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 10_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_BACKSUB_BATCH4_MAX_WIDTH: usize = 32_768;
+const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MIN_WIDTH: usize = 5_000;
+const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MAX_WIDTH: usize = 20_000;
+const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS: usize = 4;
 const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 256;
 #[cfg(feature = "std")]
 const HDPC_VERIFY_ROW_PAIRS_CACHE_CAPACITY: usize = 16;
@@ -213,6 +216,24 @@ fn use_overdetermined_no_hdpc_prefix_owned(width: usize) -> bool {
     (OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH..OVERDETERMINED_NO_HDPC_PREFIX_MID_OWNED_MAX_WIDTH)
         .contains(&width)
         || width >= OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH
+}
+
+#[inline]
+fn overdetermined_no_hdpc_prefix_height(
+    width: usize,
+    matrix_height: usize,
+    source_block_symbols: u32,
+) -> usize {
+    let h = crate::systematic_constants::num_hdpc_symbols(source_block_symbols) as usize;
+    let extra = if (OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MIN_WIDTH
+        ..OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MAX_WIDTH)
+        .contains(&width)
+    {
+        h.min(OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS)
+    } else {
+        h
+    };
+    (width + extra).min(matrix_height)
 }
 
 #[inline]
@@ -4429,9 +4450,8 @@ fn try_overdetermined_no_hdpc_prefix_solve_owned<M: BinaryMatrix>(
     source_block_symbols: u32,
 ) -> OverdeterminedNoHdpcPrefixSolve {
     let width = matrix.width();
-    let prefix_height = (width
-        + crate::systematic_constants::num_hdpc_symbols(source_block_symbols) as usize)
-        .min(matrix.height());
+    let prefix_height =
+        overdetermined_no_hdpc_prefix_height(width, matrix.height(), source_block_symbols);
     if prefix_height == matrix.height() {
         return OverdeterminedNoHdpcPrefixSolve::Fallback(symbols);
     }
@@ -4697,9 +4717,8 @@ fn try_overdetermined_no_hdpc_prefix_solve<M: BinaryMatrix>(
     source_block_symbols: u32,
 ) -> Option<SymbolSlab> {
     let width = matrix.width();
-    let prefix_height = (width
-        + crate::systematic_constants::num_hdpc_symbols(source_block_symbols) as usize)
-        .min(matrix.height());
+    let prefix_height =
+        overdetermined_no_hdpc_prefix_height(width, matrix.height(), source_block_symbols);
     if prefix_height == matrix.height() {
         return None;
     }
@@ -9814,6 +9833,26 @@ mod tests {
         assert!(width_for(5_000) < OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH);
         assert!(width_for(10_000) >= OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH);
         assert!(width_for(20_000) >= OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH);
+    }
+
+    #[test]
+    fn overdetermined_prefix_short_extra_rows_cover_mid_overhead() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+        let prefix_extra_for = |source_symbols| {
+            let width = width_for(source_symbols);
+            overdetermined_no_hdpc_prefix_height(width, usize::MAX, source_symbols) - width
+        };
+
+        assert_eq!(prefix_extra_for(2_000), num_hdpc_symbols(2_000) as usize);
+        assert_eq!(
+            prefix_extra_for(5_000),
+            OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS
+        );
+        assert_eq!(
+            prefix_extra_for(10_000),
+            OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS
+        );
+        assert_eq!(prefix_extra_for(20_000), num_hdpc_symbols(20_000) as usize);
     }
 
     #[test]
