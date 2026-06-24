@@ -325,6 +325,11 @@ impl BinaryMatrix for SparseBinaryMatrix {
         }
     }
 
+    fn row_entries_unordered_slice(&self, row: usize) -> Option<&[usize]> {
+        assert!(row < self.rows.len());
+        Some(&self.rows[row])
+    }
+
     fn row_entries(&self, row: usize) -> Vec<usize> {
         assert!(row < self.rows.len());
         let mut entries = self.rows[row].clone();
@@ -368,6 +373,9 @@ mod tests {
         matrix.visit_row_entries_unordered(0, |col| unordered.push(col));
         unordered.sort_unstable();
         assert_eq!(unordered, vec![3, 5, 7]);
+        let mut unordered_slice = matrix.row_entries_unordered_slice(0).unwrap().to_vec();
+        unordered_slice.sort_unstable();
+        assert_eq!(unordered_slice, vec![3, 5, 7]);
 
         matrix.normalize_rows();
         assert!(matrix.rows_normalized);

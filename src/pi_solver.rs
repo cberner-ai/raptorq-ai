@@ -5263,6 +5263,11 @@ fn addassign_binary_row_sources_to_slice<const BATCH: usize, M: BinaryMatrix>(
     decoded: &SymbolSlab,
     add_assign_path: AddAssignFastPath,
 ) {
+    if let Some(entries) = matrix.row_entries_unordered_slice(row) {
+        addassign_binary_row_entries_to_slice::<BATCH>(entries, check, decoded, add_assign_path);
+        return;
+    }
+
     let mut source_batch = [0usize; BATCH];
     let mut source_batch_len = 0usize;
     matrix.visit_row_entries_unordered(row, |col| {
@@ -5281,6 +5286,30 @@ fn addassign_binary_row_sources_to_slice<const BATCH: usize, M: BinaryMatrix>(
     );
 }
 
+fn addassign_binary_row_entries_to_slice<const BATCH: usize>(
+    entries: &[usize],
+    check: &mut [u8],
+    decoded: &SymbolSlab,
+    add_assign_path: AddAssignFastPath,
+) {
+    let mut source_batch = [0usize; BATCH];
+    let mut source_batch_len = 0usize;
+    for &col in entries {
+        source_batch[source_batch_len] = col;
+        source_batch_len += 1;
+        if source_batch_len == source_batch.len() {
+            addassign_symbol_sources_to_slice(check, decoded, &source_batch, add_assign_path);
+            source_batch_len = 0;
+        }
+    }
+    addassign_symbol_sources_to_slice(
+        check,
+        decoded,
+        &source_batch[..source_batch_len],
+        add_assign_path,
+    );
+}
+
 fn addassign_binary_row_sources_to_slice_and_check_zero_trusted<
     const BATCH: usize,
     M: BinaryMatrix,
@@ -5291,6 +5320,15 @@ fn addassign_binary_row_sources_to_slice_and_check_zero_trusted<
     decoded: &SymbolSlab,
     add_assign_path: AddAssignFastPath,
 ) -> bool {
+    if let Some(entries) = matrix.row_entries_unordered_slice(row) {
+        return addassign_binary_row_entries_to_slice_and_check_zero_trusted::<BATCH>(
+            entries,
+            check,
+            decoded,
+            add_assign_path,
+        );
+    }
+
     let symbol_size = decoded.symbol_size();
     let source_base = decoded.as_bytes().as_ptr();
     let mut source_batch: [*const u8; BATCH] = [core::ptr::null(); BATCH];
@@ -5327,6 +5365,48 @@ fn addassign_binary_row_sources_to_slice_and_check_zero_trusted<
     add_assign_and_check_zero(check, pending_source)
 }
 
+fn addassign_binary_row_entries_to_slice_and_check_zero_trusted<const BATCH: usize>(
+    entries: &[usize],
+    check: &mut [u8],
+    decoded: &SymbolSlab,
+    add_assign_path: AddAssignFastPath,
+) -> bool {
+    let symbol_size = decoded.symbol_size();
+    let source_base = decoded.as_bytes().as_ptr();
+    let mut source_batch: [*const u8; BATCH] = [core::ptr::null(); BATCH];
+    let mut source_batch_len = 0usize;
+    let mut pending_source: *const u8 = core::ptr::null();
+    for &col in entries {
+        debug_assert!(col < decoded.len());
+        let source = unsafe { source_base.add(col * symbol_size) };
+        if pending_source.is_null() {
+            pending_source = source;
+        } else {
+            source_batch[source_batch_len] = pending_source;
+            source_batch_len += 1;
+            if source_batch_len == source_batch.len() {
+                addassign_symbol_source_ptrs_to_slice(check, &source_batch, add_assign_path);
+                source_batch_len = 0;
+            }
+            pending_source = source;
+        }
+    }
+    addassign_symbol_source_ptrs_to_slice(
+        check,
+        &source_batch[..source_batch_len],
+        add_assign_path,
+    );
+    if pending_source.is_null() {
+        return symbol_is_zero(check);
+    }
+
+    let pending_source = unsafe { core::slice::from_raw_parts(pending_source, symbol_size) };
+    if decoded.len() <= SUFFIX_VERIFY_PENDING_COMPARE_MAX_WIDTH {
+        return check == pending_source;
+    }
+    add_assign_and_check_zero(check, pending_source)
+}
+
 fn addassign_binary_row_sources_to_slice_and_check_zero<const BATCH: usize, M: BinaryMatrix>(
     matrix: &M,
     row: usize,
@@ -5334,6 +5414,15 @@ fn addassign_binary_row_sources_to_slice_and_check_zero<const BATCH: usize, M: B
     decoded: &SymbolSlab,
     add_assign_path: AddAssignFastPath,
 ) -> bool {
+    if let Some(entries) = matrix.row_entries_unordered_slice(row) {
+        return addassign_binary_row_entries_to_slice_and_check_zero::<BATCH>(
+            entries,
+            check,
+            decoded,
+            add_assign_path,
+        );
+    }
+
     let mut source_batch = [0usize; BATCH];
     let mut source_batch_len = 0usize;
     let mut pending_source = NO_BUCKET_ROW;
@@ -5350,6 +5439,46 @@ fn addassign_binary_row_sources_to_slice_and_check_zero<const BATCH: usize, M: B
             pending_source = col;
         }
     });
+    addassign_symbol_sources_to_slice(
+        check,
+        decoded,
+        &source_batch[..source_batch_len],
+        add_assign_path,
+    );
+    if pending_source != NO_BUCKET_ROW {
+        if (SUFFIX_VERIFY_PENDING_COMPARE_MIN_WIDTH..=SUFFIX_VERIFY_PENDING_COMPARE_MAX_WIDTH)
+            .contains(&decoded.len())
+        {
+            return check == decoded.get(pending_source);
+        }
+        add_assign_and_check_zero(check, decoded.get(pending_source))
+    } else {
+        symbol_is_zero(check)
+    }
+}
+
+fn addassign_binary_row_entries_to_slice_and_check_zero<const BATCH: usize>(
+    entries: &[usize],
+    check: &mut [u8],
+    decoded: &SymbolSlab,
+    add_assign_path: AddAssignFastPath,
+) -> bool {
+    let mut source_batch = [0usize; BATCH];
+    let mut source_batch_len = 0usize;
+    let mut pending_source = NO_BUCKET_ROW;
+    for &col in entries {
+        if pending_source == NO_BUCKET_ROW {
+            pending_source = col;
+        } else {
+            source_batch[source_batch_len] = pending_source;
+            source_batch_len += 1;
+            if source_batch_len == source_batch.len() {
+                addassign_symbol_sources_to_slice(check, decoded, &source_batch, add_assign_path);
+                source_batch_len = 0;
+            }
+            pending_source = col;
+        }
+    }
     addassign_symbol_sources_to_slice(
         check,
         decoded,
