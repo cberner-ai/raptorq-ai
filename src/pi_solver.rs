@@ -139,7 +139,7 @@ const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 64;
 const OVERDETERMINED_NO_HDPC_PREFIX_MIN_WIDTH: usize = 5_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_MID_OWNED_MAX_WIDTH: usize = 10_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_OWNED_MIN_WIDTH: usize = 20_000;
-const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 20_000;
+const OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH: usize = 10_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_BACKSUB_BATCH4_MAX_WIDTH: usize = 32_768;
 const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 256;
 #[cfg(feature = "std")]
@@ -9805,6 +9805,15 @@ mod tests {
         assert!(use_overdetermined_no_hdpc_prefix_owned(width_for(5_000)));
         assert!(!use_overdetermined_no_hdpc_prefix_owned(width_for(10_000)));
         assert!(use_overdetermined_no_hdpc_prefix_owned(width_for(20_000)));
+    }
+
+    #[test]
+    fn overdetermined_prefix_metadata_covers_10k_overhead() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert!(width_for(5_000) < OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH);
+        assert!(width_for(10_000) >= OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH);
+        assert!(width_for(20_000) >= OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH);
     }
 
     #[test]
