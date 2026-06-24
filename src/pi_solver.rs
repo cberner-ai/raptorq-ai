@@ -160,6 +160,7 @@ const EXACT_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH: usize = HYBRID_MAX_WIDTH;
 const CACHED_HDPC_ALPHA_FAST_PATH_MIN_GAMMA_WIDTH: usize = 5_000;
 const CACHED_HDPC_ALPHA_FAST_PATH_MAX_GAMMA_WIDTH: usize = 32_768;
 const FUSED_HDPC_ALPHA_CHECK_PAIR_MAX_GAMMA_WIDTH: usize = 32_768;
+const TRUSTED_SUFFIX_VERIFY_MIN_WIDTH: usize = 20_000;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
@@ -3543,6 +3544,87 @@ fn addassign_symbol_sources_to_slice(
     );
 }
 
+fn addassign_symbol_source_ptrs_to_slice(
+    dest: &mut [u8],
+    sources: &[*const u8],
+    add_assign_path: AddAssignFastPath,
+) {
+    if sources.is_empty() {
+        return;
+    }
+
+    let symbol_size = dest.len();
+    let dest_ptr = dest.as_mut_ptr();
+
+    let mut source_chunks = sources.chunks_exact(16);
+    for chunk in source_chunks.by_ref() {
+        unsafe {
+            add_assign_path.apply_sources_same_len_raw_16(
+                dest_ptr,
+                [
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                    chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14],
+                    chunk[15],
+                ],
+                symbol_size,
+            );
+        }
+    }
+
+    let mut source_chunks = source_chunks.remainder().chunks_exact(8);
+    for chunk in source_chunks.by_ref() {
+        unsafe {
+            add_assign_path.apply_sources_same_len_raw_8(
+                dest_ptr,
+                [
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ],
+                symbol_size,
+            );
+        }
+    }
+
+    let mut source_chunks = source_chunks.remainder().chunks_exact(4);
+    for chunk in source_chunks.by_ref() {
+        unsafe {
+            add_assign_path.apply_sources_same_len_raw_4(
+                dest_ptr,
+                [chunk[0], chunk[1], chunk[2], chunk[3]],
+                symbol_size,
+            );
+        }
+    }
+
+    let mut source_chunks = source_chunks.remainder().chunks_exact(3);
+    for chunk in source_chunks.by_ref() {
+        unsafe {
+            add_assign_path.apply_sources_same_len_raw_3(
+                dest_ptr,
+                [chunk[0], chunk[1], chunk[2]],
+                symbol_size,
+            );
+        }
+    }
+
+    let mut source_chunks = source_chunks.remainder().chunks_exact(2);
+    for chunk in source_chunks.by_ref() {
+        unsafe {
+            add_assign_path.apply_sources_same_len_raw_2(
+                dest_ptr,
+                [chunk[0], chunk[1]],
+                symbol_size,
+            );
+        }
+    }
+
+    for &source in source_chunks.remainder() {
+        unsafe {
+            let source = core::slice::from_raw_parts(source, symbol_size);
+            add_assign_path.apply_same_len(dest, source);
+        }
+    }
+}
+
 trait SymbolSourceIndex {
     fn symbol_source_index(self) -> usize;
 }
@@ -4878,17 +4960,31 @@ fn binary_row_suffixes_satisfied<M: BinaryMatrix>(
     suffix_symbols: &SymbolSlab,
     start_row: usize,
 ) -> bool {
+    debug_assert_eq!(matrix.width(), decoded.len());
+    debug_assert_eq!(matrix.height() - start_row, suffix_symbols.len());
     let mut check = vec![0u8; decoded.symbol_size()];
     let add_assign_path = AddAssignFastPath::new(decoded.symbol_size());
+    let use_trusted_sources = decoded.len() >= TRUSTED_SUFFIX_VERIFY_MIN_WIDTH;
     for row in start_row..matrix.height() {
         check.copy_from_slice(suffix_symbols.get(row - start_row));
-        if !addassign_binary_row_sources_to_slice_and_check_zero::<16, M>(
-            matrix,
-            row,
-            &mut check,
-            decoded,
-            add_assign_path,
-        ) {
+        let satisfied = if use_trusted_sources {
+            addassign_binary_row_sources_to_slice_and_check_zero_trusted::<16, M>(
+                matrix,
+                row,
+                &mut check,
+                decoded,
+                add_assign_path,
+            )
+        } else {
+            addassign_binary_row_sources_to_slice_and_check_zero::<16, M>(
+                matrix,
+                row,
+                &mut check,
+                decoded,
+                add_assign_path,
+            )
+        };
+        if !satisfied {
             return false;
         }
     }
@@ -4942,6 +5038,49 @@ fn addassign_binary_row_sources_to_slice<const BATCH: usize, M: BinaryMatrix>(
         &source_batch[..source_batch_len],
         add_assign_path,
     );
+}
+
+fn addassign_binary_row_sources_to_slice_and_check_zero_trusted<
+    const BATCH: usize,
+    M: BinaryMatrix,
+>(
+    matrix: &M,
+    row: usize,
+    check: &mut [u8],
+    decoded: &SymbolSlab,
+    add_assign_path: AddAssignFastPath,
+) -> bool {
+    let symbol_size = decoded.symbol_size();
+    let source_base = decoded.as_bytes().as_ptr();
+    let mut source_batch: [*const u8; BATCH] = [core::ptr::null(); BATCH];
+    let mut source_batch_len = 0usize;
+    let mut pending_source: *const u8 = core::ptr::null();
+    matrix.visit_row_entries_unordered(row, |col| {
+        debug_assert!(col < decoded.len());
+        let source = unsafe { source_base.add(col * symbol_size) };
+        if pending_source.is_null() {
+            pending_source = source;
+        } else {
+            source_batch[source_batch_len] = pending_source;
+            source_batch_len += 1;
+            if source_batch_len == source_batch.len() {
+                addassign_symbol_source_ptrs_to_slice(check, &source_batch, add_assign_path);
+                source_batch_len = 0;
+            }
+            pending_source = source;
+        }
+    });
+    addassign_symbol_source_ptrs_to_slice(
+        check,
+        &source_batch[..source_batch_len],
+        add_assign_path,
+    );
+    if pending_source.is_null() {
+        return symbol_is_zero(check);
+    }
+
+    let pending_source = unsafe { core::slice::from_raw_parts(pending_source, symbol_size) };
+    add_assign_and_check_zero(check, pending_source)
 }
 
 fn addassign_binary_row_sources_to_slice_and_check_zero<const BATCH: usize, M: BinaryMatrix>(
@@ -10080,6 +10219,8 @@ mod tests {
             prefix_extra_for(50_000),
             OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS
         );
+        assert!(width_for(10_000) < TRUSTED_SUFFIX_VERIFY_MIN_WIDTH);
+        assert!(width_for(20_000) >= TRUSTED_SUFFIX_VERIFY_MIN_WIDTH);
     }
 
     #[test]
