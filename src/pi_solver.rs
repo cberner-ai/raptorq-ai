@@ -3808,6 +3808,140 @@ fn addassign_symbol_sources_raw_impl<
                 }
                 return;
             }
+            5 => {
+                let src0_start = sources[0].symbol_source_index() * symbol_size;
+                let src1_start = sources[1].symbol_source_index() * symbol_size;
+                let src2_start = sources[2].symbol_source_index() * symbol_size;
+                let src3_start = sources[3].symbol_source_index() * symbol_size;
+                let src4_start = sources[4].symbol_source_index() * symbol_size;
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src0_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src1_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src2_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src3_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src4_start, symbol_size, source_len);
+                unsafe {
+                    add_assign_path.apply_sources_same_len_raw_4(
+                        dest_ptr,
+                        [
+                            source_base.add(src0_start),
+                            source_base.add(src1_start),
+                            source_base.add(src2_start),
+                            source_base.add(src3_start),
+                        ],
+                        symbol_size,
+                    );
+                    let dest_symbol = core::slice::from_raw_parts_mut(dest_ptr, symbol_size);
+                    let source_symbol =
+                        core::slice::from_raw_parts(source_base.add(src4_start), symbol_size);
+                    add_assign_path.apply_same_len(dest_symbol, source_symbol);
+                }
+                return;
+            }
+            6 => {
+                let src0_start = sources[0].symbol_source_index() * symbol_size;
+                let src1_start = sources[1].symbol_source_index() * symbol_size;
+                let src2_start = sources[2].symbol_source_index() * symbol_size;
+                let src3_start = sources[3].symbol_source_index() * symbol_size;
+                let src4_start = sources[4].symbol_source_index() * symbol_size;
+                let src5_start = sources[5].symbol_source_index() * symbol_size;
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src0_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src1_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src2_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src3_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src4_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src5_start, symbol_size, source_len);
+                unsafe {
+                    add_assign_path.apply_sources_same_len_raw_4(
+                        dest_ptr,
+                        [
+                            source_base.add(src0_start),
+                            source_base.add(src1_start),
+                            source_base.add(src2_start),
+                            source_base.add(src3_start),
+                        ],
+                        symbol_size,
+                    );
+                    add_assign_path.apply_sources_same_len_raw_2(
+                        dest_ptr,
+                        [source_base.add(src4_start), source_base.add(src5_start)],
+                        symbol_size,
+                    );
+                }
+                return;
+            }
+            7 => {
+                let src0_start = sources[0].symbol_source_index() * symbol_size;
+                let src1_start = sources[1].symbol_source_index() * symbol_size;
+                let src2_start = sources[2].symbol_source_index() * symbol_size;
+                let src3_start = sources[3].symbol_source_index() * symbol_size;
+                let src4_start = sources[4].symbol_source_index() * symbol_size;
+                let src5_start = sources[5].symbol_source_index() * symbol_size;
+                let src6_start = sources[6].symbol_source_index() * symbol_size;
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src0_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src1_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src2_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src3_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src4_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src5_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src6_start, symbol_size, source_len);
+                unsafe {
+                    add_assign_path.apply_sources_same_len_raw_4(
+                        dest_ptr,
+                        [
+                            source_base.add(src0_start),
+                            source_base.add(src1_start),
+                            source_base.add(src2_start),
+                            source_base.add(src3_start),
+                        ],
+                        symbol_size,
+                    );
+                    add_assign_path.apply_sources_same_len_raw_3(
+                        dest_ptr,
+                        [
+                            source_base.add(src4_start),
+                            source_base.add(src5_start),
+                            source_base.add(src6_start),
+                        ],
+                        symbol_size,
+                    );
+                }
+                return;
+            }
+            8 => {
+                let src0_start = sources[0].symbol_source_index() * symbol_size;
+                let src1_start = sources[1].symbol_source_index() * symbol_size;
+                let src2_start = sources[2].symbol_source_index() * symbol_size;
+                let src3_start = sources[3].symbol_source_index() * symbol_size;
+                let src4_start = sources[4].symbol_source_index() * symbol_size;
+                let src5_start = sources[5].symbol_source_index() * symbol_size;
+                let src6_start = sources[6].symbol_source_index() * symbol_size;
+                let src7_start = sources[7].symbol_source_index() * symbol_size;
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src0_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src1_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src2_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src3_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src4_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src5_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src6_start, symbol_size, source_len);
+                check_source_bounds::<CHECK_SOURCE_BOUNDS>(src7_start, symbol_size, source_len);
+                unsafe {
+                    add_assign_path.apply_sources_same_len_raw_8(
+                        dest_ptr,
+                        [
+                            source_base.add(src0_start),
+                            source_base.add(src1_start),
+                            source_base.add(src2_start),
+                            source_base.add(src3_start),
+                            source_base.add(src4_start),
+                            source_base.add(src5_start),
+                            source_base.add(src6_start),
+                            source_base.add(src7_start),
+                        ],
+                        symbol_size,
+                    );
+                }
+                return;
+            }
             _ => {}
         }
     }
@@ -9534,7 +9668,7 @@ mod tests {
         let symbol_count = CHECKED_TINY_SOURCE_BATCH_MIN_SYMBOLS;
         let add_assign_path = AddAssignFastPath::new(symbol_size);
 
-        for source_count in 1..=4 {
+        for source_count in 1..=8 {
             let mut bytes = Vec::new();
             for symbol in 0..symbol_count {
                 let symbol = symbol as u8;
