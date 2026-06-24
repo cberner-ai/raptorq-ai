@@ -673,6 +673,77 @@ impl PackedBinaryRows {
         }
     }
 
+    pub(crate) fn set_row_from_le_bytes(
+        &mut self,
+        row: usize,
+        bytes: &[u8],
+    ) -> (u32, Option<usize>) {
+        assert!(row < self.height);
+        assert_eq!(bytes.len(), self.width.div_ceil(8));
+
+        let row_start = self.row_start(row);
+        let row_words = &mut self.words[row_start..row_start + self.words_per_row];
+        let mut weight = 0u32;
+        let mut first_one = None;
+        let mut chunks = bytes.chunks_exact(8);
+        for (word_index, chunk) in chunks.by_ref().enumerate() {
+            let word = u64::from_le_bytes(chunk.try_into().expect("chunk length is 8"));
+            row_words[word_index] = word;
+            weight += word.count_ones();
+            if first_one.is_none() && word != 0 {
+                first_one = Some(word_index * u64::BITS as usize + word.trailing_zeros() as usize);
+            }
+        }
+
+        let tail = chunks.remainder();
+        if !tail.is_empty() {
+            let word_index = bytes.len() / 8;
+            let mut word = 0u64;
+            for (offset, &byte) in tail.iter().enumerate() {
+                word |= (byte as u64) << (offset * 8);
+            }
+            let valid_bits = self.width - word_index * u64::BITS as usize;
+            if valid_bits < u64::BITS as usize {
+                word &= u64::MAX >> (u64::BITS as usize - valid_bits);
+            }
+            row_words[word_index] = word;
+            weight += word.count_ones();
+            if first_one.is_none() && word != 0 {
+                first_one = Some(word_index * u64::BITS as usize + word.trailing_zeros() as usize);
+            }
+        }
+
+        (weight, first_one)
+    }
+
+    pub(crate) fn set_row_from_bit_slice(
+        &mut self,
+        row: usize,
+        bytes: &[u8],
+        start_bit: usize,
+    ) -> (u32, Option<usize>) {
+        assert!(row < self.height);
+        assert!(start_bit + self.width <= bytes.len() * u8::BITS as usize);
+
+        let row_start = self.row_start(row);
+        let row_words = &mut self.words[row_start..row_start + self.words_per_row];
+        let mut weight = 0u32;
+        let mut first_one = None;
+
+        for (word_index, slot) in row_words.iter_mut().enumerate() {
+            let col = word_index * u64::BITS as usize;
+            let valid_bits = (self.width - col).min(u64::BITS as usize);
+            let word = read_le_bits(bytes, start_bit + col, valid_bits);
+            *slot = word;
+            weight += word.count_ones();
+            if first_one.is_none() && word != 0 {
+                first_one = Some(col + word.trailing_zeros() as usize);
+            }
+        }
+
+        (weight, first_one)
+    }
+
     fn row_start(&self, row: usize) -> usize {
         row * self.words_per_row
     }
@@ -681,6 +752,26 @@ impl PackedBinaryRows {
         assert!(row < self.height);
         self.row_start(row) + col / u64::BITS as usize
     }
+}
+
+fn read_le_bits(bytes: &[u8], start_bit: usize, valid_bits: usize) -> u64 {
+    debug_assert!((1..=u64::BITS as usize).contains(&valid_bits));
+    debug_assert!(start_bit + valid_bits <= bytes.len() * u8::BITS as usize);
+
+    let byte_start = start_bit / u8::BITS as usize;
+    let bit_offset = start_bit % u8::BITS as usize;
+    let byte_len = (bit_offset + valid_bits).div_ceil(u8::BITS as usize);
+    let mut bits = 0u128;
+    for (offset, &byte) in bytes[byte_start..byte_start + byte_len].iter().enumerate() {
+        bits |= (byte as u128) << (offset * u8::BITS as usize);
+    }
+    let shifted = bits >> bit_offset;
+    let mask = if valid_bits == u64::BITS as usize {
+        u64::MAX
+    } else {
+        (1u64 << valid_bits) - 1
+    };
+    (shifted as u64) & mask
 }
 
 fn fill_sparse_entry_metadata_chunk(

@@ -193,11 +193,84 @@ impl BinaryMatrix for DenseBinaryMatrix {
         self.data[byte] ^= mask;
     }
 
+    fn packed_rows(&self) -> PackedBinaryRows {
+        let mut rows = PackedBinaryRows::new(self.height, self.width);
+        if self.width.is_multiple_of(8) {
+            let row_byte_width = self.width / 8;
+            for row in 0..self.height {
+                let row_start = row * row_byte_width;
+                rows.set_row_from_le_bytes(row, &self.data[row_start..row_start + row_byte_width]);
+            }
+            return rows;
+        }
+
+        for row in 0..self.height {
+            rows.set_row_from_bit_slice(row, &self.data, row * self.width);
+        }
+        rows
+    }
+
+    fn packed_row_prefix(&self, height: usize) -> PackedBinaryRows {
+        assert!(height <= self.height);
+        let mut rows = PackedBinaryRows::new(height, self.width);
+        if self.width.is_multiple_of(8) {
+            let row_byte_width = self.width / 8;
+            for row in 0..height {
+                let row_start = row * row_byte_width;
+                rows.set_row_from_le_bytes(row, &self.data[row_start..row_start + row_byte_width]);
+            }
+            return rows;
+        }
+
+        for row in 0..height {
+            rows.set_row_from_bit_slice(row, &self.data, row * self.width);
+        }
+        rows
+    }
+
+    fn packed_rows_with_first_ones(&self) -> (PackedBinaryRows, Vec<Option<usize>>) {
+        let mut rows = PackedBinaryRows::new(self.height, self.width);
+        let mut first_ones = Vec::with_capacity(self.height);
+        if self.width.is_multiple_of(8) {
+            let row_byte_width = self.width / 8;
+            for row in 0..self.height {
+                let row_start = row * row_byte_width;
+                let (_, first_one) = rows
+                    .set_row_from_le_bytes(row, &self.data[row_start..row_start + row_byte_width]);
+                first_ones.push(first_one);
+            }
+            return (rows, first_ones);
+        }
+
+        for row in 0..self.height {
+            let (_, first_one) = rows.set_row_from_bit_slice(row, &self.data, row * self.width);
+            first_ones.push(first_one);
+        }
+        (rows, first_ones)
+    }
+
     fn visit_row_entries<F>(&self, row: usize, mut visit: F)
     where
         F: FnMut(usize),
     {
         assert!(row < self.height);
+        if self.width.is_multiple_of(8) {
+            let row_byte_width = self.width / 8;
+            let row_start = row * row_byte_width;
+            for (byte_offset, &byte) in self.data[row_start..row_start + row_byte_width]
+                .iter()
+                .enumerate()
+            {
+                let mut byte = byte;
+                while byte != 0 {
+                    let set_bit = byte.trailing_zeros() as usize;
+                    visit(byte_offset * 8 + set_bit);
+                    byte &= byte - 1;
+                }
+            }
+            return;
+        }
+
         let start_bit = row * self.width;
         let end_bit = start_bit + self.width;
         let mut bit = start_bit;
@@ -242,5 +315,51 @@ mod tests {
         assert_eq!(matrix.row_entries(0), vec![0, 4]);
         assert_eq!(matrix.row_entries(1), vec![1, 3]);
         assert_eq!(matrix.row_entries(2), vec![2]);
+    }
+
+    #[test]
+    fn dense_byte_aligned_rows_pack_directly() {
+        let mut matrix = DenseBinaryMatrix::new(3, 16);
+        matrix.set(0, 1, true);
+        matrix.set(0, 15, true);
+        matrix.set(1, 8, true);
+
+        let (packed, first_ones) = matrix.packed_rows_with_first_ones();
+
+        assert_eq!(first_ones, vec![Some(1), Some(8), None]);
+        assert!(packed.contains(0, 1));
+        assert!(packed.contains(0, 15));
+        assert!(packed.contains(1, 8));
+        assert!(!packed.contains(1, 7));
+
+        let prefix = matrix.packed_row_prefix(2);
+        assert_eq!(prefix.height(), 2);
+        assert!(prefix.contains(0, 15));
+        assert!(prefix.contains(1, 8));
+    }
+
+    #[test]
+    fn dense_unaligned_rows_pack_directly() {
+        let mut matrix = DenseBinaryMatrix::new(3, 13);
+        matrix.set(0, 0, true);
+        matrix.set(0, 12, true);
+        matrix.set(1, 1, true);
+        matrix.set(1, 11, true);
+        matrix.set(2, 6, true);
+
+        let (packed, first_ones) = matrix.packed_rows_with_first_ones();
+
+        assert_eq!(first_ones, vec![Some(0), Some(1), Some(6)]);
+        assert!(packed.contains(0, 0));
+        assert!(packed.contains(0, 12));
+        assert!(packed.contains(1, 1));
+        assert!(packed.contains(1, 11));
+        assert!(packed.contains(2, 6));
+        assert!(!packed.contains(1, 12));
+
+        let prefix = matrix.packed_row_prefix(2);
+        assert_eq!(prefix.height(), 2);
+        assert!(prefix.contains(0, 12));
+        assert!(prefix.contains(1, 11));
     }
 }
