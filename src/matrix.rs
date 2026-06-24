@@ -114,6 +114,10 @@ pub trait BinaryMatrix: Clone {
         self.visit_row_entries(row, visit);
     }
 
+    fn row_entries_unordered_slice(&self, _row: usize) -> Option<&[usize]> {
+        None
+    }
+
     fn row_entries(&self, row: usize) -> Vec<usize> {
         let mut entries = Vec::new();
         self.visit_row_entries(row, |col| entries.push(col));
