@@ -4757,7 +4757,7 @@ fn binary_row_suffixes_satisfied<M: BinaryMatrix>(
             decoded,
             add_assign_path,
         );
-        if check.as_slice() != suffix_symbols.get(row - start_row) {
+        if !add_assign_and_check_zero(&mut check, suffix_symbols.get(row - start_row)) {
             return false;
         }
     }
@@ -4781,7 +4781,7 @@ fn binary_rows_satisfied<M: BinaryMatrix>(
             decoded,
             add_assign_path,
         );
-        if check.as_slice() != symbols.get(row) {
+        if !add_assign_and_check_zero(&mut check, symbols.get(row)) {
             return false;
         }
     }
