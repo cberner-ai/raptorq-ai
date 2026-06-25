@@ -3,6 +3,8 @@ use std::cell::RefCell;
 #[cfg(feature = "std")]
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "std")]
+use std::mem::MaybeUninit;
+#[cfg(feature = "std")]
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "std")]
 use std::vec::Vec;
@@ -132,6 +134,8 @@ const IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 512;
 const IN_PLACE_HYBRID_REPLAY_MAX_MID_WIDTH: usize = 768;
 #[cfg(feature = "std")]
 const LARGE_IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 32_768;
+#[cfg(feature = "std")]
+const BINARY_SLAB_OUTPUT_TRANSFER_MIN_WIDTH: usize = 10_000;
 #[cfg(not(test))]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 4_096;
 #[cfg(test)]
@@ -3815,12 +3819,68 @@ fn addassign_symbol_source_ptrs_to_slice(
     }
 }
 
-#[allow(clippy::uninit_vec)]
-fn symbol_slab_with_uninit(symbols: usize, symbol_size: usize) -> SymbolSlab {
-    let mut bytes = Vec::with_capacity(symbols * symbol_size);
-    // Callers only use this when every symbol is overwritten before any read.
+#[cfg(feature = "std")]
+fn copy_symbol_to_uninit(
+    dest: &mut [MaybeUninit<u8>],
+    symbol_index: usize,
+    symbol_size: usize,
+    src: &[u8],
+) {
+    assert_eq!(src.len(), symbol_size);
+    let start = symbol_index * symbol_size;
+    assert!(start + symbol_size <= dest.len());
     unsafe {
-        bytes.set_len(symbols * symbol_size);
+        core::ptr::copy_nonoverlapping(
+            src.as_ptr(),
+            dest.as_mut_ptr().cast::<u8>().add(start),
+            symbol_size,
+        );
+    }
+}
+
+#[cfg(feature = "std")]
+fn initialized_hybrid_decoded_symbols<F>(
+    width: usize,
+    symbol_size: usize,
+    free_cols: &[usize],
+    free_values: &SymbolSlab,
+    pivots: &[(usize, usize)],
+    mut copy_pivot_symbol: F,
+) -> SymbolSlab
+where
+    F: FnMut(&mut [MaybeUninit<u8>], usize, usize),
+{
+    let mut bytes = Vec::with_capacity(width * symbol_size);
+    let spare = bytes.spare_capacity_mut();
+
+    #[cfg(debug_assertions)]
+    let mut initialized = vec![false; width];
+
+    for (free_index, &col) in free_cols.iter().enumerate() {
+        copy_symbol_to_uninit(spare, col, symbol_size, free_values.get(free_index));
+        #[cfg(debug_assertions)]
+        {
+            assert!(!initialized[col], "decoded symbol initialized twice");
+            initialized[col] = true;
+        }
+    }
+    for &(col, pivot) in pivots {
+        copy_pivot_symbol(spare, col, pivot);
+        #[cfg(debug_assertions)]
+        {
+            assert!(!initialized[col], "decoded symbol initialized twice");
+            initialized[col] = true;
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    assert!(
+        initialized.iter().all(|&is_initialized| is_initialized),
+        "cached hybrid plan must initialize every decoded symbol"
+    );
+
+    unsafe {
+        bytes.set_len(width * symbol_size);
     }
     SymbolSlab::from_bytes(bytes, symbol_size)
 }
@@ -4768,6 +4828,11 @@ fn use_in_place_hybrid_replay(width: usize) -> bool {
 }
 
 #[cfg(feature = "std")]
+fn use_binary_slab_output_transfer(width: usize) -> bool {
+    (BINARY_SLAB_OUTPUT_TRANSFER_MIN_WIDTH..LARGE_IN_PLACE_HYBRID_REPLAY_MIN_WIDTH).contains(&width)
+}
+
+#[cfg(feature = "std")]
 fn apply_cached_hybrid_systematic_plan_with_binary_slab(
     plan: &CachedHybridSystematicPlan,
     symbols: &mut SymbolSlab,
@@ -4821,17 +4886,14 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
             .expect("cached hybrid systematic free-column solve failed")
     };
 
-    let mut decoded = symbol_slab_with_uninit(plan.width, symbol_size);
-    for (free_index, &col) in plan.free_cols.iter().enumerate() {
-        decoded
-            .get_mut(col)
-            .copy_from_slice(free_values.get(free_index));
-    }
-    for &(col, pivot) in plan.pivots.iter() {
-        decoded
-            .get_mut(col)
-            .copy_from_slice(binary_symbols.get(pivot));
-    }
+    let mut decoded = initialized_hybrid_decoded_symbols(
+        plan.width,
+        symbol_size,
+        &plan.free_cols,
+        &free_values,
+        &plan.pivots,
+        |dest, col, pivot| copy_symbol_to_uninit(dest, col, symbol_size, binary_symbols.get(pivot)),
+    );
     for src in (0..plan.width).rev() {
         fused_addassign_cached_binary_symbol_batch(
             &mut decoded,
@@ -4841,7 +4903,11 @@ fn apply_cached_hybrid_systematic_plan_with_binary_slab(
         );
     }
 
-    symbols.copy_block_from(0, decoded.as_bytes());
+    if use_binary_slab_output_transfer(plan.width) {
+        *symbols = decoded;
+    } else {
+        symbols.copy_block_from(0, decoded.as_bytes());
+    }
 }
 
 #[cfg(feature = "std")]
@@ -4863,6 +4929,7 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
     assert_eq!(symbols.len(), plan.width);
 
     let symbol_size = symbols.symbol_size();
+    let use_large_output_transfer = plan.width >= LARGE_IN_PLACE_HYBRID_REPLAY_MIN_WIDTH;
     let add_assign_path = AddAssignFastPath::new(symbol_size);
     let fused_mul_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
     for (step_index, &(_, pivot)) in plan.pivots.iter().enumerate() {
@@ -4923,16 +4990,17 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
         return true;
     }
 
-    let mut decoded = symbol_slab_with_uninit(plan.width, symbol_size);
-    for (free_index, &col) in plan.free_cols.iter().enumerate() {
-        decoded
-            .get_mut(col)
-            .copy_from_slice(free_values.get(free_index));
-    }
-    for &(col, pivot) in plan.pivots.iter() {
-        let pivot = mapped_binary_symbol_row(pivot, plan.s, plan.h);
-        decoded.get_mut(col).copy_from_slice(symbols.get(pivot));
-    }
+    let mut decoded = initialized_hybrid_decoded_symbols(
+        plan.width,
+        symbol_size,
+        &plan.free_cols,
+        &free_values,
+        &plan.pivots,
+        |dest, col, pivot| {
+            let pivot = mapped_binary_symbol_row(pivot, plan.s, plan.h);
+            copy_symbol_to_uninit(dest, col, symbol_size, symbols.get(pivot));
+        },
+    );
     for src in (0..plan.width).rev() {
         fused_addassign_cached_binary_symbol_batch(
             &mut decoded,
@@ -4942,7 +5010,11 @@ fn try_apply_cached_hybrid_systematic_plan_in_place(
         );
     }
 
-    symbols.copy_block_from(0, decoded.as_bytes());
+    if use_large_output_transfer {
+        *symbols = decoded;
+    } else {
+        symbols.copy_block_from(0, decoded.as_bytes());
+    }
     true
 }
 
@@ -11177,13 +11249,26 @@ mod tests {
     }
 
     #[test]
-    fn in_place_hybrid_replay_is_limited_to_mid_width_500_symbol_band() {
+    fn in_place_hybrid_replay_covers_mid_and_large_symbol_bands() {
         let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
 
         assert!(!use_in_place_hybrid_replay(width_for(250)));
         assert!(use_in_place_hybrid_replay(width_for(500)));
         assert!(!use_in_place_hybrid_replay(width_for(1000)));
         assert!(!use_in_place_hybrid_replay(width_for(2000)));
+        assert!(!use_in_place_hybrid_replay(width_for(10_000)));
+        assert!(!use_in_place_hybrid_replay(width_for(20_000)));
+        assert!(use_in_place_hybrid_replay(width_for(50_000)));
+    }
+
+    #[test]
+    fn binary_slab_output_transfer_covers_10k_and_20k_bands() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert!(!use_binary_slab_output_transfer(width_for(5_000)));
+        assert!(use_binary_slab_output_transfer(width_for(10_000)));
+        assert!(use_binary_slab_output_transfer(width_for(20_000)));
+        assert!(!use_binary_slab_output_transfer(width_for(50_000)));
     }
 
     #[test]
