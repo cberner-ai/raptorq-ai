@@ -148,6 +148,7 @@ const OVERDETERMINED_NO_HDPC_PREFIX_BACKSUB_BATCH4_MAX_WIDTH: usize = 32_768;
 const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MIN_WIDTH: usize = 5_000;
 const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_MAX_WIDTH: usize = HYBRID_MAX_WIDTH + 1;
 const OVERDETERMINED_NO_HDPC_PREFIX_SHORT_EXTRA_ROWS: usize = 4;
+const OVERDETERMINED_BORROW_SUFFIX_MAX_WIDTH: usize = 32_768;
 const OVERDETERMINED_SMALL_ROW_HINT_MIN_WIDTH: usize = 2_000;
 const OVERDETERMINED_SMALL_ROW_HINT_LOW_MAX_WIDTH: usize = 10_000;
 const OVERDETERMINED_SMALL_ROW_HINT_HIGH_MIN_WIDTH: usize = 20_000;
@@ -5326,30 +5327,47 @@ fn try_overdetermined_no_hdpc_prefix_solve_owned<M: BinaryMatrix>(
         return OverdeterminedNoHdpcPrefixSolve::Fallback(symbols);
     }
     let symbol_size = symbols.symbol_size();
-    let mut prefix_bytes = symbols.into_bytes();
-    let suffix_bytes = prefix_bytes.split_off(prefix_height * symbol_size);
-    let prefix_symbols = SymbolSlab::from_bytes(prefix_bytes, symbol_size);
-    let (decoded, suffix_bytes) = match solve_full_rank_binary_prefix_owned(
-        matrix,
-        prefix_height,
-        prefix_symbols,
-        suffix_bytes,
-        symbol_size,
-    ) {
-        FullRankBinaryPrefixSolve::Decoded {
-            decoded,
-            suffix_bytes,
-        } => (decoded, suffix_bytes),
-        FullRankBinaryPrefixSolve::RankDeficient { restored_symbols } => {
-            return OverdeterminedNoHdpcPrefixSolve::Fallback(restored_symbols);
+    let width = matrix.width();
+    let (decoded, received_symbols) = if width <= OVERDETERMINED_BORROW_SUFFIX_MAX_WIDTH {
+        match solve_full_rank_binary_prefix_owned(matrix, prefix_height, symbols, symbol_size) {
+            FullRankBinaryPrefixSolve::Decoded {
+                decoded,
+                received_symbols,
+            } => (decoded, received_symbols),
+            FullRankBinaryPrefixSolve::RankDeficient { restored_symbols } => {
+                return OverdeterminedNoHdpcPrefixSolve::Fallback(restored_symbols);
+            }
+            FullRankBinaryPrefixSolve::Failed => return OverdeterminedNoHdpcPrefixSolve::Failed,
         }
-        FullRankBinaryPrefixSolve::Failed => return OverdeterminedNoHdpcPrefixSolve::Failed,
+    } else {
+        let mut prefix_bytes = symbols.into_bytes();
+        let suffix_bytes = prefix_bytes.split_off(prefix_height * symbol_size);
+        let prefix_symbols = SymbolSlab::from_bytes(prefix_bytes, symbol_size);
+        let decoded = match solve_full_rank_binary_prefix_owned(
+            matrix,
+            prefix_height,
+            prefix_symbols,
+            symbol_size,
+        ) {
+            FullRankBinaryPrefixSolve::Decoded { decoded, .. } => decoded,
+            FullRankBinaryPrefixSolve::RankDeficient { restored_symbols } => {
+                let mut bytes = restored_symbols.into_bytes();
+                bytes.extend_from_slice(&suffix_bytes);
+                return OverdeterminedNoHdpcPrefixSolve::Fallback(SymbolSlab::from_bytes(
+                    bytes,
+                    symbol_size,
+                ));
+            }
+            FullRankBinaryPrefixSolve::Failed => {
+                return OverdeterminedNoHdpcPrefixSolve::Failed;
+            }
+        };
+        (decoded, SymbolSlab::from_bytes(suffix_bytes, symbol_size))
     };
     let Some(decoded) = verify_no_hdpc_solution(decoded, source_block_symbols, true) else {
         return OverdeterminedNoHdpcPrefixSolve::Failed;
     };
-    let suffix_symbols = SymbolSlab::from_bytes(suffix_bytes, symbol_size);
-    if binary_row_suffixes_satisfied(matrix, &decoded, &suffix_symbols, prefix_height) {
+    if binary_row_suffixes_satisfied(matrix, &decoded, &received_symbols, prefix_height) {
         OverdeterminedNoHdpcPrefixSolve::Decoded(decoded)
     } else {
         OverdeterminedNoHdpcPrefixSolve::Failed
@@ -5359,7 +5377,7 @@ fn try_overdetermined_no_hdpc_prefix_solve_owned<M: BinaryMatrix>(
 enum FullRankBinaryPrefixSolve {
     Decoded {
         decoded: SymbolSlab,
-        suffix_bytes: Vec<u8>,
+        received_symbols: SymbolSlab,
     },
     RankDeficient {
         restored_symbols: SymbolSlab,
@@ -5371,10 +5389,10 @@ fn solve_full_rank_binary_prefix_owned<M: BinaryMatrix>(
     matrix: &M,
     prefix_height: usize,
     mut symbols: SymbolSlab,
-    suffix_bytes: Vec<u8>,
     symbol_size: usize,
 ) -> FullRankBinaryPrefixSolve {
     let width = matrix.width();
+    debug_assert!(symbols.len() >= prefix_height);
     let use_weighted_buckets = width >= OVERDETERMINED_NO_HDPC_PREFIX_METADATA_MIN_WIDTH;
     let (mut rows, mut row_weights, first_ones) = if use_weighted_buckets {
         matrix.packed_row_prefix_with_row_weights_and_first_ones(prefix_height)
@@ -5442,10 +5460,8 @@ fn solve_full_rank_binary_prefix_owned<M: BinaryMatrix>(
                 &forward_entries,
                 add_assign_path,
             );
-            let mut bytes = symbols.into_bytes();
-            bytes.extend_from_slice(&suffix_bytes);
             return FullRankBinaryPrefixSolve::RankDeficient {
-                restored_symbols: SymbolSlab::from_bytes(bytes, symbol_size),
+                restored_symbols: symbols,
             };
         };
         pivot_for_col[col] = pivot;
@@ -5561,7 +5577,7 @@ fn solve_full_rank_binary_prefix_owned<M: BinaryMatrix>(
 
     FullRankBinaryPrefixSolve::Decoded {
         decoded,
-        suffix_bytes,
+        received_symbols: symbols,
     }
 }
 
@@ -5615,16 +5631,22 @@ fn try_overdetermined_no_hdpc_prefix_solve<M: BinaryMatrix>(
 fn binary_row_suffixes_satisfied<M: BinaryMatrix>(
     matrix: &M,
     decoded: &SymbolSlab,
-    suffix_symbols: &SymbolSlab,
+    row_symbols: &SymbolSlab,
     start_row: usize,
 ) -> bool {
     debug_assert_eq!(matrix.width(), decoded.len());
-    debug_assert_eq!(matrix.height() - start_row, suffix_symbols.len());
+    let suffix_len = matrix.height() - start_row;
+    debug_assert!(row_symbols.len() == suffix_len || row_symbols.len() >= matrix.height());
+    let row_symbol_offset = if row_symbols.len() == suffix_len {
+        start_row
+    } else {
+        0
+    };
     let mut check = vec![0u8; decoded.symbol_size()];
     let add_assign_path = AddAssignFastPath::new(decoded.symbol_size());
     let use_trusted_sources = decoded.len() >= TRUSTED_SUFFIX_VERIFY_MIN_WIDTH;
     for row in start_row..matrix.height() {
-        let expected = suffix_symbols.get(row - start_row);
+        let expected = row_symbols.get(row - row_symbol_offset);
         if let Some(entries) = matrix.row_entries_unordered_slice(row)
             && let Some(satisfied) = small_binary_row_entries_satisfied(entries, decoded, expected)
         {
