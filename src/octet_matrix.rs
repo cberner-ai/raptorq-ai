@@ -109,6 +109,35 @@ impl DenseOctetMatrix {
         self.width
     }
 
+    pub(crate) fn into_shared_if_large(self) -> DenseOctetMatrix {
+        #[cfg(feature = "std")]
+        {
+            let DenseOctetMatrix {
+                height,
+                width,
+                data,
+            } = self;
+            let data = match data {
+                DenseOctetMatrixData::Owned(data)
+                    if data.len() >= SHARED_DENSE_OCTET_MATRIX_MIN_LEN =>
+                {
+                    DenseOctetMatrixData::Shared(Arc::from(data.into_boxed_slice()))
+                }
+                data => data,
+            };
+            DenseOctetMatrix {
+                height,
+                width,
+                data,
+            }
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            self
+        }
+    }
+
     pub(crate) fn row(&self, row: usize) -> &[Octet] {
         assert!(row < self.height);
         let start = row * self.width;
@@ -304,6 +333,21 @@ mod tests {
 
         cloned.set(0, width - 1, Octet::new(9));
         assert_ne!(original, cloned);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn large_matrix_can_be_shared_before_repeated_clones() {
+        let width = SHARED_DENSE_OCTET_MATRIX_MIN_LEN + 1;
+        let mut original = DenseOctetMatrix::new(1, width);
+        original.set(0, width - 1, Octet::new(7));
+
+        let shared = original.into_shared_if_large();
+        let mut cloned = shared.clone();
+        cloned.set(0, width - 1, Octet::new(9));
+
+        assert_eq!(shared.get(0, width - 1), Octet::new(7));
+        assert_eq!(cloned.get(0, width - 1), Octet::new(9));
     }
 
     #[cfg(feature = "serde_support")]

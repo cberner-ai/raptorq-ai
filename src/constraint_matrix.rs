@@ -341,7 +341,7 @@ pub(crate) fn generate_hdpc_rows(source_block_symbols: u32) -> DenseOctetMatrix 
             }
         }
 
-        let generated = generate_hdpc_rows_uncached(k_prime);
+        let generated = generate_hdpc_rows_uncached(k_prime).into_shared_if_large();
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());

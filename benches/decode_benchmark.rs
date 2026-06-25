@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 const TARGET_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 const SYMBOL_COUNTS: [usize; 10] = [10, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000];
 const CI_TARGET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const LARGE_SYMBOL_COUNTS: [usize; 3] = [10000, 20000, 50000];
 
 fn black_box(value: u64) {
     if value == rand::rng().random() {
@@ -17,6 +18,10 @@ fn black_box(value: u64) {
 
 fn ci_mode_enabled() -> bool {
     std::env::args().any(|arg| arg == "--ci")
+}
+
+fn large_only_mode_enabled() -> bool {
+    std::env::args().any(|arg| arg == "--large-only")
 }
 
 fn elapsed_seconds(elapsed: Duration) -> f64 {
@@ -71,6 +76,9 @@ fn main() {
     let (target_total_bytes, symbol_counts) = if ci_mode_enabled() {
         println!("Running CI benchmark subset");
         (CI_TARGET_TOTAL_BYTES, CI_SYMBOL_COUNTS.as_slice())
+    } else if large_only_mode_enabled() {
+        println!("Running large-symbol benchmark subset");
+        (TARGET_TOTAL_BYTES, LARGE_SYMBOL_COUNTS.as_slice())
     } else {
         (TARGET_TOTAL_BYTES, SYMBOL_COUNTS.as_slice())
     };
