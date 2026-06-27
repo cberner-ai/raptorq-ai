@@ -52,6 +52,8 @@ const CACHED_SYSTEMATIC_PLAN_RECORDING_MIN_WIDTH: usize = 128;
 const CACHED_SYSTEMATIC_PLAN_RECORDING_MIN_WIDTH: usize = MAX_INLINE_RECORDED_SOLVER_WIDTH + 1;
 #[cfg(feature = "std")]
 const SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT: usize = 96;
+#[cfg(feature = "std")]
+const TRUSTED_DIRECT_SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT: usize = 32;
 const LIGHTEST_PIVOT_MIN_WIDTH: usize = 64;
 const COEFFICIENT_BUCKET_SOLVER_MIN_WIDTH: usize = 512;
 const SPARSE_SOURCE_MERGE_DEST_FACTOR: usize = 3;
@@ -1964,8 +1966,13 @@ fn prepare_direct_systematic_plan_with_small_weight_max<
     let mut is_pivot_row = vec![false; binary_height];
     let mut forward_steps = Vec::with_capacity(width);
     let mut forward_ranges = Vec::with_capacity(width);
+    let forward_entries_per_col_hint = if trust_source_batch_bounds {
+        TRUSTED_DIRECT_SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT
+    } else {
+        SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT
+    };
     let mut forward_entries = if use_weighted_buckets {
-        Vec::with_capacity(width.saturating_mul(SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT))
+        Vec::with_capacity(width.saturating_mul(forward_entries_per_col_hint))
     } else {
         Vec::new()
     };
@@ -11320,6 +11327,15 @@ mod tests {
         assert!(width_for(20_000) >= WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
         assert!(width_for(20_000) < HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
         assert!(width_for(50_000) >= HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH);
+    }
+
+    #[test]
+    fn trusted_direct_systematic_plan_uses_narrower_forward_reserve() {
+        assert_eq!(SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT, 96);
+        assert_eq!(
+            TRUSTED_DIRECT_SYSTEMATIC_PLAN_FORWARD_DESTS_PER_COL_HINT,
+            32
+        );
     }
 
     #[test]
