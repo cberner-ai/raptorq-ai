@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 const REPLAY_BATCH_FAST_PATH_MIN_SYMBOLS: usize = 500;
 const REPLAY_BATCH_FAST_PATH_MIN_DESTS_FOR_LARGE_SYMBOLS: usize = 2;
 const REPLAY_BATCH_FAST_PATH_LARGE_SYMBOLS: usize = 20_000;
-const REPLAY_BATCH_FAST_PATH_MAX_SYMBOLS: usize = 32_768;
+const REPLAY_BATCH_FAST_PATH_MAX_SYMBOLS: usize = u16::MAX as usize;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
@@ -263,6 +263,6 @@ mod tests {
         assert!(use_replay_batch_fast_paths(1_000, 2));
         assert!(use_replay_batch_fast_paths(5_000, 2));
         assert!(use_replay_batch_fast_paths(20_000, 2));
-        assert!(!use_replay_batch_fast_paths(50_000, 4));
+        assert!(use_replay_batch_fast_paths(50_000, 4));
     }
 }
