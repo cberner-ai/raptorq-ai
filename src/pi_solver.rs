@@ -105,7 +105,7 @@ const DIRECT_FORWARD_NO_ZERO_CHECK_MIN_WIDTH: usize = 10_000;
 #[cfg(feature = "std")]
 const DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
-const DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MAX_WIDTH: usize = 20_000;
+const DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MAX_WIDTH: usize = 21_000;
 #[cfg(feature = "std")]
 const DIRECT_DECODE_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH: usize = 5_000;
 #[cfg(feature = "std")]
@@ -11901,7 +11901,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_collect_source_batches_cover_5k_trusted_encode_band() {
+    fn direct_collect_source_batches_cover_5k_to_20k_trusted_encode_band() {
         let h = 10;
         let max_supported_width = HYBRID_MAX_WIDTH;
         let square_binary_height = max_supported_width - h;
@@ -11949,6 +11949,14 @@ mod tests {
             DirectBackSubstitutionLayout::SourcesByDest,
             true,
         ));
+        assert!(
+            (num_intermediate_symbols(20_000) as usize)
+                < DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MAX_WIDTH
+        );
+        assert!(
+            (num_intermediate_symbols(50_000) as usize)
+                > DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MAX_WIDTH
+        );
 
         let decode_width = DIRECT_DECODE_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH;
         assert!(decode_width <= DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH);
