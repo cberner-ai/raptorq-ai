@@ -177,7 +177,7 @@ const TRUSTED_SUFFIX_VERIFY_MIN_WIDTH: usize = 20_000;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 24;
 const WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH: usize = 20_000;
-const MID_OVERDETERMINED_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 8;
+const MID_OVERDETERMINED_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 4;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 24;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH: usize = 32_768;
@@ -11353,7 +11353,7 @@ mod tests {
     fn high_decode_small_weight_bucket_threshold_only_covers_50k_ci_row() {
         let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
 
-        assert_eq!(MID_OVERDETERMINED_SMALL_WEIGHT_BINARY_BUCKET_MAX, 8);
+        assert_eq!(MID_OVERDETERMINED_SMALL_WEIGHT_BINARY_BUCKET_MAX, 4);
         assert_eq!(DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 16);
         assert_eq!(HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 24);
         assert_eq!(PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX, 31);
