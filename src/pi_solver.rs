@@ -7089,10 +7089,24 @@ fn dense_hdpc_coefficient_values_column_major_padded(
     stride: usize,
 ) -> Vec<u8> {
     debug_assert!(matrix.height() <= stride);
-    let mut coefficients = vec![0u8; matrix.width() * stride];
-    for row in 0..matrix.height() {
-        for (col, coefficient) in matrix.row(row).iter().enumerate() {
-            coefficients[col * stride + row] = coefficient.value();
+    let height = matrix.height();
+    let width = matrix.width();
+    let mut coefficients = vec![0u8; width * stride];
+    if (DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MIN_WIDTH..DIRECT_SOURCE_BATCH_DIRECT_COLLECT_MAX_WIDTH)
+        .contains(&width)
+    {
+        let matrix_values = matrix.as_slice();
+        for col in 0..width {
+            let coefficient_col = &mut coefficients[col * stride..col * stride + height];
+            for row in 0..height {
+                coefficient_col[row] = matrix_values[row * width + col].value();
+            }
+        }
+    } else {
+        for row in 0..height {
+            for (col, coefficient) in matrix.row(row).iter().enumerate() {
+                coefficients[col * stride + row] = coefficient.value();
+            }
         }
     }
     coefficients
