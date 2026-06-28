@@ -177,6 +177,7 @@ const TRUSTED_SUFFIX_VERIFY_MIN_WIDTH: usize = 20_000;
 const PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 31;
 const WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 24;
 const WIDE_PLAN_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH: usize = 20_000;
+const MID_OVERDETERMINED_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 8;
 const DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 16;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX: usize = 24;
 const HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH: usize = 32_768;
@@ -5395,6 +5396,28 @@ enum FullRankBinaryPrefixSolve {
 fn solve_full_rank_binary_prefix_owned<M: BinaryMatrix>(
     matrix: &M,
     prefix_height: usize,
+    symbols: SymbolSlab,
+    symbol_size: usize,
+) -> FullRankBinaryPrefixSolve {
+    if matrix.width() >= HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MIN_WIDTH {
+        solve_full_rank_binary_prefix_owned_with_small_weight_max::<
+            DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+            M,
+        >(matrix, prefix_height, symbols, symbol_size)
+    } else {
+        solve_full_rank_binary_prefix_owned_with_small_weight_max::<
+            MID_OVERDETERMINED_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+            M,
+        >(matrix, prefix_height, symbols, symbol_size)
+    }
+}
+
+fn solve_full_rank_binary_prefix_owned_with_small_weight_max<
+    const SMALL_WEIGHT_MAX: usize,
+    M: BinaryMatrix,
+>(
+    matrix: &M,
+    prefix_height: usize,
     mut symbols: SymbolSlab,
     symbol_size: usize,
 ) -> FullRankBinaryPrefixSolve {
@@ -5413,15 +5436,14 @@ fn solve_full_rank_binary_prefix_owned<M: BinaryMatrix>(
     let mut bucket_heads = vec![NO_BUCKET_ROW; width];
     let mut small_weight_buckets = SmallWeightBinaryBuckets::<u16>::new(
         if use_weighted_buckets { width } else { 0 },
-        DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
+        SMALL_WEIGHT_MAX,
     );
-    let mut small_row_cache = SmallBinaryRowCache::<DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX>::new(
-        if use_weighted_buckets {
+    let mut small_row_cache =
+        SmallBinaryRowCache::<SMALL_WEIGHT_MAX>::new(if use_weighted_buckets {
             prefix_height
         } else {
             0
-        },
-    );
+        });
     let mut next_in_bucket = vec![NO_BUCKET_ROW; prefix_height];
     for (row, first_one) in first_ones.into_iter().enumerate() {
         if let Some(col) = first_one {
@@ -5494,9 +5516,7 @@ fn solve_full_rank_binary_prefix_owned<M: BinaryMatrix>(
             pop_row_bucket(&mut bucket_heads, &mut next_in_bucket, col)
         } {
             if use_weighted_buckets {
-                let next_col = eliminate_weighted_binary_row_with_small_row_hint::<
-                    DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX,
-                >(
+                let next_col = eliminate_weighted_binary_row_with_small_row_hint::<SMALL_WEIGHT_MAX>(
                     &mut rows,
                     &mut row_weights,
                     &mut small_row_cache,
@@ -11319,6 +11339,7 @@ mod tests {
     fn high_decode_small_weight_bucket_threshold_only_covers_50k_ci_row() {
         let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
 
+        assert_eq!(MID_OVERDETERMINED_SMALL_WEIGHT_BINARY_BUCKET_MAX, 8);
         assert_eq!(DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 16);
         assert_eq!(HIGH_DECODE_SMALL_WEIGHT_BINARY_BUCKET_MAX, 24);
         assert_eq!(PLAN_SMALL_WEIGHT_BINARY_BUCKET_MAX, 31);
