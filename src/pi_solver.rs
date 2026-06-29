@@ -116,6 +116,8 @@ const CACHED_HDPC_FREE_SOLVE_MAX_WIDTH: usize = 10_000;
 const DIRECT_CACHED_HDPC_FREE_SOLVE_MAX_WIDTH: usize = HYBRID_MAX_WIDTH;
 #[cfg(feature = "std")]
 const DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 128;
+#[cfg(feature = "std")]
+const DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH: usize = 10_000;
 #[cfg(all(feature = "std", not(test)))]
 const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH;
 #[cfg(all(feature = "std", test))]
@@ -2719,6 +2721,23 @@ fn try_apply_prepared_direct_systematic_plan(
                 update_slice,
                 add_assign_path,
             );
+        } else if plan.trust_source_batch_bounds
+            && plan.width >= DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH
+            && update_slice.len() > 1
+        {
+            let mut coefficients = [0u8; 16];
+            for &(row, factor) in update_slice {
+                coefficients[coefficient_col_index(row)] = factor.value();
+            }
+            unsafe {
+                fused_mul_path.apply_column_coefficients(
+                    hdpc_symbols.as_mut_bytes().as_mut_ptr(),
+                    symbol_size,
+                    pivot_symbol.as_ptr(),
+                    &coefficients[..plan.h],
+                    symbol_size,
+                );
+            }
         } else {
             for &(row, factor) in update_slice {
                 fused_mul_path.apply_nonzero(
@@ -11527,6 +11546,16 @@ mod tests {
         assert!(use_direct_decode_forward_no_zero_check(width_for(2_000)));
         assert!(use_direct_decode_forward_no_zero_check(width_for(5_000)));
         assert!(use_direct_decode_forward_no_zero_check(width_for(10_000)));
+    }
+
+    #[test]
+    fn direct_hdpc_column_update_starts_at_10k_encode_row() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert!(width_for(5_000) < DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH);
+        assert!(width_for(10_000) >= DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH);
+        assert!(width_for(20_000) >= DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH);
+        assert!(width_for(50_000) >= DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH);
     }
 
     #[test]
