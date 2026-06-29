@@ -11561,6 +11561,81 @@ mod tests {
         assert_eq!(DIRECT_HDPC_COLUMN_UPDATE_MIN_ROWS, 4);
     }
 
+    fn hdpc_column_update_test_plan(trust_source_batch_bounds: bool) -> DirectSystematicPlan {
+        let h = 4;
+        DirectSystematicPlan {
+            forward_steps: Vec::new(),
+            forward_dests: DirectSystematicSlices {
+                ranges: Vec::new(),
+                entries: Vec::new(),
+            },
+            hdpc_update_pivots: vec![coefficient_col(h)].into_boxed_slice(),
+            hdpc_updates: CachedSystematicSlices {
+                ranges: vec![(0, h)],
+                entries: vec![
+                    (coefficient_col(0), Octet::new(2)),
+                    (coefficient_col(1), Octet::new(7)),
+                    (coefficient_col(2), Octet::new(19)),
+                    (coefficient_col(3), Octet::new(53)),
+                ],
+                unit_only: vec![false],
+            },
+            hdpc_free_rows: (0..h).map(|_| Vec::new().into_boxed_slice()).collect(),
+            hdpc_free_solve: None,
+            free_cols: Vec::new().into_boxed_slice(),
+            pivot_symbol_moves: Vec::new(),
+            back_substitution: DirectSystematicBackSubstitution::SourcesByDest {
+                slices: DirectSystematicSlices {
+                    ranges: Vec::new(),
+                    entries: Vec::new(),
+                },
+                non_empty_dests: Vec::new().into_boxed_slice(),
+            },
+            trust_source_batch_bounds,
+            width: DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH,
+            s: 0,
+            h,
+        }
+    }
+
+    #[test]
+    fn direct_hdpc_column_update_matches_per_row_fallback() {
+        let trusted_plan = hdpc_column_update_test_plan(true);
+        let fallback_plan = hdpc_column_update_test_plan(false);
+        let symbol_size = 5;
+        let pivot_symbol = [0x31, 0x42, 0x53, 0x64, 0x75];
+        let mut symbols = SymbolSlab::with_zeros(trusted_plan.width, symbol_size);
+
+        symbols
+            .get_mut(trusted_plan.h)
+            .copy_from_slice(&pivot_symbol);
+        for &(row, factor) in trusted_plan.hdpc_updates.slice(0) {
+            let symbol = symbols.get_mut(coefficient_col_index(row));
+            for (dest, &source) in symbol.iter_mut().zip(&pivot_symbol) {
+                *dest = (factor * Octet::new(source)).value();
+            }
+        }
+
+        assert!(trusted_plan.trust_source_batch_bounds);
+        assert!(trusted_plan.width >= DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH);
+        assert!(trusted_plan.hdpc_updates.slice(0).len() >= DIRECT_HDPC_COLUMN_UPDATE_MIN_ROWS);
+        assert!(!trusted_plan.hdpc_updates.is_unit_only(0));
+
+        let mut trusted = symbols.clone();
+        assert!(try_apply_prepared_direct_systematic_plan(
+            &trusted_plan,
+            &mut trusted
+        ));
+
+        let mut fallback = symbols;
+        assert!(try_apply_prepared_direct_systematic_plan(
+            &fallback_plan,
+            &mut fallback
+        ));
+
+        assert_eq!(trusted, fallback);
+    }
+
     #[test]
     fn large_systematic_plan_uses_hybrid_direct_systematic_solve() {
         let source_symbols = 4_000;
