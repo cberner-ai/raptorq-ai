@@ -754,6 +754,7 @@ impl PackedBinaryRows {
     }
 }
 
+#[inline]
 fn read_le_bits(bytes: &[u8], start_bit: usize, valid_bits: usize) -> u64 {
     debug_assert!((1..=u64::BITS as usize).contains(&valid_bits));
     debug_assert!(start_bit + valid_bits <= bytes.len() * u8::BITS as usize);
@@ -761,17 +762,32 @@ fn read_le_bits(bytes: &[u8], start_bit: usize, valid_bits: usize) -> u64 {
     let byte_start = start_bit / u8::BITS as usize;
     let bit_offset = start_bit % u8::BITS as usize;
     let byte_len = (bit_offset + valid_bits).div_ceil(u8::BITS as usize);
-    let mut bits = 0u128;
-    for (offset, &byte) in bytes[byte_start..byte_start + byte_len].iter().enumerate() {
-        bits |= (byte as u128) << (offset * u8::BITS as usize);
+    let byte_window = &bytes[byte_start..byte_start + byte_len];
+
+    let bits = if byte_window.len() >= 8 {
+        u64::from_le_bytes(byte_window[..8].try_into().expect("slice length is 8"))
+    } else {
+        let mut bits = 0u64;
+        for (offset, &byte) in byte_window.iter().enumerate() {
+            bits |= (byte as u64) << (offset * u8::BITS as usize);
+        }
+        bits
+    };
+
+    let mut shifted = bits >> bit_offset;
+    if bit_offset != 0 && byte_window.len() > 8 {
+        shifted |= (byte_window[8] as u64) << (u64::BITS as usize - bit_offset);
     }
-    let shifted = bits >> bit_offset;
-    let mask = if valid_bits == u64::BITS as usize {
+    shifted & valid_bit_mask(valid_bits)
+}
+
+#[inline]
+fn valid_bit_mask(valid_bits: usize) -> u64 {
+    if valid_bits == u64::BITS as usize {
         u64::MAX
     } else {
         (1u64 << valid_bits) - 1
-    };
-    (shifted as u64) & mask
+    }
 }
 
 fn fill_sparse_entry_metadata_chunk(
@@ -1069,5 +1085,36 @@ mod tests {
         assert!(packed.contains(1, 3));
         assert!(packed.contains(1, 95));
         assert!(!packed.contains(0, 95));
+    }
+
+    #[test]
+    fn read_le_bits_matches_reference_across_byte_offsets() {
+        let bytes = (0u8..96)
+            .map(|byte| byte.wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+
+        for start_bit in 0..256 {
+            for valid_bits in 1..=u64::BITS as usize {
+                let actual = read_le_bits(&bytes, start_bit, valid_bits);
+                let expected = read_le_bits_reference(&bytes, start_bit, valid_bits);
+                assert_eq!(
+                    actual, expected,
+                    "start_bit={start_bit}, valid_bits={valid_bits}"
+                );
+            }
+        }
+    }
+
+    fn read_le_bits_reference(bytes: &[u8], start_bit: usize, valid_bits: usize) -> u64 {
+        let mut bits = 0u64;
+        for bit in 0..valid_bits {
+            let source_bit = start_bit + bit;
+            let byte = bytes[source_bit / u8::BITS as usize];
+            let mask = 1u8 << (source_bit % u8::BITS as usize);
+            if byte & mask != 0 {
+                bits |= 1u64 << bit;
+            }
+        }
+        bits
     }
 }
