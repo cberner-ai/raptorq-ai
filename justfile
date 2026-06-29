@@ -24,7 +24,8 @@ profile:
     RUSTFLAGS='-Cforce-frame-pointers' cargo bench --no-run --features benchmarking
 
 fuzz:
-    cargo fuzz run --sanitizer=none --release fuzz_raptorq
+    mkdir -p fuzz/corpus/fuzz_raptorq
+    cargo fuzz run --sanitizer=none --release fuzz_raptorq fuzz/corpus/fuzz_raptorq fuzz/seeds/fuzz_raptorq
 
 build_py: pre
     maturin build
