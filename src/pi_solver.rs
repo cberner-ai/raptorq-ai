@@ -161,6 +161,7 @@ const OVERDETERMINED_SMALL_ROW_HINT_HIGH_MIN_WIDTH: usize = 20_000;
 const OVERDETERMINED_SMALL_ROW_HINT_HIGH_MAX_WIDTH: usize = 32_768;
 const SUFFIX_VERIFY_PENDING_COMPARE_MIN_WIDTH: usize = 5_000;
 const SUFFIX_VERIFY_PENDING_COMPARE_MAX_WIDTH: usize = 32_768;
+const SHORT_SUFFIX_DIRECT_CHECK_MAX_WIDTH: usize = 16_384;
 const COLUMN_MAJOR_HDPC_VERIFY_MIN_WIDTH: usize = 256;
 #[cfg(feature = "std")]
 const HDPC_VERIFY_ROW_PAIRS_CACHE_CAPACITY: usize = 16;
@@ -5744,6 +5745,15 @@ fn small_binary_row_entries_satisfied(
     decoded: &SymbolSlab,
     expected: &[u8],
 ) -> Option<bool> {
+    macro_rules! direct_xor_check {
+        ($($col:ident),+ $(,)?) => {{
+            $(
+                assert!($col < decoded.len());
+            )+
+            Some(xor_slices_are_zero([expected, $(decoded.get($col)),+]))
+        }};
+    }
+
     match *entries {
         [] => Some(symbol_is_zero(expected)),
         [a] => {
@@ -5782,6 +5792,34 @@ fn small_binary_row_entries_satisfied(
                 decoded.get(c),
                 decoded.get(d),
             ]))
+        }
+        [a, b, c, d, e] if decoded.len() <= SHORT_SUFFIX_DIRECT_CHECK_MAX_WIDTH => {
+            direct_xor_check!(a, b, c, d, e)
+        }
+        [a, b, c, d, e, f] if decoded.len() <= SHORT_SUFFIX_DIRECT_CHECK_MAX_WIDTH => {
+            direct_xor_check!(a, b, c, d, e, f)
+        }
+        [a, b, c, d, e, f, g] if decoded.len() <= SHORT_SUFFIX_DIRECT_CHECK_MAX_WIDTH => {
+            direct_xor_check!(a, b, c, d, e, f, g)
+        }
+        [a, b, c, d, e, f, g, h] if decoded.len() <= SHORT_SUFFIX_DIRECT_CHECK_MAX_WIDTH => {
+            direct_xor_check!(a, b, c, d, e, f, g, h)
+        }
+        [a, b, c, d, e, f, g, h, i] if decoded.len() <= SHORT_SUFFIX_DIRECT_CHECK_MAX_WIDTH => {
+            direct_xor_check!(a, b, c, d, e, f, g, h, i)
+        }
+        [a, b, c, d, e, f, g, h, i, j] if decoded.len() <= SHORT_SUFFIX_DIRECT_CHECK_MAX_WIDTH => {
+            direct_xor_check!(a, b, c, d, e, f, g, h, i, j)
+        }
+        [a, b, c, d, e, f, g, h, i, j, k]
+            if decoded.len() <= SHORT_SUFFIX_DIRECT_CHECK_MAX_WIDTH =>
+        {
+            direct_xor_check!(a, b, c, d, e, f, g, h, i, j, k)
+        }
+        [a, b, c, d, e, f, g, h, i, j, k, l]
+            if decoded.len() <= SHORT_SUFFIX_DIRECT_CHECK_MAX_WIDTH =>
+        {
+            direct_xor_check!(a, b, c, d, e, f, g, h, i, j, k, l)
         }
         _ => None,
     }
@@ -10124,7 +10162,7 @@ mod tests {
     #[test]
     fn suffix_verifier_accepts_short_row_direct_checks() {
         let symbol_size = 129;
-        let mut decoded = SymbolSlab::with_zeros(8, symbol_size);
+        let mut decoded = SymbolSlab::with_zeros(12, symbol_size);
         for col in 0..decoded.len() {
             for (offset, byte) in decoded.get_mut(col).iter_mut().enumerate() {
                 *byte = (offset as u8)
@@ -10133,11 +10171,13 @@ mod tests {
             }
         }
 
-        let rows: [&[usize]; 5] = [&[], &[3], &[1, 4], &[0, 2, 6], &[1, 3, 5, 7]];
+        let rows = (0..=12)
+            .map(|len| (0..len).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
         let mut matrix = SparseBinaryMatrix::new(rows.len(), decoded.len());
         let mut suffix_symbols = SymbolSlab::with_zeros(rows.len(), symbol_size);
         for (row, entries) in rows.iter().enumerate() {
-            for &col in *entries {
+            for &col in entries {
                 matrix.set(row, col, true);
                 add_assign(suffix_symbols.get_mut(row), decoded.get(col));
             }
