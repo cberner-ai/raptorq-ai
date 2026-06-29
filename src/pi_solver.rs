@@ -118,6 +118,8 @@ const DIRECT_CACHED_HDPC_FREE_SOLVE_MAX_WIDTH: usize = HYBRID_MAX_WIDTH;
 const DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = 128;
 #[cfg(feature = "std")]
 const DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH: usize = 10_000;
+#[cfg(feature = "std")]
+const DIRECT_HDPC_COLUMN_UPDATE_MIN_ROWS: usize = 4;
 #[cfg(all(feature = "std", not(test)))]
 const SQUARE_HYBRID_DECODE_MIN_WIDTH: usize = DIRECT_SQUARE_HYBRID_DECODE_MIN_WIDTH;
 #[cfg(all(feature = "std", test))]
@@ -2723,7 +2725,7 @@ fn try_apply_prepared_direct_systematic_plan(
             );
         } else if plan.trust_source_batch_bounds
             && plan.width >= DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH
-            && update_slice.len() > 1
+            && update_slice.len() >= DIRECT_HDPC_COLUMN_UPDATE_MIN_ROWS
         {
             let mut coefficients = [0u8; 16];
             for &(row, factor) in update_slice {
@@ -11556,6 +11558,7 @@ mod tests {
         assert!(width_for(10_000) >= DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH);
         assert!(width_for(20_000) >= DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH);
         assert!(width_for(50_000) >= DIRECT_HDPC_COLUMN_UPDATE_MIN_WIDTH);
+        assert_eq!(DIRECT_HDPC_COLUMN_UPDATE_MIN_ROWS, 4);
     }
 
     #[test]
