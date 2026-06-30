@@ -144,6 +144,19 @@ fn fused_addassign_symbol_batch_inner<const REUSE_FAST_PATHS: bool>(
         let add_fast_path = AddAssignFastPath::new(symbol_size);
         let fused_fast_path = FusedAddAssignMulScalarFastPath::new(symbol_size);
 
+        if dests.iter().all(|&(_, scalar)| scalar == Octet::one()) {
+            let replay = UnitReplayBatch {
+                symbol_size,
+                bytes_ptr,
+                bytes_len: bytes.len(),
+                src_ptr,
+                src_symbol,
+                add_fast_path,
+            };
+            addassign_unit_symbol_batch_for_replay(src, dests, replay);
+            return;
+        }
+
         for &(dest, scalar) in dests {
             if scalar.is_zero() {
                 continue;
@@ -183,9 +196,116 @@ fn fused_addassign_symbol_batch_inner<const REUSE_FAST_PATHS: bool>(
     }
 }
 
+#[derive(Clone, Copy)]
+struct UnitReplayBatch<'a> {
+    symbol_size: usize,
+    bytes_ptr: *mut u8,
+    bytes_len: usize,
+    src_ptr: *const u8,
+    src_symbol: &'a [u8],
+    add_fast_path: AddAssignFastPath,
+}
+
+fn addassign_unit_symbol_batch_for_replay(
+    src: usize,
+    dests: &[(usize, Octet)],
+    replay: UnitReplayBatch<'_>,
+) {
+    let mut index = 0;
+
+    while index + 8 <= dests.len() {
+        let chunk = &dests[index..index + 8];
+        if unit_dest_chunk_is_disjoint(src, chunk) {
+            unsafe {
+                replay.add_fast_path.apply_same_len_raw_8(
+                    [
+                        replay.dest_ptr(chunk[0].0),
+                        replay.dest_ptr(chunk[1].0),
+                        replay.dest_ptr(chunk[2].0),
+                        replay.dest_ptr(chunk[3].0),
+                        replay.dest_ptr(chunk[4].0),
+                        replay.dest_ptr(chunk[5].0),
+                        replay.dest_ptr(chunk[6].0),
+                        replay.dest_ptr(chunk[7].0),
+                    ],
+                    replay.src_ptr,
+                    replay.symbol_size,
+                );
+            }
+            index += 8;
+            continue;
+        }
+
+        replay.addassign_one(src, chunk[0].0);
+        index += 1;
+    }
+
+    while index + 4 <= dests.len() {
+        let chunk = &dests[index..index + 4];
+        if unit_dest_chunk_is_disjoint(src, chunk) {
+            unsafe {
+                replay.add_fast_path.apply_same_len_raw_4(
+                    [
+                        replay.dest_ptr(chunk[0].0),
+                        replay.dest_ptr(chunk[1].0),
+                        replay.dest_ptr(chunk[2].0),
+                        replay.dest_ptr(chunk[3].0),
+                    ],
+                    replay.src_ptr,
+                    replay.symbol_size,
+                );
+            }
+            index += 4;
+            continue;
+        }
+
+        replay.addassign_one(src, chunk[0].0);
+        index += 1;
+    }
+
+    for &(dest, scalar) in &dests[index..] {
+        debug_assert_eq!(scalar, Octet::one());
+        replay.addassign_one(src, dest);
+    }
+}
+
+impl UnitReplayBatch<'_> {
+    fn addassign_one(self, src: usize, dest: usize) {
+        assert_ne!(dest, src);
+        unsafe {
+            let dest_symbol =
+                core::slice::from_raw_parts_mut(self.dest_ptr(dest), self.symbol_size);
+            self.add_fast_path
+                .apply_same_len(dest_symbol, self.src_symbol);
+        }
+    }
+
+    fn dest_ptr(self, dest: usize) -> *mut u8 {
+        let dest_start = dest * self.symbol_size;
+        assert!(dest_start + self.symbol_size <= self.bytes_len);
+        unsafe { self.bytes_ptr.add(dest_start) }
+    }
+}
+
+fn unit_dest_chunk_is_disjoint(src: usize, chunk: &[(usize, Octet)]) -> bool {
+    for (offset, &(dest, _)) in chunk.iter().enumerate() {
+        if dest == src {
+            return false;
+        }
+        for &(other_dest, _) in &chunk[..offset] {
+            if dest == other_dest {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
 
     #[test]
     fn unit_add_matches_fused_add_with_one() {
@@ -264,5 +384,77 @@ mod tests {
         assert!(use_replay_batch_fast_paths(5_000, 2));
         assert!(use_replay_batch_fast_paths(20_000, 2));
         assert!(use_replay_batch_fast_paths(50_000, 4));
+    }
+
+    #[test]
+    fn unit_replay_batch_matches_individual_ops() {
+        let mut bytes = vec![0u8; 600 * 64];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let mut batch = SymbolSlab::from_bytes(bytes, 64);
+        let mut individual = batch.clone();
+        let dests = (1..15).map(|dest| (dest, Octet::one())).collect::<Vec<_>>();
+
+        perform_op(
+            &SymbolOps::FusedAddBatch {
+                src: 0,
+                dests: dests.clone().into_boxed_slice(),
+            },
+            &mut batch,
+        );
+        for (dest, scalar) in dests {
+            perform_op(
+                &SymbolOps::FusedAdd {
+                    dest,
+                    src: 0,
+                    scalar,
+                },
+                &mut individual,
+            );
+        }
+
+        assert_eq!(individual, batch);
+    }
+
+    #[test]
+    fn duplicate_unit_replay_batch_preserves_ordered_semantics() {
+        let mut bytes = vec![0u8; 600 * 64];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let mut batch = SymbolSlab::from_bytes(bytes, 64);
+        let mut individual = batch.clone();
+        let dests = vec![
+            (1, Octet::one()),
+            (1, Octet::one()),
+            (2, Octet::one()),
+            (3, Octet::one()),
+            (4, Octet::one()),
+            (5, Octet::one()),
+            (6, Octet::one()),
+            (7, Octet::one()),
+            (8, Octet::one()),
+        ];
+
+        perform_op(
+            &SymbolOps::FusedAddBatch {
+                src: 0,
+                dests: dests.clone().into_boxed_slice(),
+            },
+            &mut batch,
+        );
+        for (dest, scalar) in dests {
+            perform_op(
+                &SymbolOps::FusedAdd {
+                    dest,
+                    src: 0,
+                    scalar,
+                },
+                &mut individual,
+            );
+        }
+
+        assert_eq!(individual, batch);
     }
 }
