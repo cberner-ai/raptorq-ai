@@ -88,6 +88,24 @@ impl PackedBinaryRows {
         (packed, row_weights, first_ones)
     }
 
+    pub(crate) fn from_sparse_entries_with_first_ones(
+        width: usize,
+        rows: &[Vec<usize>],
+    ) -> (PackedBinaryRows, Vec<Option<usize>>) {
+        let height = rows.len();
+        let mut packed = PackedBinaryRows::new(height, width);
+        let mut first_ones = vec![None; height];
+
+        fill_sparse_entry_first_ones(
+            width,
+            packed.words_per_row,
+            rows,
+            packed.words.as_mut_slice(),
+            first_ones.as_mut_slice(),
+        );
+        (packed, first_ones)
+    }
+
     pub(crate) fn width(&self) -> usize {
         self.width
     }
@@ -805,14 +823,35 @@ fn fill_sparse_entry_metadata_chunk(
     for (row, entries) in rows.iter().enumerate() {
         row_weights[row] = entries.len() as u32;
         let row_words = &mut words[row * words_per_row..(row + 1) * words_per_row];
-        let mut first_one = width;
-        for &col in entries {
-            debug_assert!(col < width);
-            first_one = first_one.min(col);
-            row_words[col / u64::BITS as usize] |= bit_mask(col);
-        }
-        first_ones[row] = (first_one != width).then_some(first_one);
+        first_ones[row] = fill_sparse_entry_row(width, row_words, entries);
     }
+}
+
+fn fill_sparse_entry_first_ones(
+    width: usize,
+    words_per_row: usize,
+    rows: &[Vec<usize>],
+    words: &mut [u64],
+    first_ones: &mut [Option<usize>],
+) {
+    debug_assert_eq!(words.len(), rows.len() * words_per_row);
+    debug_assert_eq!(first_ones.len(), rows.len());
+
+    for (row, entries) in rows.iter().enumerate() {
+        let row_words = &mut words[row * words_per_row..(row + 1) * words_per_row];
+        first_ones[row] = fill_sparse_entry_row(width, row_words, entries);
+    }
+}
+
+#[inline]
+fn fill_sparse_entry_row(width: usize, row_words: &mut [u64], entries: &[usize]) -> Option<usize> {
+    let mut first_one = width;
+    for &col in entries {
+        debug_assert!(col < width);
+        first_one = first_one.min(col);
+        row_words[col / u64::BITS as usize] |= bit_mask(col);
+    }
+    (first_one != width).then_some(first_one)
 }
 
 #[inline]
