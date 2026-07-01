@@ -262,17 +262,15 @@ impl BinaryMatrix for SparseBinaryMatrix {
     }
 
     fn packed_rows_with_first_ones(&self) -> (PackedBinaryRows, Vec<Option<usize>>) {
+        if !self.rows_normalized {
+            return PackedBinaryRows::from_sparse_entries_with_first_ones(self.width, &self.rows);
+        }
+
         let mut packed = PackedBinaryRows::new(self.rows.len(), self.width);
         let mut first_ones = Vec::with_capacity(self.rows.len());
         for (row, entries) in self.rows.iter().enumerate() {
-            let mut first_one = entries.first().copied();
-            for &col in entries {
-                if !self.rows_normalized && first_one.is_some_and(|first| col < first) {
-                    first_one = Some(col);
-                }
-            }
             packed.set_entries(row, entries);
-            first_ones.push(first_one);
+            first_ones.push(entries.first().copied());
         }
         (packed, first_ones)
     }
@@ -411,6 +409,21 @@ mod tests {
             matrix.packed_rows_with_row_weights_and_first_ones();
 
         assert_eq!(row_weights, vec![2, 1, 0]);
+        assert_eq!(first_ones, vec![Some(3), Some(64), None]);
+        assert!(packed.contains(0, 3));
+        assert!(packed.contains(0, 70));
+        assert!(packed.contains(1, 64));
+    }
+
+    #[test]
+    fn packed_rows_with_first_ones_returns_first_sparse_entries() {
+        let mut matrix = SparseBinaryMatrix::new(3, APPEND_BUILD_MIN_WIDTH);
+        matrix.toggle(0, 70);
+        matrix.toggle(0, 3);
+        matrix.toggle(1, 64);
+
+        let (packed, first_ones) = matrix.packed_rows_with_first_ones();
+
         assert_eq!(first_ones, vec![Some(3), Some(64), None]);
         assert!(packed.contains(0, 3));
         assert!(packed.contains(0, 70));
