@@ -7554,6 +7554,23 @@ fn try_square_hybrid_binary_hdpc_solve_one_shot<M: BinaryMatrix>(
 }
 
 fn copy_binary_row<M: BinaryMatrix>(matrix: &M, row: usize) -> CoefficientRow {
+    if let Some(entries) = matrix.row_entries_unordered_slice(row) {
+        let mut result = Vec::with_capacity(entries.len());
+        let mut sorted = true;
+        let mut previous = None;
+        for &col in entries {
+            if previous.is_some_and(|previous| previous >= col) {
+                sorted = false;
+            }
+            previous = Some(col);
+            result.push((coefficient_col(col), Octet::one()));
+        }
+        if !sorted {
+            result.sort_unstable_by_key(|&(col, _)| col);
+        }
+        return result;
+    }
+
     let mut result = Vec::new();
     matrix.visit_row_entries(row, |col| result.push((coefficient_col(col), Octet::one())));
     result
@@ -10088,6 +10105,23 @@ mod tests {
     use crate::matrix::{BinaryMatrix, DenseBinaryMatrix};
     use crate::sparse_matrix::SparseBinaryMatrix;
     use crate::systematic_constants::num_hdpc_symbols;
+
+    #[test]
+    fn copy_binary_row_sorts_unordered_sparse_entries() {
+        let mut matrix = SparseBinaryMatrix::new(1, 512);
+        matrix.toggle_unique(0, 40);
+        matrix.toggle_unique(0, 2);
+        matrix.toggle_unique(0, 11);
+
+        assert_eq!(
+            copy_binary_row(&matrix, 0),
+            vec![
+                (coefficient_col(2), Octet::one()),
+                (coefficient_col(11), Octet::one()),
+                (coefficient_col(40), Octet::one()),
+            ]
+        );
+    }
 
     #[derive(Clone)]
     struct OutOfBoundsRowMatrix {
