@@ -141,6 +141,8 @@ const IN_PLACE_HYBRID_REPLAY_MAX_MID_WIDTH: usize = 768;
 #[cfg(feature = "std")]
 const LARGE_IN_PLACE_HYBRID_REPLAY_MIN_WIDTH: usize = 32_768;
 #[cfg(feature = "std")]
+const TRUSTED_WIDE_SOURCE_BATCH_REPLAY_MIN_WIDTH: usize = 50_000;
+#[cfg(feature = "std")]
 const BINARY_SLAB_OUTPUT_TRANSFER_MIN_WIDTH: usize = 10_000;
 #[cfg(not(test))]
 const LARGE_BINARY_WEIGHTED_BUCKET_MIN_WIDTH: usize = 4_096;
@@ -3365,19 +3367,31 @@ fn addassign_direct_symbol_source_batch_trusted(
     }
 
     let symbol_size = symbols.symbol_size();
+    let symbol_count = symbols.len();
     let bytes = symbols.as_mut_bytes();
     let dest_start = dest * symbol_size;
     assert!(dest_start + symbol_size <= bytes.len());
     debug_assert_direct_symbol_source_batch_dest(dest, sources);
     let dest_ptr = unsafe { bytes.as_mut_ptr().add(dest_start) };
-    addassign_symbol_sources_raw_trusted(
-        dest_ptr,
-        bytes.as_ptr(),
-        bytes.len(),
-        symbol_size,
-        sources,
-        add_assign_path,
-    );
+    if use_trusted_wide_source_batch_replay(symbol_count) {
+        addassign_symbol_sources_raw_trusted_wide(
+            dest_ptr,
+            bytes.as_ptr(),
+            bytes.len(),
+            symbol_size,
+            sources,
+            add_assign_path,
+        );
+    } else {
+        addassign_symbol_sources_raw_trusted(
+            dest_ptr,
+            bytes.as_ptr(),
+            bytes.len(),
+            symbol_size,
+            sources,
+            add_assign_path,
+        );
+    }
 }
 
 #[cfg(feature = "std")]
@@ -3982,6 +3996,24 @@ fn addassign_symbol_sources_raw_trusted<T: Copy + SymbolSourceIndex>(
     add_assign_path: AddAssignFastPath,
 ) {
     addassign_symbol_sources_raw_impl::<false, false, T>(
+        dest_ptr,
+        source_base,
+        source_len,
+        symbol_size,
+        sources,
+        add_assign_path,
+    );
+}
+
+fn addassign_symbol_sources_raw_trusted_wide<T: Copy + SymbolSourceIndex>(
+    dest_ptr: *mut u8,
+    source_base: *const u8,
+    source_len: usize,
+    symbol_size: usize,
+    sources: &[T],
+    add_assign_path: AddAssignFastPath,
+) {
+    addassign_symbol_sources_raw_impl::<false, true, T>(
         dest_ptr,
         source_base,
         source_len,
@@ -4866,6 +4898,12 @@ fn use_in_place_hybrid_replay(width: usize) -> bool {
 #[cfg(feature = "std")]
 fn use_binary_slab_output_transfer(width: usize) -> bool {
     (BINARY_SLAB_OUTPUT_TRANSFER_MIN_WIDTH..LARGE_IN_PLACE_HYBRID_REPLAY_MIN_WIDTH).contains(&width)
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn use_trusted_wide_source_batch_replay(width: usize) -> bool {
+    width >= TRUSTED_WIDE_SOURCE_BATCH_REPLAY_MIN_WIDTH
 }
 
 #[cfg(feature = "std")]
@@ -11432,6 +11470,47 @@ mod tests {
         assert!(use_binary_slab_output_transfer(width_for(10_000)));
         assert!(use_binary_slab_output_transfer(width_for(20_000)));
         assert!(!use_binary_slab_output_transfer(width_for(50_000)));
+    }
+
+    #[test]
+    fn trusted_wide_source_batch_replay_covers_50k_only() {
+        let width_for = |source_symbols| num_intermediate_symbols(source_symbols) as usize;
+
+        assert!(!use_trusted_wide_source_batch_replay(width_for(10_000)));
+        assert!(!use_trusted_wide_source_batch_replay(width_for(20_000)));
+        assert!(use_trusted_wide_source_batch_replay(width_for(50_000)));
+    }
+
+    #[test]
+    fn trusted_wide_source_batch_replay_xors_32_plus_sources() {
+        let symbol_size = 8;
+        let symbol_count = TRUSTED_WIDE_SOURCE_BATCH_REPLAY_MIN_WIDTH;
+        let dest = 7;
+        let sources = (100..133).map(coefficient_col).collect::<Vec<_>>();
+        let add_assign_path = AddAssignFastPath::new(symbol_size);
+        let mut bytes = Vec::with_capacity(symbol_count * symbol_size);
+        for symbol in 0..symbol_count {
+            for byte in 0..symbol_size {
+                bytes.push(
+                    (symbol as u8)
+                        .wrapping_mul(31)
+                        .wrapping_add(byte as u8)
+                        .wrapping_add(11),
+                );
+            }
+        }
+        let mut symbols = SymbolSlab::from_bytes(bytes, symbol_size);
+        let mut expected = symbols.get(dest).to_vec();
+        for &source in &sources {
+            let source = coefficient_col_index(source);
+            for (expected, &source_byte) in expected.iter_mut().zip(symbols.get(source)) {
+                *expected ^= source_byte;
+            }
+        }
+
+        addassign_direct_symbol_source_batch_trusted(&mut symbols, dest, &sources, add_assign_path);
+
+        assert_eq!(symbols.get(dest), expected);
     }
 
     #[test]
