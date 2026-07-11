@@ -4035,9 +4035,9 @@ fn addassign_symbol_sources_raw_impl<
     sources: &[T],
     add_assign_path: AddAssignFastPath,
 ) {
-    if CHECK_SOURCE_BOUNDS
-        && USE_32_SOURCE_BATCH
-        && source_len >= CHECKED_TINY_SOURCE_BATCH_MIN_SYMBOLS * symbol_size
+    if USE_32_SOURCE_BATCH
+        && (!CHECK_SOURCE_BOUNDS
+            || source_len >= CHECKED_TINY_SOURCE_BATCH_MIN_SYMBOLS * symbol_size)
     {
         macro_rules! checked_source_ptr {
             ($index:expr) => {{
@@ -11481,12 +11481,10 @@ mod tests {
         assert!(use_trusted_wide_source_batch_replay(width_for(50_000)));
     }
 
-    #[test]
-    fn trusted_wide_source_batch_replay_xors_32_plus_sources() {
+    fn assert_trusted_wide_source_batch_replay_xors_sources(sources: Vec<CoefficientColumn>) {
         let symbol_size = 8;
         let symbol_count = TRUSTED_WIDE_SOURCE_BATCH_REPLAY_MIN_WIDTH;
         let dest = 7;
-        let sources = (100..133).map(coefficient_col).collect::<Vec<_>>();
         let add_assign_path = AddAssignFastPath::new(symbol_size);
         let mut bytes = Vec::with_capacity(symbol_count * symbol_size);
         for symbol in 0..symbol_count {
@@ -11511,6 +11509,20 @@ mod tests {
         addassign_direct_symbol_source_batch_trusted(&mut symbols, dest, &sources, add_assign_path);
 
         assert_eq!(symbols.get(dest), expected);
+    }
+
+    #[test]
+    fn trusted_wide_source_batch_replay_xors_tiny_source_batches() {
+        assert_trusted_wide_source_batch_replay_xors_sources(
+            (100..112).map(coefficient_col).collect(),
+        );
+    }
+
+    #[test]
+    fn trusted_wide_source_batch_replay_xors_32_plus_sources() {
+        assert_trusted_wide_source_batch_replay_xors_sources(
+            (100..133).map(coefficient_col).collect(),
+        );
     }
 
     #[test]
