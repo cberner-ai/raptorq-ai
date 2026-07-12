@@ -30,13 +30,15 @@ impl PackedBinaryRows {
     pub(crate) fn new(height: usize, width: usize) -> PackedBinaryRows {
         let words_per_row = width.div_ceil(u64::BITS as usize);
         let use_wide_popcount = words_per_row >= WIDE_BINARY_ROW_POPCOUNT_MIN_WORDS;
+        let mut words = vec![0; height * words_per_row];
+        advise_huge_pages(&mut words);
         #[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
         let _ = use_wide_popcount;
         PackedBinaryRows {
             height,
             width,
             words_per_row,
-            words: vec![0; height * words_per_row],
+            words,
             #[cfg(all(feature = "std", target_arch = "x86_64"))]
             use_avx2_popcount: use_wide_popcount && std::arch::is_x86_feature_detected!("avx2"),
             #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -772,6 +774,64 @@ impl PackedBinaryRows {
     }
 }
 
+#[cfg(any(
+    test,
+    all(feature = "std", target_os = "linux", target_arch = "x86_64")
+))]
+// Linux x86-64 PMD transparent huge pages are 2 MiB.
+const LINUX_X86_64_THP_SIZE: usize = 2 * 1024 * 1024;
+#[cfg(any(
+    test,
+    all(feature = "std", target_os = "linux", target_arch = "x86_64")
+))]
+// Twice the THP size guarantees one complete aligned page inside the allocation.
+const MIN_HUGE_PAGE_ALLOCATION_BYTES: usize = 2 * LINUX_X86_64_THP_SIZE;
+
+#[cfg(any(
+    test,
+    all(feature = "std", target_os = "linux", target_arch = "x86_64")
+))]
+fn aligned_huge_page_range(
+    allocation_start: usize,
+    allocation_len: usize,
+    huge_page_size: usize,
+) -> Option<(usize, usize)> {
+    debug_assert!(huge_page_size.is_power_of_two());
+    let allocation_end = allocation_start.checked_add(allocation_len)?;
+    let start = allocation_start.checked_add(huge_page_size - 1)? & !(huge_page_size - 1);
+    let end = allocation_end & !(huge_page_size - 1);
+    let len = end.checked_sub(start)?;
+    (len >= huge_page_size).then_some((start, len))
+}
+
+#[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+fn advise_huge_pages(words: &mut [u64]) {
+    const MADV_HUGEPAGE: i32 = 14;
+
+    let allocation_len = size_of_val(words);
+    if allocation_len < MIN_HUGE_PAGE_ALLOCATION_BYTES {
+        return;
+    }
+
+    let allocation_start = words.as_mut_ptr() as usize;
+    let Some((start, len)) =
+        aligned_huge_page_range(allocation_start, allocation_len, LINUX_X86_64_THP_SIZE)
+    else {
+        return;
+    };
+
+    unsafe extern "C" {
+        fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
+    }
+
+    unsafe {
+        let _ = madvise(start as *mut core::ffi::c_void, len, MADV_HUGEPAGE);
+    }
+}
+
+#[cfg(not(all(feature = "std", target_os = "linux", target_arch = "x86_64")))]
+fn advise_huge_pages(_words: &mut [u64]) {}
+
 #[inline]
 fn read_le_bits(bytes: &[u8], start_bit: usize, valid_bits: usize) -> u64 {
     debug_assert!((1..=u64::BITS as usize).contains(&valid_bits));
@@ -913,6 +973,35 @@ unsafe fn avx2_nibble_popcount_table() -> __m256i {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huge_page_range_requires_a_complete_aligned_page() {
+        let huge_page = LINUX_X86_64_THP_SIZE;
+
+        assert_eq!(
+            aligned_huge_page_range(0, huge_page, huge_page),
+            Some((0, huge_page))
+        );
+        assert_eq!(aligned_huge_page_range(1, huge_page, huge_page), None);
+        assert_eq!(
+            aligned_huge_page_range(1, 2 * huge_page - 2, huge_page),
+            None
+        );
+    }
+
+    #[test]
+    fn huge_page_range_covers_misaligned_threshold_and_overflow() {
+        let huge_page = LINUX_X86_64_THP_SIZE;
+
+        assert_eq!(
+            aligned_huge_page_range(huge_page - 1, MIN_HUGE_PAGE_ALLOCATION_BYTES, huge_page),
+            Some((huge_page, huge_page))
+        );
+        assert_eq!(
+            aligned_huge_page_range(usize::MAX - huge_page / 2, huge_page, huge_page),
+            None
+        );
+    }
 
     #[test]
     fn xor_suffix_preserves_lower_columns() {
